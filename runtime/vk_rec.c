@@ -25,6 +25,12 @@ static VkCommandBuffer rec_cb;         // producer: the part being recorded
 static VkCommandBuffer exec_cb;        // recorder: the command buffer its calls go into (rec_begin, R_EndSubmit)
 static uint64_t sub_h;                 // producer: put_h after the last R_EndSubmit (rec_wait_submitted)
 static int end_mode = -1;              // TOTK_REC_END (rec_end_cb)
+// TOTK_REC_SPIN_US (default 200; 0: 4096 pauses, as before): how long an idle recorder spins before it sleeps.
+// TOTK_REC_WAKE_WORDS (default 2048; 0: at every packet, as before): a sleeping recorder is woken once that much of
+// the ring is waiting (drains, a full ring and the split's waits wake it at once; it also wakes by itself after 2 ms).
+// The replay makes a packet or a few per draw and the recorder is faster: it slept between draws and the replay woke it
+// with a system call almost every draw (a fifth of the render thread's time on the Mali handheld).
+static uint64_t rec_spin_ns, rec_wake_words, woke_h;
 static int rec_live;                   // producer: rec_begin started the recorder for rec_cb
 static PlatThread *rec_thread;
 static int rec_prio;                   // the submitting thread's priority, which the recorder takes
@@ -62,7 +68,12 @@ static void rec_main(void *arg) {
     for (;;) {
         uint64_t h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
         if (t == h) {
-            for (int i = 0; i < 4096 && t == h; i++) plat_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+            if (rec_spin_ns) {
+                for (uint64_t t0 = now_ns(); t == h && now_ns() - t0 < rec_spin_ns;)
+                    for (int i = 0; i < 64 && t == h; i++) plat_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+            } else {
+                for (int i = 0; i < 4096 && t == h; i++) plat_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+            }
             if (t == h) {
                 __atomic_store_n(&sleeping, 1, __ATOMIC_SEQ_CST);
                 h = __atomic_load_n(&head, __ATOMIC_SEQ_CST);
@@ -90,7 +101,7 @@ static void rec_main(void *arg) {
 
 static void wake(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
+    if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) woke_h = put_h, plat_event_set(&wake_ev);
 }
 
 static void wait_space(uint64_t need) {
@@ -123,7 +134,10 @@ static void *put(uint32_t op, size_t bytes) {
 
 static void pub(void) {
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
-    if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
+    if (!__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) return;
+    if (rec_wake_words && put_h - woke_h < rec_wake_words) return;   // batched (TOTK_REC_WAKE_WORDS)
+    woke_h = put_h;
+    plat_event_set(&wake_ev);
 }
 
 void rec_drain(void) {
@@ -156,13 +170,17 @@ void rec_begin(VkCommandBuffer cb, uint64_t fence) {
             rec_chk = rt_knob("REC_CHECK", "0");   // debug switches, read before the recorder starts
             const char *d = cfg_get("TOTK_REC_DELAY_US");
             rec_delay_ns = d && *d && atoi(d) > 0 ? (uint64_t)atoi(d) * 1000 : 0;
+            const char *sp = cfg_get("TOTK_REC_SPIN_US"), *ww = cfg_get("TOTK_REC_WAKE_WORDS");
+            rec_spin_ns = (uint64_t)(sp && *sp ? (atoi(sp) > 0 ? atoi(sp) : 0) : 200) * 1000;
+            rec_wake_words = (uint64_t)(ww && *ww ? (atoi(ww) > 0 ? atoi(ww) : 0) : 2048);
             rec_thread = plat_thread_new(rec_main, NULL, "vk recorder");
             if (!rec_thread) {
                 rt_log("vk_rec: no recorder thread: the replay makes its Vulkan calls itself");
                 mode = 0;
             } else {
-                rt_log("vk_rec: the replay's Vulkan commands are made by a recorder thread%s",
-                       mode == 2 ? " in the B blocks (TOTK_AB)" : "");
+                rt_log("vk_rec: the replay's Vulkan commands are made by a recorder thread%s; idle it spins %llu us, "
+                       "asleep it is woken every %llu words", mode == 2 ? " in the B blocks (TOTK_AB)" : "",
+                       (unsigned long long)(rec_spin_ns / 1000), (unsigned long long)rec_wake_words);
                 if (rec_chk) rt_log("vk_rec: TOTK_REC_CHECK: deferred and destroyed objects are searched in the ring");
                 if (rec_delay_ns) rt_log("vk_rec: TOTK_REC_DELAY_US: the recorder waits %llu us before each batch",
                                          (unsigned long long)(rec_delay_ns / 1000));
