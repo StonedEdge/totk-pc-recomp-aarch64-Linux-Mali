@@ -69,6 +69,8 @@ typedef struct PoolRec {
 
 static void mirror_forget(PoolRec *r);   // pool_lock exclusive: off the mirrored list
 static int shadow_on;                    // shadow mode: imported pools get shadow storage instead (vk_mem_class_log)
+static volatile int shadow_some;         // not shadow mode, but a pool whose import failed has shadow storage
+#define SHADOW_ANY (shadow_on || shadow_some)
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size);
 static void shadow_touch(PoolRec *r);
 static void shadow_forget(PoolRec *r);
@@ -86,7 +88,7 @@ static uint64_t mirror_gen;
 static pidx pool_index;                // POOL_IMPORT, POOL_PHYS and POOL_VIRT records by GPU address
 static PoolRec **phys_list;            // physical pools by key, for MapVirtual requests
 static int nphys, cap_phys;
-static int32_t n_imports, n_import_failures;
+static int32_t n_imports, n_import_failures, n_shadow_fallbacks;
 static PFN_vkGetMemoryHostPointerPropertiesEXT p_host_props;
 
 static VkBufferUsageFlags pool_usage(const VkCtx *c) {
@@ -270,6 +272,17 @@ int vk_pool_init(pool_t *p) {
         r->kind = POOL_IMPORT;
         mem_thaw((uintptr_t)p->mem, p->size);   // the import may need write access to the pages
         ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
+        if (!ok && !shadow_on) {
+            // The driver would not import this pool (the Mali blob refuses some small pools with
+            // VK_ERROR_OUT_OF_HOST_MEMORY): it gets shadow storage, a host-visible copy synced at each submit, alone.
+            r->buf = VK_NULL_HANDLE;
+            if ((ok = shadow_pool(c, r, (uintptr_t)p->mem, p->size))) {
+                shadow_some = 1;
+                long n = plat_inc32(&n_shadow_fallbacks);
+                if (n <= 8) rt_log("vk: pool %p (%#llx bytes): import refused, shadow storage instead (%ld so far)",
+                                   (void *)p->mem, (unsigned long long)p->size, n);
+            }
+        }
         if (!ok) {
             // Not fatal for the game: the pool works for the CPU, and vk_mem_resolve reports its addresses as unbacked.
             long n = plat_inc32(&n_import_failures);
@@ -399,7 +412,7 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
         out->cls = h->cls;
         out->pool = h->pool;
         if (h->alloc) out->alloc_offset = out->offset;
-        if (shadow_on && h->pool && !((PoolRec *)h->pool)->stouched) shadow_touch(h->pool);
+        if (SHADOW_ANY && h->pool && ((PoolRec *)h->pool)->smap && !((PoolRec *)h->pool)->stouched) shadow_touch(h->pool);
         if (resolve_check_on()) {
             VkMemSpan s;
             if (!resolve_locked(addr, size, &s) || memcmp(&s, out, sizeof s))
@@ -946,7 +959,7 @@ static void shadow_sync_pool(PoolRec *r) {
 }
 
 void vk_mem_shadow_sync(void) {
-    if (!shadow_on) return;
+    if (!SHADOW_ANY) return;
     uint64_t t0 = qpc();
     plat_mutex_lock(&shadow_lock);
     if (nstouch) {
@@ -961,7 +974,7 @@ void vk_mem_shadow_sync(void) {
 }
 
 void vk_mem_gpu_pending(uint64_t addr, uint64_t size) {
-    if (!shadow_on || !size) return;
+    if (!SHADOW_ANY || !size) return;
     plat_mutex_lock(&shadow_lock);
     if (nspend == cspend) grow((void **)&spend, &cspend, sizeof *spend);
     spend[nspend++] = (SRange){addr, addr + size};
@@ -969,7 +982,7 @@ void vk_mem_gpu_pending(uint64_t addr, uint64_t size) {
 }
 
 void vk_gpu_written(uint64_t addr, uint64_t size) {
-    if (shadow_on && size) {
+    if (SHADOW_ANY && size) {
         plat_mutex_lock_shared(&pool_lock);
         const pidx_ent *e = pidx_find(&pool_index, addr, size);
         PoolRec *r = e ? e->buf : NULL;
@@ -988,7 +1001,7 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
 }
 
 static void shadow_log(uint64_t frame) {
-    if (!shadow_on) return;
+    if (!SHADOW_ANY) return;
     plat_mutex_lock(&shadow_lock);
     rt_log("mem: shadow at frame %llu: %lld pools %.1f MiB; since the last: %llu pool syncs, %llu queries, %.1f MiB "
            "copied in (%llu untracked), %.1f MiB written back, %.2f ms, %d GPU writes pending",
@@ -1195,7 +1208,9 @@ static void mirror_mode(int discrete) {
 #ifdef _WIN32
     shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : plat_is_wine();
 #else
-    shadow_on = !sh || !*sh || strcmp(sh, "0");
+    // Off on Mali: the blob imports host memory, and the copies cost 1.2 GB of RAM outdoors (with the handheld's 8 GB
+    // the game swapped) plus 3-4 ms a frame of syncing; pools it refuses fall back to shadow storage one by one.
+    shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : !vk_caps.mali;
 #endif
     if (vk_ctx() && !vk_ctx()->has_external_memory_host && !shadow_on) {
         shadow_on = 1;   // nothing to import with
