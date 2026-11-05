@@ -641,10 +641,28 @@ static uint64_t st_passes, st_left_out, st_det_miss, st_frag, st_frag_restarts, 
 // does not know yet, one whose vertex stage reads GPU results.
 static uint64_t st_why_disp, st_why_copy, st_why_clear, st_why_other, st_why_store, st_why_forced, st_why_new, st_why_vs;
 
+static uint64_t fnv(uint64_t h, const void *p, size_t n) {
+    for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t *)p)[i]) * 1099511628211ull;
+    return h;
+}
+
+// What a target is from frame to frame: its storage and description, and the view. Not the record's texture pointer:
+// that is a pin per initialization (nvn_api_cmd.c tex_pin), and targets the game initializes again every frame got a
+// new key every frame, so the table never knew their passes (on the Mali handheld outdoors ~22 passes a frame began
+// behind a full barrier as "not seen yet", with every target attached).
+static uint64_t target_key(uint64_t h, const tex_t *t, const view_t *v, uint8_t has_v) {
+    uint64_t m = t ? (uint64_t)(uintptr_t)t->mem : 0;
+    h = fnv(h, &m, sizeof m);
+    if (t) h = fnv(h, &t->d, sizeof t->d);
+    h = fnv(h, &has_v, 1);
+    return has_v ? fnv(h, v, sizeof *v) : h;
+}
+
 static uint64_t pass_key_of(const VkExec *ex) {
-    uint64_t h = 1469598103934665603ull;
-    const uint8_t *p = (const uint8_t *)&ex->rt;
-    for (size_t i = 0; i < sizeof ex->rt; i++) h = (h ^ p[i]) * 1099511628211ull;
+    const p_set_rt *r = &ex->rt;
+    uint64_t h = fnv(1469598103934665603ull, &r->n, sizeof r->n);
+    for (int i = 0; i < r->n && i < 8; i++) h = target_key(h, r->color[i], &r->cview[i], r->has_cview[i]);
+    h = target_key(h, r->depth, &r->dview, r->has_dview);
     return (h ^ (ex->prog ? ex->prog->serial : 0)) * 0x9E3779B97F4A7C15ull | 1;
 }
 
