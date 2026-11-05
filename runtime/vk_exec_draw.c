@@ -275,16 +275,19 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
     return p;
 }
 
-// ---- TOTK_GPUW_LOG=1 (diagnostic): what the GPU writes into memory the game can read
-// Every range a storage binding or a copy writes into CPU-visible memory is checked once its submission completed:
-// a line when it is first seen and each time its contents change (a hash of the first 64 KiB), with the shader (or
-// "copy") and the count of nonzero bytes. A range the game reads back but the GPU never fills stays unchanged; aiming
-// Ultra Hand should make its readback change.
-typedef struct { uint64_t addr, size, sid, fence; uint32_t hash, nz, st; int seen; } Gw;
-static Gw gw[512];
+// ---- TOTK_GPUW_LOG=1 or =<trigger file> (diagnostic): what the GPU writes into memory the game can read
+// Every range a storage binding or a copy writes into CPU-visible memory is hashed once its submission completed. With
+// a trigger file, nothing is kept until the file appears (checked about once a second), so loading does not fill the
+// table; then every 5 s a line lists the ranges whose contents changed in those 5 s (how often, the shader or "copy",
+// nonzero bytes now), the 40 most changed. Ranges seen for the first time are logged too (the first 300). Comparing
+// the 5-s lines while Ultra Hand is aimed with those before shows which result the game reads for it.
+typedef struct { uint64_t addr, size, sid, fence; uint32_t hash, nz, st, nchg; int seen; } Gw;
+#define GW_N 1024
+static Gw gw[GW_N];
 static volatile int32_t ngw;
-static int gw_on = -1, gw_logged;
-static uint64_t gw_t0;
+static int gw_on = -1, gw_logged, gw_armed;
+static char gw_path[512];
+static uint64_t gw_t0, gw_check, gw_win;
 static const GfxShader *gw_sh[8];
 static unsigned long long gw_sid(const GfxShader *s) {
     if (!s) return 0;
@@ -293,39 +296,74 @@ static unsigned long long gw_sid(const GfxShader *s) {
     for (int i = 0; i < 8; i++) v = v << 8 | iid[i];
     return v;
 }
+static const char *gw_kind(uint32_t st) {
+    return st == 7 ? "copy" : st == NVN_STAGE_CS ? "cs" : st == NVN_STAGE_FS ? "fs" : st == NVN_STAGE_VS ? "vs" : "stage";
+}
+static void gw_summary(uint64_t now) {   // completion thread
+    int n = __atomic_load_n(&ngw, __ATOMIC_ACQUIRE), idx[GW_N], k = 0;
+    for (int i = 0; i < n; i++)
+        if (gw[i].nchg) idx[k++] = i;
+    for (int i = 1; i < k; i++)   // most changed first
+        for (int j = i; j > 0 && gw[idx[j]].nchg > gw[idx[j - 1]].nchg; j--) { int t = idx[j]; idx[j] = idx[j - 1]; idx[j - 1] = t; }
+    rt_log("gpuw: %.1f s: %d of %d ranges changed in the last 5 s", (now - gw_t0) / 1e9, k, n);
+    for (int i = 0; i < k && i < 40; i++) {
+        Gw *g = &gw[idx[i]];
+        rt_log("gpuw:   %#llx+%#llx by %s %016llx: %u changes, %u of %llu bytes nonzero", (unsigned long long)g->addr,
+               (unsigned long long)g->size, gw_kind(g->st), (unsigned long long)g->sid, g->nchg, g->nz,
+               (unsigned long long)(g->size < 65536 ? g->size : 65536));
+    }
+    for (int i = 0; i < n; i++) gw[i].nchg = 0;
+}
 static void gw_cb(void *arg) {   // completion thread, after the submission finished
     Gw *g = &gw[(intptr_t)arg];
     uint64_t n = g->size < 65536 ? g->size : 65536;
     uint32_t h = 2166136261u, nz = 0;
     const volatile uint8_t *p = (const volatile uint8_t *)(uintptr_t)g->addr;
     for (uint64_t k = 0; k < n; k++) h = (h ^ p[k]) * 16777619u, nz += p[k] != 0;
-    if ((!g->seen || h != g->hash) && gw_logged < 1500) {
+    uint64_t now = plat_now_ns();
+    if (!g->seen && gw_logged < 300) {
         gw_logged++;
-        rt_log("gpuw: %.1f s frame %llu: %#llx+%#llx by %s %016llx: %s, %u of %llu bytes nonzero",
-               (plat_now_ns() - gw_t0) / 1e9, (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED),
-               (unsigned long long)g->addr, (unsigned long long)g->size,
-               g->st == 7 ? "copy" : g->st == NVN_STAGE_CS ? "cs" : g->st == NVN_STAGE_FS ? "fs" : g->st == NVN_STAGE_VS ? "vs" : "stage",
-               (unsigned long long)g->sid, g->seen ? "changed" : "first", nz, (unsigned long long)n);
+        rt_log("gpuw: %.1f s frame %llu: new %#llx+%#llx by %s %016llx, %u of %llu bytes nonzero", (now - gw_t0) / 1e9,
+               (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), (unsigned long long)g->addr,
+               (unsigned long long)g->size, gw_kind(g->st), (unsigned long long)g->sid, nz, (unsigned long long)n);
+    } else if (g->seen && h != g->hash) {
+        g->nchg++;
     }
     g->seen = 1, g->hash = h, g->nz = nz;
+    if (!gw_win) gw_win = now;
+    if (now - gw_win >= 5000000000ull) gw_summary(now), gw_win = now;
 }
 int vk_gpuw_on(void) {
     if (gw_on < 0) {
         const char *e = cfg_get("TOTK_GPUW_LOG");
         gw_on = e && *e && strcmp(e, "0");
         gw_t0 = plat_now_ns();
-        if (gw_on) rt_log("gpuw: TOTK_GPUW_LOG: GPU writes into CPU-visible memory are logged when their contents change");
+        if (gw_on && *e == '/') snprintf(gw_path, sizeof gw_path, "%s", e);
+        else gw_armed = gw_on;
+        if (gw_on) rt_log("gpuw: TOTK_GPUW_LOG: GPU writes into CPU-visible memory are summarised every 5 s%s%s",
+                          gw_path[0] ? " once this file appears: " : "", gw_path);
     }
     return gw_on;
 }
 void vk_gpuw_note(VkExec *ex, uint64_t addr, uint64_t size, int st) {
     if (!vk_gpuw_on() || !size || !addr || nvn_gpu_only(addr)) return;
+    if (!gw_armed) {
+        uint64_t now = plat_now_ns();
+        if (now - gw_check < 1000000000ull) return;
+        gw_check = now;
+        FILE *f = fopen(gw_path, "rb");
+        if (!f) return;
+        fclose(f);
+        gw_armed = 1, gw_t0 = now;
+        rt_log("gpuw: trigger seen at frame %llu: logging from now (0.0 s)",
+               (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+    }
     uint64_t sid = st >= 0 && st < 8 ? gw_sid(gw_sh[st]) : 0;
     int n = ngw, i = 0;
     while (i < n && !(gw[i].addr == addr && gw[i].size == size && gw[i].sid == sid && gw[i].st == (uint32_t)st)) i++;
     if (i == n) {
-        if (n == (int)(sizeof gw / sizeof *gw)) return;
-        gw[n] = (Gw){addr, size, sid, 0, 0, 0, (uint32_t)st, 0};
+        if (n == GW_N) return;
+        gw[n] = (Gw){addr, size, sid, 0, 0, 0, (uint32_t)st, 0, 0};
         __atomic_store_n(&ngw, n + 1, __ATOMIC_RELEASE);
     }
     if (gw[i].fence == ex->fence) return;   // once per submission
