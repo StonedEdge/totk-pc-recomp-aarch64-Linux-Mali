@@ -505,6 +505,7 @@ static void sw_note_wait(uint64_t fence, uint64_t ns) {
 // handheld the game waits once a frame, ~12 ms, for the previous frame's GPU work, so the CPU and the GPU take turns.
 // The game then believes work done that may still run: data it reads back from the GPU can be a frame old, and memory
 // it rewrites while the GPU still reads it can show as flicker. A wait on a sync of the same frame waits as before.
+void vk_reports_provisional(uint64_t after, uint64_t upto) __attribute__((weak));
 static int sync_ahead(void) {
     static int on = -1;
     if (on < 0) {
@@ -549,7 +550,12 @@ NVN_API(nvnSyncWait) {
         return;
     }
     uint64_t target = s->fence, older = sync_ahead() ? sw_older_fence(s->fence) : 0;
-    if (older && older < target) target = older;
+    if (older && older < target) {
+        target = older;
+        // the skipped submissions' counter reports get provisional values (vk_exec_xfer.c): occlusion counts as
+        // visible, so the game's culling does not hide grass it has no answer for yet
+        if (vk_reports_provisional) vk_reports_provisional(target, s->fence);
+    }
     if (target != s->fence && b->fence_done() >= target) {
         if (rt_trace & RT_TRACE_PERF) __atomic_fetch_add(&sw_quick, 1, __ATOMIC_RELAXED);
         b->cpu_synced(target);

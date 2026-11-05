@@ -109,6 +109,24 @@ static void counter_cb(void *arg) {
 static struct { uint64_t addr, fence; int unknown; } pending[PENDING];
 static unsigned pending_head;
 
+// TOTK_SYNC_AHEAD (nvn_api_core.c nvnSyncWait): the game's wait for frame N-1 returned once frame N-2 was done, and
+// the game goes on to read N-1's counter reports before the completion thread wrote them. Its occlusion culling then
+// read old or unwritten samples-passed counts and hid patches of grass that were in view. The reports of the skipped
+// submissions get provisional values now: samples passed as many (visible, nothing culled for a frame), others as
+// counter_cb writes them; the real values replace them when the submissions complete. Called on the game's thread;
+// the ring is the replay's, so an entry may be overwritten meanwhile (then it is only a report written early).
+#define PROVISIONAL_SAMPLES (1u << 20)
+void vk_reports_provisional(uint64_t after, uint64_t upto) {
+    uint64_t done = vk_sync_fence_done();
+    unsigned head = __atomic_load_n(&pending_head, __ATOMIC_ACQUIRE);
+    for (unsigned k = 1; k <= PENDING && k <= head; k++) {
+        unsigned i = (head - k) % PENDING;
+        uint64_t f = pending[i].fence, a = pending[i].addr;
+        if (f <= after || f > upto || f <= done || !a || nvn_gpu_only(a)) continue;
+        write_counter(a, pending[i].unknown ? PROVISIONAL_SAMPLES : 0);
+    }
+}
+
 // ---- occlusion counts (samples passed)
 //
 // After a SAMPLES_PASSED reset, the first draw of a pass begins an occlusion query (precise when the device has
