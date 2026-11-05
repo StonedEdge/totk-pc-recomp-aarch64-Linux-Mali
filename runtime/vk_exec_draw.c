@@ -2511,7 +2511,7 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     VkBufferCopy cp = {o, sp.offset, u->size};
     vkCmdCopyBuffer(ex->cb, b, sp.buffer, 1, &cp);
     vk_mem_gpu_wrote(&sp, u->size);
-    vk_usnap_drop(u->dst, u->size);
+    vk_usnap_drop_ub(u->dst, u->size, 1);
     ex->recorded++;
     vk_mem_count(sp.cls, VK_MUSE_GPU_WRITE, u->size);
     note_written(ex, u->dst, u->size);

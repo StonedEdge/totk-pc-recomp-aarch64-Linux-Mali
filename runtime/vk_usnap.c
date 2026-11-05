@@ -44,7 +44,7 @@ typedef struct Arena {
 
 typedef struct { uint64_t lo, hi; } Rng;
 typedef struct { uint64_t lo, hi, off; int dropped, found; } Reg;   // found: bound since its last version
-typedef struct { uint64_t lo, hi, fence; } Wrote;
+typedef struct { uint64_t lo, hi, fence; int ub; } Wrote;   // ub: an UpdateUniformBuffer copy
 
 static struct {
     int mode;                   // rt_knob: 0 off, 1 on, 2 ab
@@ -56,6 +56,7 @@ static struct {
     Reg *reg;                   // merged, sorted by lo, disjoint
     int nreg, creg;
     Rng *excl;                  // bound uniform ranges left out of the copy (refused, GPU write in flight), sorted
+    uint8_t *excl_ub;           // per excl: left out because of an earlier submission's update copy in flight
     int nexcl, cexcl;
     Wrote *wr;                  // GPU writes of submissions not known to be complete
     int nwr, cwr;
@@ -63,7 +64,8 @@ static struct {
     uint64_t subs, regions, bytes, copy_ns, hits, drops, inflight, refused, off_subs;
     uint64_t used;              // bytes of the arena in use (copies, then versions)
     int random;                 // TOTK_UB_INPLACE: arenas keep a cached shadow and room for new versions
-    uint64_t upd_done, upd_bytes, upd_big, upd_none, upd_full, upd_direct, upd_dropped, upd_big_bytes;
+    uint64_t upd_done, upd_bytes, upd_big, upd_none, upd_full, upd_direct, upd_dropped, upd_big_bytes, upd_live, upd_live_ub;
+    uint64_t ex_ub;             // ranges left out as in flight because of an UpdateUniformBuffer copy of an earlier submission
 } U;
 
 static Arena *free_arenas;
@@ -212,20 +214,24 @@ static void wr_prune(void) {
         if (m && U.wr[i].lo <= U.wr[m - 1].hi) {
             if (U.wr[i].hi > U.wr[m - 1].hi) U.wr[m - 1].hi = U.wr[i].hi;
             if (U.wr[i].fence > U.wr[m - 1].fence) U.wr[m - 1].fence = U.wr[i].fence;
+            U.wr[m - 1].ub &= U.wr[i].ub;
         } else {
             U.wr[m++] = U.wr[i];
         }
     }
     U.nwr = m;
 }
-static int wr_hits(uint64_t lo, uint64_t hi) {   // wr_prune ran: disjoint, sorted
+static int wr_hits(uint64_t lo, uint64_t hi) {   // wr_prune ran: disjoint, sorted. 2: only update copies
     int a = 0, b = U.nwr;
     while (a < b) {
         int k = (a + b) / 2;
         if (U.wr[k].hi <= lo) a = k + 1;
         else b = k;
     }
-    return a < U.nwr && U.wr[a].lo < hi;
+    if (!(a < U.nwr && U.wr[a].lo < hi)) return 0;
+    for (int k = a; k < U.nwr && U.wr[k].lo < hi; k++)
+        if (!U.wr[k].ub) return 1;
+    return 2;
 }
 
 static void summary(void) {
@@ -239,13 +245,15 @@ static void summary(void) {
     if (U.random)
         rt_log("vk_usnap: UpdateUniformBuffer in the snapshot (TOTK_UB_INPLACE), per submission: %.1f versions "
                "(%.1f KiB copied), %.1f of a range no uniform binding of the submission touches (written to memory "
-               "only), %.1f in a region over %u KiB (avg %.1f KiB), %.1f in a region dropped by a GPU write, %.1f partly "
-               "in a region, %.1f with the arena full",
+               "only), %.1f in a region over %u KiB (avg %.1f KiB), %.1f in a region dropped by a GPU write, %.1f bound "
+               "live (left out of the copy; %.1f of them by an earlier submission's update copy in flight), %.1f "
+               "partly in a region, %.1f with the arena full; ranges left out by an update copy in flight %.1f",
                U.upd_done / s, U.upd_bytes / s / 1024.0, U.upd_direct / s, U.upd_big / s, upd_max >> 10,
-               U.upd_big ? U.upd_big_bytes / (double)U.upd_big / 1024.0 : 0.0, U.upd_dropped / s, U.upd_none / s,
-               U.upd_full / s);
+               U.upd_big ? U.upd_big_bytes / (double)U.upd_big / 1024.0 : 0.0, U.upd_dropped / s, U.upd_live / s,
+               U.upd_live_ub / s, U.upd_none / s, U.upd_full / s, U.ex_ub / s);
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
     U.upd_done = U.upd_bytes = U.upd_big = U.upd_none = U.upd_full = U.upd_direct = U.upd_dropped = U.upd_big_bytes = 0;
+    U.upd_live = U.upd_live_ub = U.ex_ub = 0;
 }
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
@@ -276,10 +284,16 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
         VkMemSpan sp;
         int refused = !vk_mem_resolve(lo, hi - lo, &sp) || sp.alloc || !sp.pool || sp.avail < hi - lo ||
                       (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC);
-        if (refused || wr_hits(lo, hi)) {
+        int wh = refused ? 0 : wr_hits(lo, hi);
+        if (refused || wh) {
             if (refused) U.refused++;
             else U.inflight++;
-            if (U.nexcl == U.cexcl) U.excl = grow(U.excl, &U.cexcl, sizeof *U.excl);
+            if (U.nexcl == U.cexcl) {
+                U.excl = grow(U.excl, &U.cexcl, sizeof *U.excl);
+                if (!(U.excl_ub = realloc(U.excl_ub, (size_t)U.cexcl))) rt_fatal("vk_usnap: out of memory");
+            }
+            U.excl_ub[U.nexcl] = (uint8_t)(wh == 2);
+            if (wh == 2) U.ex_ub++;
             U.excl[U.nexcl++] = (Rng){lo, hi};   // bound live: vk_usnap_update must not write it early
             continue;
         }
@@ -330,14 +344,16 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     return 1;
 }
 
-void vk_usnap_drop(uint64_t addr, uint64_t n) {
+void vk_usnap_drop_ub(uint64_t addr, uint64_t n, int ub) {
     if (!U.mode || !n) return;
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
-    U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence};
+    U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence, ub != 0};
     if (!U.on) return;
     for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
         if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, U.gen++;
 }
+
+void vk_usnap_drop(uint64_t addr, uint64_t n) { vk_usnap_drop_ub(addr, n, 0); }
 
 // TOTK_UB_INPLACE (vk_exec_draw.c op_update_ub): nvnCommandBufferUpdateUniformBuffer of [dst, dst+n) as a new version
 // of the snapshot region holding it: the region's bytes as the earlier draws read them, with the update applied, at a
@@ -357,7 +373,11 @@ int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
             if (U.excl[m].hi <= dst) a = m + 1;
             else b = m;
         }
-        if (a < U.nexcl && U.excl[a].lo < dst + n) { U.upd_none++; return 0; }   // bound live in this submission
+        if (a < U.nexcl && U.excl[a].lo < dst + n) {   // bound live in this submission
+            U.upd_live++;
+            if (U.excl_ub[a]) U.upd_live_ub++;
+            return 0;
+        }
         for (int k = 0; k < U.nwr; k++)   // a GPU write still to come in this submission would land after this one
             if (U.wr[k].fence >= U.fence && U.wr[k].lo < dst + n && U.wr[k].hi > dst) { U.upd_none++; return 0; }
         U.upd_direct++;
