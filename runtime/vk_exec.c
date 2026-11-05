@@ -64,6 +64,7 @@ void vk_exec_frame_written(const tex_t *t) {
 
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     VkExecFrame *f = &vk_exec_frame;
+    vk_pass_time_frame(frame);
     if (!(rt_trace & RT_TRACE_GFX)) {
         // TOTK_TRACE=perf alone: the same counts as a per-frame average over 60 frames
         static uint64_t n;

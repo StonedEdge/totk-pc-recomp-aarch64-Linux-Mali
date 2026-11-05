@@ -85,6 +85,7 @@ void vk_device_fault_report(VkResult r);
 enum { VK_CRUMB_SUBMIT = 1, VK_CRUMB_SUBMIT_END, VK_CRUMB_UPLOAD, VK_CRUMB_UPLOAD_END, VK_CRUMB_ASTC, VK_CRUMB_PRESENT,
        VK_CRUMB_PRESENT_END };
 void vk_crumbs_init(VkCtx *c);       // after the allocator exists
+void vk_pass_time_frame(uint64_t frame);   // TOTK_PASS_TIME (vk_crumbs.c): at each present, on the replay thread
 void vk_crumbs_release(void);
 // Records crumb kind with number n (a timeline value, a batch number; the low 28 bits are kept) into cb. Only the
 // thread that records cb may call it: never into a replay part while the recorder thread owns it (vk_rec.h).

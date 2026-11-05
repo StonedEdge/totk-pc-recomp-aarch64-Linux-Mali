@@ -11,6 +11,7 @@
 // per pass and dispatch, numbers in a ring of 4096, text only at the device loss); the code is ours.
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
@@ -36,6 +37,9 @@ static int pm_fill;
 static int pm_cpu;
 static PFN_vkCmdSetCheckpointNV set_checkpoint;
 static void pass_marks_init(VkCtx *c);
+static void pt_init(VkCtx *c);
+static void pt_cmd(VkCommandBuffer cb, uint32_t id, int end);
+static void pt_release(VkCtx *c);
 
 static void buffer_init(VkCtx *c) {
     write_marker = (PFN_vkCmdWriteBufferMarkerAMD)vkGetDeviceProcAddr(c->device, "vkCmdWriteBufferMarkerAMD");
@@ -78,11 +82,13 @@ void vk_crumbs_init(VkCtx *c) {
         if (e && !strcmp(e, "fill")) fill_buffer_init(c);
     }
     pass_marks_init(c);
+    pt_init(c);
 }
 
 void vk_crumbs_release(void) {
     VkCtx *c = vk_ctx();
     if (buf && c) vmaDestroyBuffer(c->vma, buf, alloc);
+    pt_release(c);
     buf = VK_NULL_HANDLE, alloc = NULL, words = NULL, write_marker = NULL;
     vk_pass_marks_on = pm_amd = pm_fill = pm_cpu = 0, set_checkpoint = NULL;
 }
@@ -151,6 +157,7 @@ static void pass_marks_init(VkCtx *c) {
 }
 
 void vk_pass_mark_cmd(VkCommandBuffer cb, uint32_t id, int end) {
+    pt_cmd(cb, id, end);
     if (pm_cpu) return;   // the ring record is the mark
     if (pm_fill) {
         if (end) {   // after everything recorded before it
@@ -386,4 +393,178 @@ void vk_pass_marks_report(void) {
         log_lines(t);
     }
     nv_report();
+}
+
+// ---- TOTK_PASS_TIME=<frame> (or =<path>: from the first frame after a file appears there, looked for every 30
+// frames): GPU time of every pass and dispatch of PT_FRAMES presented frames from then on, logged
+// a few frames later as "gpu passes:" lines: the passes grouped by shape (size, formats, first fragment shader) with
+// their summed time, then the frame's passes in GPU order. Each timed mark gets two timestamps, written when everything
+// before them finished (BOTTOM_OF_PIPE): the begin mark follows the full barrier before the pass or dispatch, so the
+// difference is the pass's own time. Uses the pass marks (on by default, also on the CPU only), so the shapes and
+// shader ids match the lost-device report. The timestamps are written with the driver's own entry points, not the
+// recorder's wrappers: vk_pass_mark_cmd runs on the recorder thread for the parts it records.
+#define PT_FRAMES 2
+#define PT_MAX 2048                         // marks timed, a query pair each
+static int pt_state;                        // 0 off, 1 waiting for the frame, 2 timing, 3 waiting to read, 4 done
+static uint64_t pt_frame, pt_end, pt_read_at;
+static char pt_path[512];                  // TOTK_PASS_TIME=<path>: the trigger file
+static volatile uint32_t pt_lo, pt_hi;      // marks [pt_lo, pt_hi) are timed (pt_hi 0: none yet)
+static VkQueryPool pt_pool;
+static PFN_vkCmdResetQueryPool pt_reset;
+static PFN_vkCmdWriteTimestamp pt_write;
+static double pt_period;
+static uint64_t pt_mask;
+
+static void pt_init(VkCtx *c) {
+    const char *e = cfg_get("TOTK_PASS_TIME");
+    if (!e || !*e || !strcmp(e, "0")) return;
+    if (!vk_pass_marks_on) {
+        rt_log("vk: TOTK_PASS_TIME needs the pass marks (TOTK_PASS_CRUMBS=0 turns them off): passes not timed");
+        return;
+    }
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(c->phys, &nq, NULL);
+    VkQueueFamilyProperties qp[16];
+    if (nq > 16) nq = 16;
+    vkGetPhysicalDeviceQueueFamilyProperties(c->phys, &nq, qp);
+    uint32_t bits = c->gfx_family < nq ? qp[c->gfx_family].timestampValidBits : 0;
+    VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                .queryCount = 2 * PT_MAX};
+    pt_reset = (PFN_vkCmdResetQueryPool)vkGetDeviceProcAddr(c->device, "vkCmdResetQueryPool");
+    pt_write = (PFN_vkCmdWriteTimestamp)vkGetDeviceProcAddr(c->device, "vkCmdWriteTimestamp");
+    if (!bits || c->props.limits.timestampPeriod <= 0 || !pt_reset || !pt_write ||
+        vkCreateQueryPool(c->device, &qi, NULL, &pt_pool) != VK_SUCCESS) {
+        rt_log("vk: TOTK_PASS_TIME: no timestamps on the graphics queue: passes not timed");
+        pt_pool = VK_NULL_HANDLE;
+        return;
+    }
+    pt_period = c->props.limits.timestampPeriod;
+    pt_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+    char *end;
+    pt_frame = strtoull(e, &end, 10);
+    pt_state = 1;
+    if (*end || !pt_frame) {
+        snprintf(pt_path, sizeof pt_path, "%s", e);
+        remove(pt_path);   // a file left from an earlier run would start the timing at once
+        pt_frame = UINT64_MAX;
+        rt_log("vk: TOTK_PASS_TIME: %d frames' passes and dispatches are timed on the GPU once %s appears", PT_FRAMES,
+               pt_path);
+    } else
+        rt_log("vk: TOTK_PASS_TIME: the passes and dispatches of frames %llu-%llu are timed on the GPU",
+               (unsigned long long)pt_frame, (unsigned long long)(pt_frame + PT_FRAMES - 1));
+}
+
+static void pt_release(VkCtx *c) {
+    if (pt_pool && c) vkDestroyQueryPool(c->device, pt_pool, NULL);
+    pt_pool = VK_NULL_HANDLE;
+    pt_state = 0;
+}
+
+static void pt_cmd(VkCommandBuffer cb, uint32_t id, int end) {
+    uint32_t lo = __atomic_load_n(&pt_lo, __ATOMIC_ACQUIRE), hi = __atomic_load_n(&pt_hi, __ATOMIC_ACQUIRE);
+    if (!pt_pool || !hi || id < lo || id >= hi || id - lo >= PT_MAX) return;
+    uint32_t k = id - lo;
+    if (!end) pt_reset(cb, pt_pool, 2 * k, 2);   // outside any pass: the begin mark precedes vkCmdBeginRendering
+    pt_write(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pt_pool, 2 * k + (end != 0));
+}
+
+typedef struct { char key[200]; double ms; uint32_t n, draws; } PtGroup;
+typedef struct { uint64_t t0, t1; uint32_t id; } PtEnt;
+
+static int pt_by_start(const void *a, const void *b) {
+    const PtEnt *x = a, *y = b;
+    return x->t0 < y->t0 ? -1 : x->t0 > y->t0;
+}
+static int pt_by_ms(const void *a, const void *b) {
+    const PtGroup *x = a, *y = b;
+    return x->ms < y->ms ? 1 : x->ms > y->ms ? -1 : 0;
+}
+
+// The shape of a mark: what repeats from frame to frame (not its place in the submission or its draw count).
+static void pt_key(const VkPassMark *m, char *o, size_t size) {
+    if (m->kind == VK_MARK_DISPATCH) {
+        snprintf(o, size, "dispatch %ux%ux%u cs %016llx", m->w, m->h, m->d, shader_id(m->first[0]));
+        return;
+    }
+    size_t n = (size_t)snprintf(o, size, "pass %ux%u x%u colour", m->w, m->h, m->d);
+    for (int i = 0; i < m->ncolor && i < 8 && n < size; i++)
+        n += (size_t)snprintf(o + n, size - n, "%s%d", i ? "," : " ", (int)m->color[i]);
+    if (!m->ncolor && n < size) n += (size_t)snprintf(o + n, size - n, " none");
+    if (n < size) snprintf(o + n, size - n, " depth %d fs %016llx", (int)m->depth, shader_id(m->first[1]));
+}
+
+static void pt_report(void) {
+    VkCtx *c = vk_ctx();
+    uint32_t lo = pt_lo, n = pt_hi - pt_lo;
+    if (n > PT_MAX) n = PT_MAX;
+    if (seq - lo >= VK_PASS_MARKS) rt_log("gpu passes: the mark ring moved on; some records are gone");
+    uint64_t *v = calloc((size_t)n * 4, sizeof *v);
+    PtEnt *e = calloc(n ? n : 1, sizeof *e);
+    PtGroup *g = calloc(n ? n : 1, sizeof *g);
+    if (!c || !v || !e || !g) { free(v), free(e), free(g); return; }
+    VkResult r = vkGetQueryPoolResults(c->device, pt_pool, 0, 2 * n, (size_t)n * 4 * sizeof *v, v, 2 * sizeof *v,
+                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    uint32_t ne = 0, ng = 0, lost = 0;
+    if (r == VK_SUCCESS || r == VK_NOT_READY)
+        for (uint32_t k = 0; k < n; k++) {
+            uint64_t b = v[4 * k], ba = v[4 * k + 1], en = v[4 * k + 2], ea = v[4 * k + 3];
+            if (!ba || !ea || !vk_pass_mark_record(lo + k)) { lost++; continue; }
+            e[ne++] = (PtEnt){b & pt_mask, en & pt_mask, lo + k};
+        }
+    qsort(e, ne, sizeof *e, pt_by_start);
+    double sum = 0, span = ne ? ((e[ne - 1].t1 - e[0].t0) & pt_mask) * pt_period / 1e6 : 0;
+    for (uint32_t i = 0; i < ne; i++) {
+        const VkPassMark *m = vk_pass_mark_record(e[i].id);
+        double ms = ((e[i].t1 - e[i].t0) & pt_mask) * pt_period / 1e6;
+        sum += ms;
+        char key[200];
+        pt_key(m, key, sizeof key);
+        uint32_t j = 0;
+        while (j < ng && strcmp(g[j].key, key)) j++;
+        if (j == ng) snprintf(g[ng++].key, sizeof g[0].key, "%s", key);
+        g[j].ms += ms, g[j].n++;
+        if (m->draws != UINT32_MAX) g[j].draws += m->draws;
+    }
+    rt_log("gpu passes: frames %llu-%llu: %u passes and dispatches timed (%u without a result), their GPU time %.2f ms "
+           "a frame, first start to last end %.2f ms a frame",
+           (unsigned long long)pt_frame, (unsigned long long)(pt_end - 1), ne, lost, sum / PT_FRAMES, span / PT_FRAMES);
+    qsort(g, ng, sizeof *g, pt_by_ms);
+    rt_log("gpu passes: by shape, a frame (ms, %% of the passes' time, count, draws): formats are VkFormat numbers");
+    for (uint32_t j = 0; j < ng && j < 60; j++)
+        rt_log("gpu passes: %7.3f ms %5.1f%% x%-4.1f %6.1f draws  %s", g[j].ms / PT_FRAMES, sum ? 100 * g[j].ms / sum : 0,
+               (double)g[j].n / PT_FRAMES, (double)g[j].draws / PT_FRAMES, g[j].key);
+    rt_log("gpu passes: frame %llu in GPU order (start ms, time ms, draws, shape), passes of 0.05 ms and more",
+           (unsigned long long)pt_frame);
+    uint64_t f0 = ne ? e[0].t0 : 0;
+    for (uint32_t i = 0; i < ne; i++) {
+        const VkPassMark *m = vk_pass_mark_record(e[i].id);
+        double ms = ((e[i].t1 - e[i].t0) & pt_mask) * pt_period / 1e6, at = ((e[i].t0 - f0) & pt_mask) * pt_period / 1e6;
+        if (at > span / PT_FRAMES * 1.05) break;   // the second frame
+        if (ms < 0.05) continue;
+        char key[200];
+        pt_key(m, key, sizeof key);
+        rt_log("gpu passes:   %8.3f %7.3f %5u  %s", at, ms, m->draws == UINT32_MAX ? 0 : m->draws, key);
+    }
+    free(v), free(e), free(g);
+}
+
+// At each present (vk_exec_frame_log, the replay thread): starts, ends and reads the timing.
+void vk_pass_time_frame(uint64_t frame) {
+    if (pt_state == 1 && pt_path[0] && frame % 30 == 0) {
+        FILE *f = fopen(pt_path, "r");
+        if (f) fclose(f), pt_frame = frame + 1;
+    }
+    if (pt_state == 1 && frame >= pt_frame) {
+        pt_frame = frame;
+        __atomic_store_n(&pt_lo, seq + 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&pt_hi, UINT32_MAX, __ATOMIC_RELEASE);
+        pt_state = 2;
+    } else if (pt_state == 2 && frame >= pt_frame + PT_FRAMES) {
+        __atomic_store_n(&pt_hi, seq + 1, __ATOMIC_RELEASE);
+        pt_end = frame, pt_read_at = frame + 4;
+        pt_state = 3;
+    } else if (pt_state == 3 && frame >= pt_read_at) {
+        pt_state = 4;
+        pt_report();
+    }
 }
