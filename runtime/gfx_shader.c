@@ -819,7 +819,7 @@ out:
 // with the block's window as of the draw (vk_exec_draw.c ubo_info), and the block itself to one copy shared by the
 // submission's draws (vk_usnap.c, base). Without it every draw of TotK's terrain needed its own 64 KiB copy, or the
 // game's update became a copy on the GPU timeline that ends the pass. The twin's GfxShaderRes has GFX_UBO_TWIN and the
-// slot of its block. Reads of the window at computed offsets still read the shared copy (assumed not to happen).
+// slot of its block. Reads of the window at computed offsets: below.
 int vk_caps_tiler_opt(const char *name) __attribute__((weak));
 static int ubo_window_on(void) {
     static int on = -1;
@@ -830,9 +830,22 @@ static int ubo_window_on(void) {
     return on;
 }
 
+// Reads of the window at computed offsets (data[i] with i not a constant) would see the shared copy, which holds the
+// window as the submission began: TotK's terrain does read it that way, and the ground came out smeared and in the
+// wrong colours as the camera turned. So every computed read of a block with a twin reads both: the block at i and the
+// twin at i (0 when i is past the twin), and keeps the twin's value when i < UBW_END. Blocks read only at computed
+// offsets (GFX_UBO_BASE) get a twin for that too.
+enum { OP_EXT_INST = 12, OP_TYPE_BOOL = 20, OP_FUNCTION = 54, OP_FUNCTION_CALL = 57, OP_LOAD = 61, OP_COMPOSITE_CONSTRUCT = 80,
+       OP_COMPOSITE_EXTRACT = 81, OP_COPY_OBJECT = 83, OP_SELECT = 169, OP_ULESS_THAN = 176, OP_PHI = 245 };
+static int has_result_type(uint32_t op) {
+    return op == OP_EXT_INST || op == OP_CONSTANT || op == OP_FUNCTION_CALL || op == OP_LOAD ||
+           (op >= OP_COMPOSITE_EXTRACT && op <= OP_COPY_OBJECT) || (op >= 109 && op <= 205) || op == OP_PHI;
+}
+
 static void ubo_window(GfxShader *s) {
+    const uint8_t WB = GFX_UBO_WINDOWED | GFX_UBO_BASE;
     int nubo = s->nres[GFX_RES_UBO], want = 0;
-    for (int r = 0; r < nubo; r++) want += !!(s->res[GFX_RES_UBO][r].flags & GFX_UBO_WINDOWED);
+    for (int r = 0; r < nubo; r++) want += !!(s->res[GFX_RES_UBO][r].flags & WB);
     if (!want || !ubo_window_on()) {
         for (int r = 0; r < nubo; r++) s->res[GFX_RES_UBO][r].flags &= (uint8_t)~GFX_UBO_WINDOWED;
         return;
@@ -840,6 +853,7 @@ static void ubo_window(GfxShader *s) {
     const uint32_t *w = s->spirv;
     uint64_t n = s->words;
     uint32_t bound = w[3], span = 1;
+    if (bound >= (1u << 20)) goto fail0;
     for (int k = 0; k < GFX_RES_KINDS; k++)
         for (int r = 0; r < s->nres[k]; r++) {
             uint32_t e = s->res[k][r].binding + (s->res[k][r].count ? s->res[k][r].count : 1);
@@ -847,10 +861,17 @@ static void ubo_window(GfxShader *s) {
         }
     // the variables: binding -> id, its pointer type, its set
     uint32_t vid[64] = {0}, vtype[64] = {0}, vset[64] = {0}, twin[64] = {0}, tbind[64] = {0};
+    uint32_t ityp[4] = {0}, c0[4] = {0}, c5[4] = {0}, nityp = 0, boolt = 0, new_bool = 0;
+    uint64_t nchain = 0, nload = 0;
     uint32_t *bindof = calloc(bound, sizeof *bindof), *setof = calloc(bound, sizeof *setof);
-    uint32_t *cval = calloc(bound, sizeof *cval);   // OpConstant value + 1
-    uint32_t *o = malloc((n + (uint64_t)want * 16 + 8) * 4);
-    if (!bindof || !setof || !cval || !o) goto fail;
+    uint32_t *cval = calloc(bound, sizeof *cval);    // OpConstant value + 1
+    uint32_t *rtype = calloc(bound, sizeof *rtype);  // result type of a value
+    uint32_t *vcomp = calloc(bound, sizeof *vcomp), *vcnt = calloc(bound, sizeof *vcnt);   // vector types
+    uint8_t *isint = calloc(bound, 1);
+    uint32_t *chb = calloc(bound * 2 + 64, sizeof *chb);   // computed chain A -> its twin chain B and condition (pass 2)
+    uint32_t *o = NULL;
+    if (!bindof || !setof || !cval || !rtype || !vcomp || !vcnt || !isint || !chb) goto fail;
+    uint8_t *cand = isint;   // bit 1: a computed chain into a block that gets a twin (pass 1)
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > n) goto fail;
@@ -858,23 +879,76 @@ static void ubo_window(GfxShader *s) {
         if (op == OP_DECORATE && len >= 4 && a[0] < bound && a[1] == DEC_BINDING) bindof[a[0]] = a[2] + 1;
         if (op == OP_DECORATE && len >= 4 && a[0] < bound && a[1] == 34) setof[a[0]] = a[2] + 1;
         if (op == OP_CONSTANT && len == 4 && a[1] < bound) cval[a[1]] = a[2] + 1;
+        if (op == OP_TYPE_BOOL && len >= 2 && a[0] < bound) boolt = a[0];
+        if (op == OP_TYPE_INT && len >= 4 && a[0] < bound && a[1] == 32) isint[a[0]] |= 1;
+        if (op == OP_TYPE_VECTOR && len >= 4 && a[0] < bound) vcomp[a[0]] = a[1], vcnt[a[0]] = a[2];
+        if (has_result_type(op) && len >= 3 && a[1] < bound) rtype[a[1]] = a[0];
         if (op == OP_VARIABLE && len >= 4 && a[1] < bound && a[2] == SC_UNIFORM && bindof[a[1]] && bindof[a[1]] - 1 < 64)
             vid[bindof[a[1]] - 1] = a[1], vtype[bindof[a[1]] - 1] = a[0], vset[bindof[a[1]] - 1] = setof[a[1]] ? setof[a[1]] - 1 : 0;
+        if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 6 && a[1] < bound && a[2] < bound &&
+            bindof[a[2]] && bindof[a[2]] - 1 < 64 && a[3] < bound && cval[a[3]] == 1 && a[4] < bound && !cval[a[4]]) {
+            int hit = 0;
+            for (int r = 0; r < nubo && !hit; r++)
+                hit = (s->res[GFX_RES_UBO][r].flags & WB) && s->res[GFX_RES_UBO][r].binding == bindof[a[2]] - 1;
+            uint32_t t = rtype[a[4]];
+            if (hit && t && t < bound && (isint[t] & 1)) {
+                uint32_t k = 0;
+                while (k < nityp && ityp[k] != t) k++;
+                if (k == nityp && nityp < 4) ityp[nityp++] = t;
+                if (k < nityp) cand[a[1]] |= 2, nchain++;
+            }
+        }
+        if (op == OP_LOAD && len >= 4 && a[2] < bound && (cand[a[2]] & 2)) nload++;
         i += len;
     }
     for (int r = 0; r < nubo; r++) {
         GfxShaderRes *res = &s->res[GFX_RES_UBO][r];
-        if (!(res->flags & GFX_UBO_WINDOWED)) continue;
-        if (res->binding >= 64 || !vid[res->binding]) { res->flags &= (uint8_t)~GFX_UBO_WINDOWED; continue; }
-        twin[res->binding] = bound++, tbind[res->binding] = span++;
+        if (!(res->flags & WB)) continue;
+        if (res->binding >= 64 || !vid[res->binding]) { res->flags &= (uint8_t)~WB; continue; }
+        if (!twin[res->binding]) twin[res->binding] = bound++, tbind[res->binding] = span++;
     }
+    if (!boolt) boolt = bound++, new_bool = 1;
+    for (uint32_t k = 0; k < nityp; k++) c0[k] = bound++, c5[k] = bound++;
+    o = malloc((n + (uint64_t)want * 16 + nchain * 16 + nload * 96 + 64) * 4);
+    if (!o) goto fail;
     // copy, inserting the twins' decorations after their block's Binding and their variables after the block's
     uint64_t m = 0;
-    int v14 = w[1] >= 0x00010400;
+    int v14 = w[1] >= 0x00010400, globals_done = 0;
     for (uint64_t i = 0; i < 5; i++) o[m++] = w[i];
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         const uint32_t *a = w + i + 1;
+        if (op == OP_FUNCTION && !globals_done) {   // the new type and constants, before the first function
+            globals_done = 1;
+            if (new_bool) o[m++] = 2u << 16 | OP_TYPE_BOOL, o[m++] = boolt;
+            for (uint32_t k = 0; k < nityp; k++) {
+                o[m++] = 4u << 16 | OP_CONSTANT, o[m++] = ityp[k], o[m++] = c0[k], o[m++] = 0;
+                o[m++] = 4u << 16 | OP_CONSTANT, o[m++] = ityp[k], o[m++] = c5[k], o[m++] = UBW_END;
+            }
+        }
+        if (op == OP_LOAD && len >= 4 && a[2] < bound && chb[a[2] * 2]) {
+            // a load through a computed chain: the block's value, the twin's, and the twin's when the index is < UBW_END
+            uint32_t t = a[0], res = a[1], cond = chb[a[2] * 2 + 1], la = bound++, lb = bound++;
+            o[m++] = w[i]; o[m++] = t; o[m++] = la;
+            for (uint32_t k = 2; k + 1 < len; k++) o[m++] = a[k];
+            o[m++] = 4u << 16 | OP_LOAD, o[m++] = t, o[m++] = lb, o[m++] = chb[a[2] * 2];
+            if (t < bound && vcnt[t] >= 2 && vcnt[t] <= 4) {   // a vector: per component (a scalar condition needs 1.4)
+                uint32_t ct = vcomp[t], sel[4];
+                for (uint32_t c = 0; c < vcnt[t]; c++) {
+                    uint32_t ea = bound++, eb = bound++;
+                    o[m++] = 5u << 16 | OP_COMPOSITE_EXTRACT, o[m++] = ct, o[m++] = ea, o[m++] = la, o[m++] = c;
+                    o[m++] = 5u << 16 | OP_COMPOSITE_EXTRACT, o[m++] = ct, o[m++] = eb, o[m++] = lb, o[m++] = c;
+                    sel[c] = bound++;
+                    o[m++] = 6u << 16 | OP_SELECT, o[m++] = ct, o[m++] = sel[c], o[m++] = cond, o[m++] = eb, o[m++] = ea;
+                }
+                o[m++] = (3u + vcnt[t]) << 16 | OP_COMPOSITE_CONSTRUCT, o[m++] = t, o[m++] = res;
+                for (uint32_t c = 0; c < vcnt[t]; c++) o[m++] = sel[c];
+            } else {
+                o[m++] = 6u << 16 | OP_SELECT, o[m++] = t, o[m++] = res, o[m++] = cond, o[m++] = lb, o[m++] = la;
+            }
+            i += len;
+            continue;
+        }
         uint64_t at = m;
         for (uint32_t k = 0; k < len; k++) o[m++] = w[i + k];
         if (op == OP_ENTRY_POINT && v14) {   // SPIR-V 1.4: every global variable the entry point uses is listed
@@ -891,13 +965,29 @@ static void ubo_window(GfxShader *s) {
                 if (twin[b] && a[1] == vid[b])
                     o[m++] = 4u << 16 | OP_VARIABLE, o[m++] = vtype[b], o[m++] = twin[b], o[m++] = SC_UNIFORM;
         } else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 6) {
-            for (int b = 0; b < 64; b++)
-                if (twin[b] && a[2] == vid[b] && a[3] < bound && cval[a[3]] == 1 && a[4] < bound && cval[a[4]] &&
-                    cval[a[4]] - 1 >= UBW_FIRST && cval[a[4]] - 1 < UBW_END)
-                    o[at + 3] = twin[b];   // a constant read of the window: from the twin
+            for (int b = 0; b < 64; b++) {
+                if (!twin[b] || a[2] != vid[b] || a[3] >= bound || cval[a[3]] != 1 || a[4] >= bound) continue;
+                if (cval[a[4]]) {
+                    if (cval[a[4]] - 1 >= UBW_FIRST && cval[a[4]] - 1 < UBW_END)
+                        o[at + 3] = twin[b];   // a constant read of the window: from the twin
+                } else if (a[1] < (uint32_t)w[3] && (cand[a[1]] & 2)) {
+                    // a computed index: a twin chain at the index (0 past the twin) and the condition index < UBW_END
+                    uint32_t t = rtype[a[4]], k = 0;
+                    while (k < nityp && ityp[k] != t) k++;
+                    if (k == nityp) break;
+                    uint32_t cond = bound++, ti = bound++, bc = bound++;
+                    o[m++] = 5u << 16 | OP_ULESS_THAN, o[m++] = boolt, o[m++] = cond, o[m++] = a[4], o[m++] = c5[k];
+                    o[m++] = 6u << 16 | OP_SELECT, o[m++] = t, o[m++] = ti, o[m++] = cond, o[m++] = a[4], o[m++] = c0[k];
+                    o[m++] = len << 16 | op, o[m++] = a[0], o[m++] = bc, o[m++] = twin[b], o[m++] = a[3], o[m++] = ti;
+                    for (uint32_t q = 5; q + 1 < len; q++) o[m++] = a[q];
+                    chb[a[1] * 2] = bc, chb[a[1] * 2 + 1] = cond;
+                }
+                break;
+            }
         }
         i += len;
     }
+    if (!globals_done) goto fail;
     o[3] = bound;
     // the twins' reflection entries
     GfxShaderRes *nr = realloc(s->res[GFX_RES_UBO], (size_t)(nubo + want) * sizeof *nr);
@@ -905,7 +995,10 @@ static void ubo_window(GfxShader *s) {
     s->res[GFX_RES_UBO] = nr;
     int added = 0;
     for (int r = 0; r < nubo; r++)
-        if ((nr[r].flags & GFX_UBO_WINDOWED) && twin[nr[r].binding]) {
+        if ((nr[r].flags & WB) && twin[nr[r].binding]) {
+            int dup = 0;   // two reflection entries of one binding share its twin
+            for (int q = 0; q < added; q++) dup |= nr[nubo + q].binding == tbind[nr[r].binding];
+            if (dup) continue;
             GfxShaderRes t = nr[r];
             t.binding = (uint16_t)tbind[nr[r].binding], t.flags = GFX_UBO_TWIN, t.ubo_bytes = UBW_END * 16;
             nr[nubo + added++] = t;
@@ -913,14 +1006,17 @@ static void ubo_window(GfxShader *s) {
     s->nres[GFX_RES_UBO] = nubo + added;
     free(s->spirv);
     s->spirv = o, s->words = m;
-    free(bindof), free(setof), free(cval);
-    static volatile int32_t n_tw;
+    free(bindof), free(setof), free(cval), free(rtype), free(vcomp), free(vcnt), free(isint), free(chb);
+    static volatile int32_t n_tw, n_dyn;
+    if (nchain) plat_inc32(&n_dyn);
     int32_t k = plat_inc32(&n_tw);
-    if (k <= 4 || k == 64 || k == 512) rt_log("gfx_shader: uniform window twins: %d so far", k);
+    if (k <= 4 || k == 64 || k == 512)
+        rt_log("gfx_shader: uniform window twins: %d so far (%d with computed reads of the window)", k, n_dyn);
     return;
 fail:
-    free(bindof), free(setof), free(cval), free(o);
-    for (int r = 0; r < nubo; r++) s->res[GFX_RES_UBO][r].flags &= (uint8_t)~GFX_UBO_WINDOWED;
+    free(bindof), free(setof), free(cval), free(rtype), free(vcomp), free(vcnt), free(isint), free(chb), free(o);
+fail0:
+    for (int r = 0; r < nubo; r++) s->res[GFX_RES_UBO][r].flags &= (uint8_t)~WB;
 }
 
 // Interface Locations and the compute workgroup size from the module. Ids beyond 2^20 are ignored (Ryujinx modules stay
@@ -979,7 +1075,7 @@ out:
 // (dv/dx, dv/dy): a mip level chosen from the wrong derivatives, too sharp on terrain faces turned across the screen,
 // which crawled in patches that followed the faces (1.4.3, the Depths). TOTK_TXD_TRANSPOSE=0 turns it off.
 // Applied to the SPIR-V after it is loaded, so the shader cache is untouched.
-enum { OP_COMPOSITE_CONSTRUCT = 80, OP_SAMPLE_EXPLICIT = 88, IO_GRAD = 4 };
+enum { OP_SAMPLE_EXPLICIT = 88, IO_GRAD = 4 };
 
 static void patch_txd_transpose(GfxShader *s) {
     static int on = -1;
