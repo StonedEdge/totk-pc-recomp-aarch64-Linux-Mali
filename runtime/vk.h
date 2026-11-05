@@ -263,7 +263,8 @@ void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size);
 // it records, ubo bindings take the copy (0: not copied, bind memory), GPU writes of the replay drop the copies they touch.
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence);
 void vk_usnap_end(uint64_t fence);
-int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
+int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out, int base_ok);
+const uint8_t *vk_usnap_peek(uint64_t addr, uint64_t n);   // TOTK_UB_WINDOW: the bytes as the replay is at now
 int vk_usnap_update(uint64_t dst, uint64_t n, const void *data);   // TOTK_UB_INPLACE: 1 when the snapshot took it
 void vk_usnap_drop(uint64_t addr, uint64_t n);
 void vk_usnap_drop_ub(uint64_t addr, uint64_t n, int ub);

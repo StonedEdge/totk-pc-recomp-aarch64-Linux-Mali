@@ -196,7 +196,10 @@ static void cb_done(void *arg) {   // completion thread
     free(r->written), free(r->pools), free(r->chunks), free(r);
 }
 
-void vk_exec_draw_new_cb(void) { memset(&B, 0, sizeof B); }
+// TOTK_UB_WINDOW: the last window buffer per stage (window_info); scratch is per command buffer, so it goes with B
+static struct { uint64_t addr; uint8_t bytes[128]; VkBuffer buf; VkDeviceSize off; int valid; } WIN[6];
+
+void vk_exec_draw_new_cb(void) { memset(&B, 0, sizeof B), memset(WIN, 0, sizeof WIN); }
 
 void vk_exec_draw_shaders(const GfxShader **vs, const GfxShader **fs) {
     *vs = B.st_valid ? B.st.vs : NULL;
@@ -218,7 +221,7 @@ static CbRes *cb_res(VkExec *ex) {
     cur = calloc(1, sizeof *cur);
     if (!cur) rt_fatal("vk: out of memory");
     cur_fence = ex->fence;
-    memset(&B, 0, sizeof B);
+    memset(&B, 0, sizeof B), memset(WIN, 0, sizeof WIN);
     vk_completion_add(ex->fence, cb_done, cur);
     return cur;
 }
@@ -908,18 +911,44 @@ static void limits_init(void) {
 // TOTK_UB_REACH (tilers, Mali by default): a game uniform block is bound only as far as the shader can read it
 // (GfxShaderRes.ubo_bytes, gfx_shader.c ubo_reach). TotK binds blocks of 64 KiB and rewrites 64 bytes of one before
 // every draw; bound whole, every new version of it (vk_usnap.c) had to copy 64 KiB.
+// Off by default on its own (0049 changed no frame time with it alone); on with the window twins (TOTK_UB_WINDOW),
+// where a block's readers at constant offsets bind its updated head and not the whole of it.
 static int ub_reach_on(void) {
     static int on = -1;
-    if (on < 0) {   // off by default until a game needs it: it changed no frame time on its own (0049)
+    if (on < 0) {
         const char *e = cfg_get("TOTK_UB_REACH");
-        on = e && *e && strcmp(e, "0") != 0;
+        on = e && *e ? strcmp(e, "0") != 0 : vk_caps_tiler_opt("TOTK_UB_WINDOW");
     }
     return on;
 }
 
-static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot, uint32_t reach) {
+// TOTK_UB_WINDOW (gfx_shader.c ubo_window): the window twin of the block bound at slot: a small buffer with the
+// block's first bytes as the replay is at now (vk_usnap_peek: the current version of the snapshot; else guest memory).
+static VkDescriptorBufferInfo window_info(VkExec *ex, int st, int slot, uint32_t n) {
+    if (slot < 3 || slot - 3 >= 18 || n > sizeof WIN[0].bytes || st < 0 || st >= 6) return zero_info(n);
+    const p_bind_buf *b = &ex->ubo[st][slot - 3];
+    if (!b->size || b->size < n) return zero_info(n);
+    const uint8_t *src = vk_usnap_peek(b->addr, n);
+    VkMemSpan sp;
+    if (!src) {
+        if (!vk_mem_resolve(b->addr, n, &sp) || (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC))
+            return zero_info(n);
+        src = (const uint8_t *)(uintptr_t)b->addr;   // guest memory: written in replay order (op_update_ub)
+    }
+    typeof(WIN[0]) *w = &WIN[st];
+    if (!w->valid || w->addr != b->addr || memcmp(w->bytes, src, n)) {
+        memcpy(scratch(ex, n, &w->buf, &w->off), src, n);
+        memcpy(w->bytes, src, n);
+        w->addr = b->addr, w->valid = 1;
+    }
+    return (VkDescriptorBufferInfo){w->buf, w->off, n};
+}
+
+static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot, const GfxShaderRes *r) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     uint64_t max = LIM.ubo_max, align = LIM.ubo_align;
+    if (r->flags & GFX_UBO_TWIN) return window_info(ex, st, slot, r->ubo_bytes);
+    uint32_t reach = r->ubo_bytes;
     if (reach && reach < max && ub_reach_on()) max = reach;
     VkDescriptorBufferInfo bi;
     if (slot == 0 && c0_on()) return c0_info(ex, st);
@@ -933,7 +962,8 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot, uint32_t re
         }
     } else if (slot >= 3 && slot - 3 < 18) {
         const p_bind_buf *b = &ex->ubo[st][slot - 3];
-        if (b->size && vk_usnap_find(b->addr, b->size < max ? b->size : max, align, &bi)) {   // as of the submit call
+        if (b->size && vk_usnap_find(b->addr, b->size < max ? b->size : max, align, &bi,
+                                     (r->flags & (GFX_UBO_WINDOWED | GFX_UBO_BASE)) != 0)) {   // as of the submit call
             count_use(VK_MCLS_SCRATCH, VK_MUSE_UBO, bi.range);
             return bi;
         }
@@ -1842,7 +1872,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             }
             o->buffer = (VkDescriptorBufferInfo){B.sup_buf, B.sup_off, SUPPORT_BYTES};
         } else if (b->kind == GFX_RES_UBO) {
-            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k, r->ubo_bytes);
+            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k, r);
         } else if (b->kind == GFX_RES_SSBO) {
             for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ssbo_info(ex, st, r, r->flags & 1);
         } else if (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) {

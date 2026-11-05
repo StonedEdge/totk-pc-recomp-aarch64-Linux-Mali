@@ -43,7 +43,12 @@ typedef struct Arena {
 } Arena;
 
 typedef struct { uint64_t lo, hi; } Rng;
-typedef struct { uint64_t lo, hi, off; int dropped, found; } Reg;   // found: bound since its last version
+typedef struct {
+    uint64_t lo, hi, off;
+    int dropped, found;          // found: bound since its last version
+    int split;                   // a part of a region split at an update: its copy as the submission began is
+    uint64_t blo, bhi, boff;     // [blo, bhi) at boff (the base a block with a window twin binds)
+} Reg;
 typedef struct { uint64_t lo, hi, fence; int ub; } Wrote;   // ub: an UpdateUniformBuffer copy
 typedef struct { uint64_t lo, hi, fence; uint8_t *data; } PendUb;   // an update copy on the GPU timeline, its bytes
 
@@ -71,6 +76,7 @@ static struct {
     uint64_t ex_ub;             // ranges left out as in flight because of an UpdateUniformBuffer copy of an earlier submission
     uint64_t in_ub, late;       // ranges copied with update copies in flight applied; guest writes redone after one
     uint64_t splits, joins, join_bytes, join_fail;   // big regions split at an update; bindings across a split
+    uint64_t bases, peeks;      // bindings of a split block's base; window twin reads
 } U;
 
 static Arena *free_arenas;
@@ -259,14 +265,16 @@ static void summary(void) {
                "live (left out of the copy; %.1f of them by an earlier submission's update copy in flight), %.1f "
                "partly in a region, %.1f with the arena full; ranges left out by an update copy in flight %.1f, copied "
                "with those copies applied %.1f, guest writes redone after one %.1f; big regions split %.1f, bindings "
-               "across a split %.1f (%.1f KiB copied), not joined %.1f",
+               "across a split %.1f (%.1f KiB copied), not joined %.1f; split blocks bound as their base %.1f, window "
+               "reads %.1f",
                U.upd_done / s, U.upd_bytes / s / 1024.0, U.upd_direct / s, U.upd_big / s, upd_max >> 10,
                U.upd_big ? U.upd_big_bytes / (double)U.upd_big / 1024.0 : 0.0, U.upd_dropped / s, U.upd_live / s,
                U.upd_live_ub / s, U.upd_none / s, U.upd_full / s, U.ex_ub / s, U.in_ub / s, U.late / s, U.splits / s,
-               U.joins / s, U.join_bytes / s / 1024.0, U.join_fail / s);
+               U.joins / s, U.join_bytes / s / 1024.0, U.join_fail / s, U.bases / s, U.peeks / s);
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
     U.upd_done = U.upd_bytes = U.upd_big = U.upd_none = U.upd_full = U.upd_direct = U.upd_dropped = U.upd_big_bytes = 0;
     U.upd_live = U.upd_live_ub = U.ex_ub = U.in_ub = U.late = U.splits = U.joins = U.join_bytes = U.join_fail = 0;
+    U.bases = U.peeks = 0;
 }
 
 static int first_above(uint64_t a);
@@ -318,7 +326,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
             continue;
         }
         if (U.nreg == U.creg) U.reg = grow(U.reg, &U.creg, sizeof *U.reg);
-        U.reg[U.nreg++] = (Reg){lo, hi, total, 0, 0};
+        U.reg[U.nreg++] = (Reg){lo, hi, total, 0, 0, 0, 0, 0, 0};
         total += (hi - lo + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     }
     if (!U.nreg) return;
@@ -363,9 +371,15 @@ static int first_above(uint64_t a) {
 // read by its shaders at computed offsets, so its bindings stay whole, every one of them needed a joined 64 KiB copy
 // (~60 a submission, 3.9 MiB), the arena ran out, and bindings that could not be joined read live memory, which holds
 // the newest update: the terrain flickered.
+// With the window twins (TOTK_UB_WINDOW, gfx_shader.c ubo_window) it is on: the block's readers at computed offsets
+// bind the base (vk_usnap_find base_ok), its window comes from a small per-draw buffer (vk_usnap_peek), and no join
+// of 64 KiB is needed.
 static int split_on(void) {
     static int on = -1;
-    if (on < 0) on = cfg_bool("TOTK_UB_SPLIT");
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_UB_SPLIT");
+        on = e && *e ? strcmp(e, "0") != 0 : vk_caps_tiler_opt("TOTK_UB_WINDOW");
+    }
     return on;
 }
 
@@ -399,13 +413,29 @@ static void big_note(const char *what, const Reg *r, uint64_t addr, uint64_t n) 
            (unsigned long long)(addr - r->lo), (unsigned long long)n);
 }
 
-int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
+int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out, int base_ok) {
     if (!U.on || !n) return 0;
     int i = first_above(addr);
     if (i >= U.nreg) return 0;
     Reg *r = &U.reg[i];
     if (U.random && r->hi - r->lo > upd_max && addr >= r->lo && addr < r->hi) big_note("bind", r, addr, n);
-    if (!r->dropped && addr >= r->lo && addr + n > r->hi && U.arena && U.arena->shadow) return join(i, addr, n, align, out);
+    // A block with a window twin, bound across a split: its copy as the submission began (the twin reads the window)
+    if (base_ok && r->split && !r->dropped && addr >= r->blo && addr + n <= r->bhi && addr + n > r->hi &&
+        (r->boff + (addr - r->blo)) % align == 0) {
+        *out = (VkDescriptorBufferInfo){U.arena->buf, r->boff + (addr - r->blo), n};
+        U.hits++, U.bases++;
+        return 1;
+    }
+    if (!r->dropped && addr >= r->lo && addr + n > r->hi && U.arena && U.arena->shadow) {
+        if (join(i, addr, n, align, out)) return 1;
+        // no room for the join: the base rather than live memory, which holds the newest update (0049's flicker)
+        if (r->split && addr >= r->blo && addr + n <= r->bhi && (r->boff + (addr - r->blo)) % align == 0) {
+            *out = (VkDescriptorBufferInfo){U.arena->buf, r->boff + (addr - r->blo), n};
+            U.hits++, U.bases++;
+            return 1;
+        }
+        return 0;
+    }
     if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
@@ -466,7 +496,8 @@ int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
         if (U.nreg == U.creg) U.reg = grow(U.reg, &U.creg, sizeof *U.reg), r = &U.reg[i];
         memmove(&U.reg[i + 2], &U.reg[i + 1], (size_t)(U.nreg - i - 1) * sizeof *U.reg);
         U.nreg++;
-        U.reg[i + 1] = (Reg){r->lo + head, r->hi, r->off + head, r->dropped, r->found};
+        if (!r->split) r->split = 1, r->blo = r->lo, r->bhi = r->hi, r->boff = r->off;
+        U.reg[i + 1] = (Reg){r->lo + head, r->hi, r->off + head, r->dropped, r->found, 1, r->blo, r->bhi, r->boff};
         r->hi = r->lo + head;
         rn = head, need = head;
         U.splits++;
@@ -525,6 +556,19 @@ void vk_usnap_ub_copy(uint64_t dst, uint64_t n, const void *data) {
     if (!d) rt_fatal("vk_usnap: out of memory");
     memcpy(d, data, n);
     U.pub[U.npub++] = (PendUb){dst, dst + n, U.fence, d};
+}
+
+// The bytes [addr, addr+n) as the replay is at now (the window twin's source, vk_exec_draw.c window_info): the current
+// version of the region holding them, which a later version must re-resolve (found). NULL when no region holds them.
+const uint8_t *vk_usnap_peek(uint64_t addr, uint64_t n) {
+    if (!U.on || !U.arena || !U.arena->shadow || !n) return NULL;
+    int i = first_above(addr);
+    if (i >= U.nreg) return NULL;
+    Reg *r = &U.reg[i];
+    if (r->dropped || addr < r->lo || addr + n > r->hi) return NULL;
+    r->found = 1;
+    U.peeks++;
+    return U.arena->shadow + r->off + (addr - r->lo);
 }
 
 uint64_t vk_usnap_gen(void) { return U.gen; }

@@ -408,7 +408,7 @@ fail:
 static int mv_pass(VkCommandBuffer cb, const struct Size *e, VkImageView zv, float jx, float jy) {
     uint32_t w = e->w, h = e->h;
     VkDescriptorBufferInfo cam;
-    if (!mv_init() || !D.cam_addr || !vk_usnap_find(D.cam_addr, CAM_BYTES, 4, &cam)) {
+    if (!mv_init() || !D.cam_addr || !vk_usnap_find(D.cam_addr, CAM_BYTES, 4, &cam, 0)) {
         D.mv_none++;
         D.cam_prev_ok = 0;
         return 0;

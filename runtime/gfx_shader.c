@@ -719,6 +719,11 @@ enum { OP_ENTRY_POINT = 15, OP_EXECUTION_MODE = 16, OP_TYPE_INT = 21, OP_TYPE_FL
 enum { OP_NAME = 5, OP_MEMBER_NAME = 6, OP_TYPE_STRUCT = 30, OP_CONSTANT = 43, OP_ACCESS_CHAIN = 65,
        OP_IN_BOUNDS_ACCESS_CHAIN = 66, OP_MEMBER_DECORATE = 72, DEC_BINDING = 33, DEC_ARRAY_STRIDE = 6, SC_UNIFORM = 2 };
 
+// The per-draw window of a uniform block (ubo_window): vectors [UBW_FIRST, UBW_END), bytes 0x10..0x4f. TotK rewrites
+// those 64 bytes of a 64 KiB block before every draw (the 0048 log: update at +0x10, 0x40 bytes; bind at +0, 0x10000).
+#define UBW_FIRST 1
+#define UBW_END 5
+
 // UBO reach (GfxShaderRes.ubo_bytes): the furthest byte each uniform block's variable is read at. The translator
 // (Ryujinx) declares a constant buffer as a Block struct whose member 0 is an array of 16-byte vectors, and reads it
 // with OpAccessChain(var, 0, vector, component): a constant vector index bounds the read. A computed index, another use
@@ -737,6 +742,7 @@ static void ubo_reach(GfxShader *s) {
     uint32_t *stride = calloc(bound, sizeof *stride);
     uint8_t *vec4 = calloc(bound, 1);
     uint32_t reach[64] = {0};   // per binding (< 64): furthest byte + 1; UINT32_MAX unbounded
+    uint8_t dyn[64] = {0}, win[64] = {0}, odd[64] = {0};   // computed index; a constant read of vectors 1-4; another use
     if (!bind || !var || !cval || !pointee || !m0 || !elem || !stride || !vec4) goto out;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
@@ -767,7 +773,7 @@ static void ubo_reach(GfxShader *s) {
             var[a[1]] = b + 1;
             // the shape the reach assumes: Block { vec4 data[N] } with a 16-byte stride
             if (!t || !m0[st] || !elem[arr] || el >= bound || vec4[el] != 1 || (stride[arr] && stride[arr] != 16))
-                reach[b] = UINT32_MAX;
+                reach[b] = UINT32_MAX, odd[b] = 1;
         } else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 4 && a[2] < bound && var[a[2]]) {
             uint32_t b = var[a[2]] - 1, end;
             int nidx = (int)len - 4;   // indices after the base
@@ -775,14 +781,17 @@ static void ubo_reach(GfxShader *s) {
             if (nidx >= 2 && ix[0] < bound && cval[ix[0]] == 1 && ix[1] < bound && cval[ix[1]]) {
                 end = (cval[ix[1]] - 1) * 16 + 16;
                 if (nidx >= 3 && ix[2] < bound && cval[ix[2]]) end = (cval[ix[1]] - 1) * 16 + (cval[ix[2]] - 1) * 4 + 4;
+                if (cval[ix[1]] - 1 >= UBW_FIRST && cval[ix[1]] - 1 < UBW_END) win[b] = 1;
             } else {
                 end = UINT32_MAX;   // a computed index, or a pointer to the whole array
+                if (nidx >= 2 && ix[0] < bound && cval[ix[0]] == 1) dyn[b] = 1;
+                else odd[b] = 1;
             }
             if (reach[b] != UINT32_MAX && end > reach[b]) reach[b] = end;
         } else if (op != OP_NAME && op != OP_MEMBER_NAME && op != OP_DECORATE && op != OP_MEMBER_DECORATE &&
                    op != OP_ENTRY_POINT && op != OP_VARIABLE && op != OP_ACCESS_CHAIN && op != OP_IN_BOUNDS_ACCESS_CHAIN) {
             for (uint32_t k = 0; k + 1 < len; k++)   // any other use of a uniform variable: unbounded
-                if (a[k] < bound && var[a[k]]) reach[var[a[k]] - 1] = UINT32_MAX;
+                if (a[k] < bound && var[a[k]]) reach[var[a[k]] - 1] = UINT32_MAX, odd[var[a[k]] - 1] = 1;
         }
         i += len;
     }
@@ -791,6 +800,8 @@ static void ubo_reach(GfxShader *s) {
         GfxShaderRes *res = &s->res[GFX_RES_UBO][r];
         uint32_t b = res->binding, e = b < 64 ? reach[b] : UINT32_MAX;
         res->ubo_bytes = e && e != UINT32_MAX ? (e + 15) & ~15u : 0;   // never read: unbounded too (the safe answer)
+        // read at computed offsets: bound whole; with a constant read of the window it gets a twin (ubo_window)
+        if (b < 64 && dyn[b] && !odd[b] && res->slot >= 3) res->flags |= win[b] ? GFX_UBO_WINDOWED : GFX_UBO_BASE;
         plat_inc32(res->ubo_bytes ? &n_bounded : &n_open);
         if (res->ubo_bytes && res->ubo_bytes <= 4096) plat_inc32(&n_small);
     }
@@ -800,6 +811,116 @@ static void ubo_reach(GfxShader *s) {
                k, n_bounded, n_small, n_open);
 out:
     free(bind), free(var), free(cval), free(pointee), free(m0), free(elem), free(stride), free(vec4);
+}
+
+// The window twin (TOTK_UB_WINDOW, tilers, Mali by default). A uniform block a shader reads both at computed offsets
+// (it cannot be bound shorter) and at constant offsets inside the per-draw window gets a second variable of the same
+// type at a new binding, and the constant reads of the window read that one: the replay binds it to a small buffer
+// with the block's window as of the draw (vk_exec_draw.c ubo_info), and the block itself to one copy shared by the
+// submission's draws (vk_usnap.c, base). Without it every draw of TotK's terrain needed its own 64 KiB copy, or the
+// game's update became a copy on the GPU timeline that ends the pass. The twin's GfxShaderRes has GFX_UBO_TWIN and the
+// slot of its block. Reads of the window at computed offsets still read the shared copy (assumed not to happen).
+int vk_caps_tiler_opt(const char *name) __attribute__((weak));
+static int ubo_window_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_UB_WINDOW");
+        on = e && *e ? strcmp(e, "0") != 0 : vk_caps_tiler_opt ? vk_caps_tiler_opt("TOTK_UB_WINDOW") : 0;
+    }
+    return on;
+}
+
+static void ubo_window(GfxShader *s) {
+    int nubo = s->nres[GFX_RES_UBO], want = 0;
+    for (int r = 0; r < nubo; r++) want += !!(s->res[GFX_RES_UBO][r].flags & GFX_UBO_WINDOWED);
+    if (!want || !ubo_window_on()) {
+        for (int r = 0; r < nubo; r++) s->res[GFX_RES_UBO][r].flags &= (uint8_t)~GFX_UBO_WINDOWED;
+        return;
+    }
+    const uint32_t *w = s->spirv;
+    uint64_t n = s->words;
+    uint32_t bound = w[3], span = 1;
+    for (int k = 0; k < GFX_RES_KINDS; k++)
+        for (int r = 0; r < s->nres[k]; r++) {
+            uint32_t e = s->res[k][r].binding + (s->res[k][r].count ? s->res[k][r].count : 1);
+            if (e > span) span = e;
+        }
+    // the variables: binding -> id, its pointer type, its set
+    uint32_t vid[64] = {0}, vtype[64] = {0}, vset[64] = {0}, twin[64] = {0}, tbind[64] = {0};
+    uint32_t *bindof = calloc(bound, sizeof *bindof), *setof = calloc(bound, sizeof *setof);
+    uint32_t *cval = calloc(bound, sizeof *cval);   // OpConstant value + 1
+    uint32_t *o = malloc((n + (uint64_t)want * 16 + 8) * 4);
+    if (!bindof || !setof || !cval || !o) goto fail;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto fail;
+        const uint32_t *a = w + i + 1;
+        if (op == OP_DECORATE && len >= 4 && a[0] < bound && a[1] == DEC_BINDING) bindof[a[0]] = a[2] + 1;
+        if (op == OP_DECORATE && len >= 4 && a[0] < bound && a[1] == 34) setof[a[0]] = a[2] + 1;
+        if (op == OP_CONSTANT && len == 4 && a[1] < bound) cval[a[1]] = a[2] + 1;
+        if (op == OP_VARIABLE && len >= 4 && a[1] < bound && a[2] == SC_UNIFORM && bindof[a[1]] && bindof[a[1]] - 1 < 64)
+            vid[bindof[a[1]] - 1] = a[1], vtype[bindof[a[1]] - 1] = a[0], vset[bindof[a[1]] - 1] = setof[a[1]] ? setof[a[1]] - 1 : 0;
+        i += len;
+    }
+    for (int r = 0; r < nubo; r++) {
+        GfxShaderRes *res = &s->res[GFX_RES_UBO][r];
+        if (!(res->flags & GFX_UBO_WINDOWED)) continue;
+        if (res->binding >= 64 || !vid[res->binding]) { res->flags &= (uint8_t)~GFX_UBO_WINDOWED; continue; }
+        twin[res->binding] = bound++, tbind[res->binding] = span++;
+    }
+    // copy, inserting the twins' decorations after their block's Binding and their variables after the block's
+    uint64_t m = 0;
+    int v14 = w[1] >= 0x00010400;
+    for (uint64_t i = 0; i < 5; i++) o[m++] = w[i];
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        uint64_t at = m;
+        for (uint32_t k = 0; k < len; k++) o[m++] = w[i + k];
+        if (op == OP_ENTRY_POINT && v14) {   // SPIR-V 1.4: every global variable the entry point uses is listed
+            for (int b = 0; b < 64; b++)
+                if (twin[b]) o[m++] = twin[b], o[at] += 1u << 16;
+        } else if (op == OP_DECORATE && len >= 4 && a[1] == DEC_BINDING) {
+            for (int b = 0; b < 64; b++)
+                if (twin[b] && a[0] == vid[b]) {
+                    o[m++] = 4u << 16 | OP_DECORATE, o[m++] = twin[b], o[m++] = 34, o[m++] = vset[b];
+                    o[m++] = 4u << 16 | OP_DECORATE, o[m++] = twin[b], o[m++] = DEC_BINDING, o[m++] = tbind[b];
+                }
+        } else if (op == OP_VARIABLE && len >= 4) {
+            for (int b = 0; b < 64; b++)
+                if (twin[b] && a[1] == vid[b])
+                    o[m++] = 4u << 16 | OP_VARIABLE, o[m++] = vtype[b], o[m++] = twin[b], o[m++] = SC_UNIFORM;
+        } else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 6) {
+            for (int b = 0; b < 64; b++)
+                if (twin[b] && a[2] == vid[b] && a[3] < bound && cval[a[3]] == 1 && a[4] < bound && cval[a[4]] &&
+                    cval[a[4]] - 1 >= UBW_FIRST && cval[a[4]] - 1 < UBW_END)
+                    o[at + 3] = twin[b];   // a constant read of the window: from the twin
+        }
+        i += len;
+    }
+    o[3] = bound;
+    // the twins' reflection entries
+    GfxShaderRes *nr = realloc(s->res[GFX_RES_UBO], (size_t)(nubo + want) * sizeof *nr);
+    if (!nr) goto fail;
+    s->res[GFX_RES_UBO] = nr;
+    int added = 0;
+    for (int r = 0; r < nubo; r++)
+        if ((nr[r].flags & GFX_UBO_WINDOWED) && twin[nr[r].binding]) {
+            GfxShaderRes t = nr[r];
+            t.binding = (uint16_t)tbind[nr[r].binding], t.flags = GFX_UBO_TWIN, t.ubo_bytes = UBW_END * 16;
+            nr[nubo + added++] = t;
+        }
+    s->nres[GFX_RES_UBO] = nubo + added;
+    free(s->spirv);
+    s->spirv = o, s->words = m;
+    free(bindof), free(setof), free(cval);
+    static volatile int32_t n_tw;
+    int32_t k = plat_inc32(&n_tw);
+    if (k <= 4 || k == 64 || k == 512) rt_log("gfx_shader: uniform window twins: %d so far", k);
+    return;
+fail:
+    free(bindof), free(setof), free(cval), free(o);
+    for (int r = 0; r < nubo; r++) s->res[GFX_RES_UBO][r].flags &= (uint8_t)~GFX_UBO_WINDOWED;
 }
 
 // Interface Locations and the compute workgroup size from the module. Ids beyond 2^20 are ignored (Ryujinx modules stay
@@ -925,6 +1046,7 @@ static void reflect(GfxShader *s) {
     }
     reflect_spirv(s);
     ubo_reach(s);
+    ubo_window(s);
     patch_txd_transpose(s);
 }
 
