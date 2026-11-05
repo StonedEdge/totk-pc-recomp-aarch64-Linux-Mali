@@ -151,6 +151,21 @@ int plat_cpu_cores(uint64_t *all, uint64_t *first) {
     return cores;
 }
 
+uint64_t plat_fast_cpus(uint64_t all) {
+    uint64_t best = 0, fast = 0, slow = 0;
+    for (int i = 0; i < 64; i++) {
+        if (!(all >> i & 1)) continue;
+        char path[96];
+        uint64_t f = 0;
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+        if (!read_u64_file(path, &f) || !f) return 0;
+        if (f > best) slow |= fast, fast = 1ull << i, best = f;
+        else if (f == best) fast |= 1ull << i;
+        else slow |= 1ull << i;
+    }
+    return slow ? fast : 0;
+}
+
 // Linux has no process-wide affinity: each thread of /proc/self/task gets the mask, and threads started later inherit
 // it from the thread that starts them.
 int plat_process_affinity(uint64_t mask) {

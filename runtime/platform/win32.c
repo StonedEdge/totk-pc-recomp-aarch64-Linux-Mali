@@ -75,6 +75,11 @@ void plat_thread_detach(PlatThread *t) {
     t->h = NULL;
 }
 
+uint64_t plat_fast_cpus(uint64_t all) {   // (not looked at on Windows yet)
+    (void)all;
+    return 0;
+}
+
 int plat_cpu_cores(uint64_t *all, uint64_t *first) {
     DWORD_PTR proc, sys;
     *all = *first = 0;

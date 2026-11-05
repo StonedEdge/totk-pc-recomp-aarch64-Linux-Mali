@@ -239,9 +239,12 @@ int rt_knob(const char *name, const char *def) {
 // render thread, the guest cores, the job workers) never share a core's execution units with another; "ab" switches
 // it with the A/B blocks. Off by default until measured here; Savage Wind Recomp
 // reported +4-10% from the same rule on an 8-core SMT CPU.
+// TOTK_BIG_CORES (on by default where the cores have two maximum clocks): the process keeps the fastest cores. On the
+// RK3588 (4 A76 at 2.4 GHz, 4 A55 at 1.8 GHz) no game thread is busy more than ~40% of a core, so the scheduler put
+// guest threads on the A55s, and the frame waits on them: outdoors 17.2 -> 19.1 fps on the A76s only.
 static void cpu_placement(void) {
     static int mode = -1, applied = -1;
-    static uint64_t all, one;
+    static uint64_t all, one, fast;
     if (mode < 0) {
         mode = rt_knob("ONE_PER_CORE", "0");
         int cores = plat_cpu_cores(&all, &one);
@@ -250,11 +253,20 @@ static void cpu_placement(void) {
                    mode == 2 ? " in the B blocks" : "");
         else
             mode = 0;
+        fast = plat_fast_cpus(all);
+        const char *b = cfg_get("TOTK_BIG_CORES");
+        if (fast && (b && *b ? strcmp(b, "0") != 0 : 1))
+            rt_log("cpu: the game keeps the fastest cores (mask %#llx of %#llx; TOTK_BIG_CORES=0 for all)",
+                   (unsigned long long)fast, (unsigned long long)all);
+        else
+            fast = 0;
     }
     int on = RT_KNOB_ON(mode);
     if (on == applied) return;
     applied = on;
-    plat_process_affinity(on ? one : all);
+    uint64_t m = on ? one : all;
+    if (fast && (m & fast)) m &= fast;
+    plat_process_affinity(m);
 }
 
 void perf_present(uint64_t frame) {
