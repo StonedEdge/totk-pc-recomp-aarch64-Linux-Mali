@@ -1014,6 +1014,16 @@ static void shadow_log(uint64_t frame) {
 
 void vk_mem_dirty_submit(void) {
     if (!(rt_trace & RT_TRACE_PERF) || vk_mirror_on) return;   // the mirror's own line replaces the census
+    // TOTK_DIRTY_CENSUS=1 only: the census queries every bound imported pool with a reset at each submit, which on a
+    // kernel without userfaultfd (software write watch) re-arms those pages with mprotect and makes the game's next
+    // writes fault again. On the Mali handheld that cost ~2.5 ms of the render thread a frame, so perf traces measured
+    // a slower game than the one played.
+    static int census = -1;
+    if (census < 0) {
+        const char *e = cfg_get("TOTK_DIRTY_CENSUS");
+        census = e && *e && strcmp(e, "0");
+    }
+    if (!census) return;
     uint64_t t0 = kern_now_ns();
     uint32_t prev = dirty_sub;   // the submit whose replay noted the bindings
     dirty_sub = prev + 1 ? prev + 1 : 1;
