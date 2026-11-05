@@ -117,6 +117,34 @@ static unsigned pending_head;
 // counter_cb writes them; the real values replace them when the submissions complete. Called on the game's thread;
 // the ring is the replay's, so an entry may be overwritten meanwhile (then it is only a report written early).
 #define PROVISIONAL_SAMPLES (1u << 20)
+// The last samples-passed count written to each report address (oq_cb, completion thread): a provisional value is that
+// count when there is one, so the game's occlusion culling goes on with an answer a frame or two old rather than
+// "everything visible" (which drew everything it would have culled: more draws in grassy views). TOTK_REPORT_GUESS=
+// visible brings the old provisional value back. Entries are two words written apart; a torn read only gives an older
+// or a visible guess.
+#define LASTN 8192
+static struct { volatile uint64_t addr, count; } last_count[LASTN];
+static uint64_t guess_known, guess_visible;
+static unsigned last_slot(uint64_t a) { return (unsigned)((a >> 4) * 0x9E3779B97F4A7C15ull >> 51) & (LASTN - 1); }
+static void last_put(uint64_t a, uint64_t c) {
+    unsigned i = last_slot(a);
+    __atomic_store_n(&last_count[i].count, c, __ATOMIC_RELAXED);
+    __atomic_store_n(&last_count[i].addr, a, __ATOMIC_RELEASE);
+}
+static int last_get(uint64_t a, uint64_t *c) {
+    unsigned i = last_slot(a);
+    if (__atomic_load_n(&last_count[i].addr, __ATOMIC_ACQUIRE) != a) return 0;
+    *c = __atomic_load_n(&last_count[i].count, __ATOMIC_RELAXED);
+    return 1;
+}
+static int guess_last(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_REPORT_GUESS");
+        on = !(e && !strcmp(e, "visible"));
+    }
+    return on;
+}
 void vk_reports_provisional(uint64_t after, uint64_t upto) {
     uint64_t done = vk_sync_fence_done();
     unsigned head = __atomic_load_n(&pending_head, __ATOMIC_ACQUIRE);
@@ -124,7 +152,15 @@ void vk_reports_provisional(uint64_t after, uint64_t upto) {
         unsigned i = (head - k) % PENDING;
         uint64_t f = pending[i].fence, a = pending[i].addr;
         if (f <= after || f > upto || f <= done || !a || nvn_gpu_only(a)) continue;
-        write_counter(a, pending[i].unknown ? PROVISIONAL_SAMPLES : 0);
+        uint64_t c = PROVISIONAL_SAMPLES;
+        if (pending[i].unknown && guess_last() && last_get(a, &c)) guess_known++;
+        else if (pending[i].unknown) c = PROVISIONAL_SAMPLES, guess_visible++;
+        write_counter(a, pending[i].unknown ? c : 0);
+    }
+    if ((rt_trace & RT_TRACE_PERF) && guess_known + guess_visible >= 200000) {
+        rt_log("vk: run-ahead occlusion guesses: %llu the last count of the report, %llu visible (none known)",
+               (unsigned long long)guess_known, (unsigned long long)guess_visible);
+        guess_known = guess_visible = 0;
     }
 }
 
@@ -259,7 +295,7 @@ static void oq_cb(void *arg) {
     else {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
-        if (s->addr) write_counter(s->addr, oq_count);
+        if (s->addr) write_counter(s->addr, oq_count), last_put(s->addr, oq_count);
         if (vk_gpuw_on()) {   // TOTK_GPUW_LOG: how the samples-passed reports come out, every ~2 s
             static uint64_t n, zero, big, t;
             n++, zero += !oq_count, big += oq_count > 1000;
