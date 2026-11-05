@@ -500,13 +500,40 @@ static void sw_note_wait(uint64_t fence, uint64_t ns) {
            n[3] / f, t[3] / 1e6 / f, n[4] / f, t[4] / 1e6 / f, q / f);
 }
 
+// TOTK_SYNC_AHEAD=1 (experimental, off): a wait on a sync fenced in an earlier frame waits instead for the newest
+// sync fenced in the frame before that one, so the game runs a frame further ahead of the GPU. Outdoors on the Mali
+// handheld the game waits once a frame, ~12 ms, for the previous frame's GPU work, so the CPU and the GPU take turns.
+// The game then believes work done that may still run: data it reads back from the GPU can be a frame old, and memory
+// it rewrites while the GPU still reads it can show as flicker. A wait on a sync of the same frame waits as before.
+static int sync_ahead(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = cfg_bool("TOTK_SYNC_AHEAD");
+        if (on) rt_log("nvn: TOTK_SYNC_AHEAD: the game may run a frame further ahead of the GPU (experimental)");
+    }
+    return on;
+}
+
+// The fence to wait for instead of fence: the newest one fenced in a frame before fence's; 0 for none (or when fence
+// was fenced in the current frame).
+static uint64_t sw_older_fence(uint64_t fence) {
+    uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), at = UINT64_MAX;
+    uint32_t put = __atomic_load_n(&sw_put, __ATOMIC_RELAXED), k;
+    for (k = 1; k <= SW_RING && k <= put; k++)
+        if (sw_ring[(put - k) % SW_RING].fence == fence) { at = sw_ring[(put - k) % SW_RING].frame; break; }
+    if (at == UINT64_MAX || at >= now) return 0;
+    for (; k <= SW_RING && k <= put; k++)
+        if (sw_ring[(put - k) % SW_RING].frame < at) return sw_ring[(put - k) % SW_RING].fence;
+    return 0;
+}
+
 // void nvnQueueFenceSync(NVNqueue *q, NVNsync *s, NVNsyncCondition condition, int flags): "every command submitted to
 // the queue so far has completed"
 NVN_API(nvnQueueFenceSync) {
     sync_t *s = arg_p(c, 1);
     s->fenced = 1;
     s->fence = nvn_fence_last();
-    if (rt_trace & RT_TRACE_PERF) sw_note_fence(s->fence);
+    if ((rt_trace & RT_TRACE_PERF) || sync_ahead()) sw_note_fence(s->fence);
 }
 // NVNsyncWaitResult nvnSyncWait(const NVNsync *s, uint64_t timeout_ns): a sync never fenced reports a timeout at once;
 // a fenced one is released only after the back end completed that fence value
@@ -521,14 +548,22 @@ NVN_API(nvnSyncWait) {
         ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED);
         return;
     }
+    uint64_t target = s->fence, older = sync_ahead() ? sw_older_fence(s->fence) : 0;
+    if (older && older < target) target = older;
+    if (target != s->fence && b->fence_done() >= target) {
+        if (rt_trace & RT_TRACE_PERF) __atomic_fetch_add(&sw_quick, 1, __ATOMIC_RELAXED);
+        b->cpu_synced(target);
+        ret_x(c, NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED);
+        return;
+    }
     int ok;
     uint64_t w0 = rt_trace & RT_TRACE_PERF ? kern_now_ns() : 0;
     {
         NVN_BLOCKING();
-        ok = b->fence_wait(s->fence, timeout);
+        ok = b->fence_wait(target, timeout);
     }
     if (w0 && timeout) sw_note_wait(s->fence, kern_now_ns() - w0);
-    if (ok) b->cpu_synced(s->fence);
+    if (ok) b->cpu_synced(target);
     ret_x(c, ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
 }
 // void nvnEventBuilderSetDefaults(NVNeventBuilder *b)
