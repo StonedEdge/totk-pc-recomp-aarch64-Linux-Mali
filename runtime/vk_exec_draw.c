@@ -905,9 +905,19 @@ static void limits_init(void) {
     __atomic_store_n(&LIM.ubo_max, l->maxUniformBufferRange, __ATOMIC_RELEASE);
 }
 
-static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
+// TOTK_UB_REACH (tilers, Mali by default): a game uniform block is bound only as far as the shader can read it
+// (GfxShaderRes.ubo_bytes, gfx_shader.c ubo_reach). TotK binds blocks of 64 KiB and rewrites 64 bytes of one before
+// every draw; bound whole, every new version of it (vk_usnap.c) had to copy 64 KiB.
+static int ub_reach_on(void) {
+    static int on = -1;
+    if (on < 0) on = vk_caps_tiler_opt("TOTK_UB_REACH");
+    return on;
+}
+
+static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot, uint32_t reach) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     uint64_t max = LIM.ubo_max, align = LIM.ubo_align;
+    if (reach && reach < max && ub_reach_on()) max = reach;
     VkDescriptorBufferInfo bi;
     if (slot == 0 && c0_on()) return c0_info(ex, st);
     if (slot == 1 && ex->prog) {   // compiler constants stored after the shader code
@@ -1829,7 +1839,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             }
             o->buffer = (VkDescriptorBufferInfo){B.sup_buf, B.sup_off, SUPPORT_BYTES};
         } else if (b->kind == GFX_RES_UBO) {
-            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k);
+            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k, r->ubo_bytes);
         } else if (b->kind == GFX_RES_SSBO) {
             for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ssbo_info(ex, st, r, r->flags & 1);
         } else if (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) {

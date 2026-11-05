@@ -70,6 +70,7 @@ static struct {
     uint64_t upd_done, upd_bytes, upd_big, upd_none, upd_full, upd_direct, upd_dropped, upd_big_bytes, upd_live, upd_live_ub;
     uint64_t ex_ub;             // ranges left out as in flight because of an UpdateUniformBuffer copy of an earlier submission
     uint64_t in_ub, late;       // ranges copied with update copies in flight applied; guest writes redone after one
+    uint64_t splits, joins, join_bytes, join_fail;   // big regions split at an update; bindings across a split
 } U;
 
 static Arena *free_arenas;
@@ -257,16 +258,19 @@ static void summary(void) {
                "only), %.1f in a region over %u KiB (avg %.1f KiB), %.1f in a region dropped by a GPU write, %.1f bound "
                "live (left out of the copy; %.1f of them by an earlier submission's update copy in flight), %.1f "
                "partly in a region, %.1f with the arena full; ranges left out by an update copy in flight %.1f, copied "
-               "with those copies applied %.1f, guest writes redone after one %.1f",
+               "with those copies applied %.1f, guest writes redone after one %.1f; big regions split %.1f, bindings "
+               "across a split %.1f (%.1f KiB copied), not joined %.1f",
                U.upd_done / s, U.upd_bytes / s / 1024.0, U.upd_direct / s, U.upd_big / s, upd_max >> 10,
                U.upd_big ? U.upd_big_bytes / (double)U.upd_big / 1024.0 : 0.0, U.upd_dropped / s, U.upd_live / s,
-               U.upd_live_ub / s, U.upd_none / s, U.upd_full / s, U.ex_ub / s, U.in_ub / s, U.late / s);
+               U.upd_live_ub / s, U.upd_none / s, U.upd_full / s, U.ex_ub / s, U.in_ub / s, U.late / s, U.splits / s,
+               U.joins / s, U.join_bytes / s / 1024.0, U.join_fail / s);
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
     U.upd_done = U.upd_bytes = U.upd_big = U.upd_none = U.upd_full = U.upd_direct = U.upd_dropped = U.upd_big_bytes = 0;
-    U.upd_live = U.upd_live_ub = U.ex_ub = U.in_ub = U.late = 0;
+    U.upd_live = U.upd_live_ub = U.ex_ub = U.in_ub = U.late = U.splits = U.joins = U.join_bytes = U.join_fail = 0;
 }
 
 static int first_above(uint64_t a);
+static int join(int i, uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.mode) {
@@ -355,6 +359,25 @@ static int first_above(uint64_t a) {
     return lo;
 }
 
+// A binding across regions split from one (vk_usnap_update): a copy of its range joined from the regions' current
+// versions. 0 when the regions there are not contiguous, one is dropped, or the arena is full.
+static int join(int i, uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
+    uint64_t need = (n + ALIGN - 1) & ~(uint64_t)(ALIGN - 1), at = U.used, pos = addr;
+    if (at % align || at + need > U.arena->size) { U.join_fail++; return 0; }
+    for (int j = i; pos < addr + n; j++) {
+        if (j >= U.nreg || U.reg[j].dropped || U.reg[j].lo > pos) { U.join_fail++; return 0; }
+        uint64_t b = U.reg[j].hi < addr + n ? U.reg[j].hi : addr + n;
+        memcpy(U.arena->shadow + at + (pos - addr), U.arena->shadow + U.reg[j].off + (pos - U.reg[j].lo), b - pos);
+        pos = b;
+    }
+    for (int j = i; j < U.nreg && U.reg[j].lo < addr + n; j++) U.reg[j].found = 1;
+    memcpy(U.arena->map + at, U.arena->shadow + at, n);
+    U.used += need;
+    U.joins++, U.join_bytes += n, U.hits++;
+    *out = (VkDescriptorBufferInfo){U.arena->buf, at, n};
+    return 1;
+}
+
 // TOTK_UB_INPLACE: the first updates into and bindings of regions over the version limit, logged once (how the game
 // uses them decides how such a region can get versions).
 static int big_logged;
@@ -372,6 +395,7 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (i >= U.nreg) return 0;
     Reg *r = &U.reg[i];
     if (U.random && r->hi - r->lo > upd_max && addr >= r->lo && addr < r->hi) big_note("bind", r, addr, n);
+    if (!r->dropped && addr >= r->lo && addr + n > r->hi && U.arena && U.arena->shadow) return join(i, addr, n, align, out);
     if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
@@ -424,6 +448,19 @@ int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
     if (r->dropped) { U.upd_dropped++; return 0; }
     if (dst < r->lo || dst + n > r->hi) { U.upd_none++; return 0; }
     uint64_t rn = r->hi - r->lo, need = (rn + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
+    if (rn > upd_max && dst + n - r->lo <= upd_max) {
+        // A big region updated near its start (TotK: 64 bytes at +0x10 of a 64 KiB block before every draw): split
+        // there, so the versions copy the head; bindings reaching past it join the parts (join), and with
+        // TOTK_UB_REACH most draws bind only the start they read.
+        uint64_t head = dst + n - r->lo < 4096 ? 4096 : (dst + n - r->lo + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
+        if (U.nreg == U.creg) U.reg = grow(U.reg, &U.creg, sizeof *U.reg), r = &U.reg[i];
+        memmove(&U.reg[i + 2], &U.reg[i + 1], (size_t)(U.nreg - i - 1) * sizeof *U.reg);
+        U.nreg++;
+        U.reg[i + 1] = (Reg){r->lo + head, r->hi, r->off + head, r->dropped, r->found};
+        r->hi = r->lo + head;
+        rn = head, need = head;
+        U.splits++;
+    }
     if (rn > upd_max) { U.upd_big++, U.upd_big_bytes += rn; return 0; }
     if (U.used + need > U.arena->size) { U.upd_full++; return 0; }
     uint8_t *v = U.arena->shadow + U.used;

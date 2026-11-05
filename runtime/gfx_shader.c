@@ -716,6 +716,91 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
 enum { OP_ENTRY_POINT = 15, OP_EXECUTION_MODE = 16, OP_TYPE_INT = 21, OP_TYPE_FLOAT = 22, OP_TYPE_VECTOR = 23,
        OP_TYPE_ARRAY = 28, OP_TYPE_POINTER = 32, OP_VARIABLE = 59, OP_DECORATE = 71,
        DEC_BUILTIN = 11, DEC_LOCATION = 30, DEC_COMPONENT = 31, SC_INPUT = 1, SC_OUTPUT = 3, EM_LOCAL_SIZE = 17 };
+enum { OP_NAME = 5, OP_MEMBER_NAME = 6, OP_TYPE_STRUCT = 30, OP_CONSTANT = 43, OP_ACCESS_CHAIN = 65,
+       OP_IN_BOUNDS_ACCESS_CHAIN = 66, OP_MEMBER_DECORATE = 72, DEC_BINDING = 33, DEC_ARRAY_STRIDE = 6, SC_UNIFORM = 2 };
+
+// UBO reach (GfxShaderRes.ubo_bytes): the furthest byte each uniform block's variable is read at. The translator
+// (Ryujinx) declares a constant buffer as a Block struct whose member 0 is an array of 16-byte vectors, and reads it
+// with OpAccessChain(var, 0, vector, component): a constant vector index bounds the read. A computed index, another use
+// of the variable, or a declaration of another shape leaves the binding unbounded (0). TotK binds some uniform blocks
+// with 64 KiB and rewrites 64 bytes of one before every draw: a draw that reads only the start of it can be bound to
+// that start (vk_exec_draw.c ubo_info), which the uniform snapshot versions cheaply (vk_usnap.c).
+static void ubo_reach(GfxShader *s) {
+    const uint32_t *w = s->spirv;
+    uint64_t n = s->words;
+    int nubo = s->nres[GFX_RES_UBO];
+    if (n < 5 || !nubo) return;
+    uint32_t bound = w[3] < (1u << 20) ? w[3] : (1u << 20);
+    // per id: binding + 1 (decorations), uniform variable binding + 1, constant value + 1, type facts
+    uint32_t *bind = calloc(bound, sizeof *bind), *var = calloc(bound, sizeof *var), *cval = calloc(bound, sizeof *cval);
+    uint32_t *pointee = calloc(bound, sizeof *pointee), *m0 = calloc(bound, sizeof *m0), *elem = calloc(bound, sizeof *elem);
+    uint32_t *stride = calloc(bound, sizeof *stride);
+    uint8_t *vec4 = calloc(bound, 1);
+    uint32_t reach[64] = {0};   // per binding (< 64): furthest byte + 1; UINT32_MAX unbounded
+    if (!bind || !var || !cval || !pointee || !m0 || !elem || !stride || !vec4) goto out;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto out;
+        const uint32_t *a = w + i + 1;
+        if (op == OP_DECORATE && len >= 4 && a[0] < bound) {
+            if (a[1] == DEC_BINDING) bind[a[0]] = a[2] + 1;
+            else if (a[1] == DEC_ARRAY_STRIDE) stride[a[0]] = a[2];
+        } else if (op == OP_TYPE_FLOAT && len >= 3 && a[0] < bound) {
+            vec4[a[0]] = a[1] == 32 ? 2 : 0;   // 2: a 32-bit scalar, 1: four of them
+        } else if (op == OP_TYPE_INT && len >= 4 && a[0] < bound) {
+            if (a[1] == 32) vec4[a[0]] = 2;
+        } else if (op == OP_TYPE_VECTOR && len >= 4 && a[0] < bound && a[1] < bound) {
+            vec4[a[0]] = vec4[a[1]] == 2 && a[2] == 4 ? 1 : 0;
+        } else if (op == OP_TYPE_ARRAY && len >= 4 && a[0] < bound && a[1] < bound) {
+            elem[a[0]] = a[1] + 1;
+        } else if (op == OP_TYPE_STRUCT && len >= 3 && a[0] < bound) {
+            m0[a[0]] = a[1] + 1;
+        } else if (op == OP_TYPE_POINTER && len >= 4 && a[0] < bound) {
+            pointee[a[0]] = a[2] + 1;
+        } else if (op == OP_CONSTANT && len == 4 && a[1] < bound) {
+            cval[a[1]] = a[2] + 1;
+        } else if (op == OP_VARIABLE && len >= 4 && a[1] < bound && a[2] == SC_UNIFORM && bind[a[1]] &&
+                   bind[a[1]] - 1 < 64) {
+            uint32_t b = bind[a[1]] - 1, t = a[0] < bound ? pointee[a[0]] : 0;
+            uint32_t st = t ? t - 1 : 0, arr = st < bound && m0[st] ? m0[st] - 1 : 0;
+            uint32_t el = arr < bound && elem[arr] ? elem[arr] - 1 : 0;
+            var[a[1]] = b + 1;
+            // the shape the reach assumes: Block { vec4 data[N] } with a 16-byte stride
+            if (!t || !m0[st] || !elem[arr] || el >= bound || vec4[el] != 1 || (stride[arr] && stride[arr] != 16))
+                reach[b] = UINT32_MAX;
+        } else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 4 && a[2] < bound && var[a[2]]) {
+            uint32_t b = var[a[2]] - 1, end;
+            int nidx = (int)len - 4;   // indices after the base
+            const uint32_t *ix = a + 3;
+            if (nidx >= 2 && ix[0] < bound && cval[ix[0]] == 1 && ix[1] < bound && cval[ix[1]]) {
+                end = (cval[ix[1]] - 1) * 16 + 16;
+                if (nidx >= 3 && ix[2] < bound && cval[ix[2]]) end = (cval[ix[1]] - 1) * 16 + (cval[ix[2]] - 1) * 4 + 4;
+            } else {
+                end = UINT32_MAX;   // a computed index, or a pointer to the whole array
+            }
+            if (reach[b] != UINT32_MAX && end > reach[b]) reach[b] = end;
+        } else if (op != OP_NAME && op != OP_MEMBER_NAME && op != OP_DECORATE && op != OP_MEMBER_DECORATE &&
+                   op != OP_ENTRY_POINT && op != OP_VARIABLE && op != OP_ACCESS_CHAIN && op != OP_IN_BOUNDS_ACCESS_CHAIN) {
+            for (uint32_t k = 0; k + 1 < len; k++)   // any other use of a uniform variable: unbounded
+                if (a[k] < bound && var[a[k]]) reach[var[a[k]] - 1] = UINT32_MAX;
+        }
+        i += len;
+    }
+    static volatile int32_t n_sh, n_bounded, n_open, n_small;
+    for (int r = 0; r < nubo; r++) {
+        GfxShaderRes *res = &s->res[GFX_RES_UBO][r];
+        uint32_t b = res->binding, e = b < 64 ? reach[b] : UINT32_MAX;
+        res->ubo_bytes = e && e != UINT32_MAX ? (e + 15) & ~15u : 0;   // never read: unbounded too (the safe answer)
+        plat_inc32(res->ubo_bytes ? &n_bounded : &n_open);
+        if (res->ubo_bytes && res->ubo_bytes <= 4096) plat_inc32(&n_small);
+    }
+    int32_t k = plat_inc32(&n_sh);
+    if (k == 64 || k == 1024 || k == 4096)
+        rt_log("gfx_shader: uniform block reach after %d shaders: %d bindings bounded (%d within 4 KiB), %d unbounded",
+               k, n_bounded, n_small, n_open);
+out:
+    free(bind), free(var), free(cval), free(pointee), free(m0), free(elem), free(stride), free(vec4);
+}
 
 // Interface Locations and the compute workgroup size from the module. Ids beyond 2^20 are ignored (Ryujinx modules stay
 // far below).
@@ -839,6 +924,7 @@ static void reflect(GfxShader *s) {
         json_objects(js, kinds[k], add_res, s, k);
     }
     reflect_spirv(s);
+    ubo_reach(s);
     patch_txd_transpose(s);
 }
 
