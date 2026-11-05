@@ -719,10 +719,13 @@ enum { OP_ENTRY_POINT = 15, OP_EXECUTION_MODE = 16, OP_TYPE_INT = 21, OP_TYPE_FL
 enum { OP_NAME = 5, OP_MEMBER_NAME = 6, OP_TYPE_STRUCT = 30, OP_CONSTANT = 43, OP_ACCESS_CHAIN = 65,
        OP_IN_BOUNDS_ACCESS_CHAIN = 66, OP_MEMBER_DECORATE = 72, DEC_BINDING = 33, DEC_ARRAY_STRIDE = 6, SC_UNIFORM = 2 };
 
-// The per-draw window of a uniform block (ubo_window): vectors [UBW_FIRST, UBW_END), bytes 0x10..0x4f. TotK rewrites
-// those 64 bytes of a 64 KiB block before every draw (the 0048 log: update at +0x10, 0x40 bytes; bind at +0, 0x10000).
-#define UBW_FIRST 1
-#define UBW_END 5
+// The per-draw window of a uniform block (ubo_window): vectors [UBW_FIRST, UBW_END), the block's first 4 KiB. TotK
+// rewrites the start of 64 KiB blocks before every draw: one at +0x10, 0x40 bytes (the 0048 log), the terrain's fragment
+// block anywhere in its first ~0x940 bytes (TOTK_UB_CHECK: an 80-byte window left ~75 % of its draws with stale bytes,
+// and the ground changed its look as the camera turned). The twin is bound to the current version of that start
+// (vk_usnap.c splits such a block after 4 KiB), the rest of the block to its copy as the submission began.
+#define UBW_FIRST 0
+#define UBW_END 256
 
 // UBO reach (GfxShaderRes.ubo_bytes): the furthest byte each uniform block's variable is read at. The translator
 // (Ryujinx) declares a constant buffer as a Block struct whose member 0 is an array of 16-byte vectors, and reads it

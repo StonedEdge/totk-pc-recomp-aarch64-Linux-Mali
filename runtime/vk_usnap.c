@@ -415,6 +415,19 @@ static void big_note(const char *what, const Reg *r, uint64_t addr, uint64_t n) 
            (unsigned long long)(addr - r->lo), (unsigned long long)n);
 }
 
+// The base of the split block whose head is region i may stand for [addr, addr+n): bound at the block's start, the
+// head no larger than the twin (4 KiB), and the rest one region still at the copy as the submission began (no update
+// reached it). Otherwise the draws read stale bytes there (TOTK_UB_CHECK found ~75 % of the terrain's draws so).
+#define TWIN_BYTES 4096
+static int base_ok_at(int i, uint64_t addr, uint64_t n, uint64_t align) {
+    const Reg *h = &U.reg[i];
+    if (!h->split || h->dropped || addr != h->blo || h->lo != h->blo || h->hi - h->lo > TWIN_BYTES) return 0;
+    if (addr + n > h->bhi || addr + n <= h->hi || h->boff % align) return 0;
+    if (i + 1 >= U.nreg) return 0;
+    const Reg *t = &U.reg[i + 1];
+    return !t->dropped && t->lo == h->hi && t->hi == h->bhi && t->off == h->boff + (t->lo - h->blo);
+}
+
 static const char *find_kind;   // TOTK_UB_CHECK: how vk_usnap_find answered last
 static const Reg *find_reg;
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out, int base_ok) {
@@ -424,9 +437,9 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (i >= U.nreg) return 0;
     Reg *r = &U.reg[i];
     if (U.random && r->hi - r->lo > upd_max && addr >= r->lo && addr < r->hi) big_note("bind", r, addr, n);
-    // A block with a window twin, bound across a split: its copy as the submission began (the twin reads the window)
-    if (base_ok && r->split && !r->dropped && addr >= r->blo && addr + n <= r->bhi && addr + n > r->hi &&
-        (r->boff + (addr - r->blo)) % align == 0) {
+    // A block with a window twin, bound at its start across a split: its copy as the submission began. The twin reads
+    // the head (gfx_shader.c ubo_window: the first 4 KiB) from its current version; the rest must still be the copy.
+    if (base_ok && base_ok_at(i, addr, n, align)) {
         *out = (VkDescriptorBufferInfo){U.arena->buf, r->boff + (addr - r->blo), n};
         U.hits++, U.bases++;
         find_kind = "base", find_reg = r;
@@ -435,8 +448,8 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (!r->dropped && addr >= r->lo && addr + n > r->hi && U.arena && U.arena->shadow) {
         find_kind = "join", find_reg = r;
         if (join(i, addr, n, align, out)) return 1;
-        // no room for the join: the base rather than live memory, which holds the newest update (0049's flicker)
-        if (r->split && addr >= r->blo && addr + n <= r->bhi && (r->boff + (addr - r->blo)) % align == 0) {
+        // no room for the join: the base when it is still right (0049's flicker came from live memory)
+        if (base_ok_at(i, addr, n, align)) {
             *out = (VkDescriptorBufferInfo){U.arena->buf, r->boff + (addr - r->blo), n};
             U.hits++, U.bases++;
             find_kind = "base (join failed)";

@@ -196,10 +196,8 @@ static void cb_done(void *arg) {   // completion thread
     free(r->written), free(r->pools), free(r->chunks), free(r);
 }
 
-// TOTK_UB_WINDOW: the last window buffer per stage (window_info); scratch is per command buffer, so it goes with B
-static struct { uint64_t addr; uint8_t bytes[128]; VkBuffer buf; VkDeviceSize off; int valid; } WIN[6];
 
-void vk_exec_draw_new_cb(void) { memset(&B, 0, sizeof B), memset(WIN, 0, sizeof WIN); }
+void vk_exec_draw_new_cb(void) { memset(&B, 0, sizeof B); }
 
 void vk_exec_draw_shaders(const GfxShader **vs, const GfxShader **fs) {
     *vs = B.st_valid ? B.st.vs : NULL;
@@ -221,7 +219,7 @@ static CbRes *cb_res(VkExec *ex) {
     cur = calloc(1, sizeof *cur);
     if (!cur) rt_fatal("vk: out of memory");
     cur_fence = ex->fence;
-    memset(&B, 0, sizeof B), memset(WIN, 0, sizeof WIN);
+    memset(&B, 0, sizeof B);
     vk_completion_add(ex->fence, cb_done, cur);
     return cur;
 }
@@ -925,24 +923,19 @@ static int ub_reach_on(void) {
 // TOTK_UB_WINDOW (gfx_shader.c ubo_window): the window twin of the block bound at slot: a small buffer with the
 // block's first bytes as the replay is at now (vk_usnap_peek: the current version of the snapshot; else guest memory).
 static VkDescriptorBufferInfo window_info(VkExec *ex, int st, int slot, uint32_t n) {
-    if (slot < 3 || slot - 3 >= 18 || n > sizeof WIN[0].bytes || st < 0 || st >= 6) return zero_info(n);
+    if (slot < 3 || slot - 3 >= 18 || st < 0 || st >= 6) return zero_info(n);
     const p_bind_buf *b = &ex->ubo[st][slot - 3];
-    if (!b->size || b->size < n) return zero_info(n);
-    const uint8_t *src = vk_usnap_peek(b->addr, n);
-    VkMemSpan sp;
-    if (!src) {
-        if (!vk_mem_resolve(b->addr, n, &sp) || (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC))
-            return zero_info(n);
-        src = (const uint8_t *)(uintptr_t)b->addr;   // guest memory: written in replay order (op_update_ub)
+    if (!b->size) return zero_info(n);
+    if (b->size < n) n = (uint32_t)b->size;   // a block smaller than the window: all of it (reads past it as before)
+    VkDescriptorBufferInfo bi;
+    // the current version of the block's start in the snapshot (a split block's head: no copy per draw)
+    if (vk_usnap_find(b->addr, n, LIM.ubo_align, &bi, 0)) {
+        if (vk_usnap_check_on()) vk_usnap_check(b->addr, &bi, st, slot);
+        return bi;
     }
-    if (vk_usnap_check_on()) vk_usnap_check_twin(b->addr, src, n, st, slot);
-    typeof(WIN[0]) *w = &WIN[st];
-    if (!w->valid || w->addr != b->addr || memcmp(w->bytes, src, n)) {
-        memcpy(scratch(ex, n, &w->buf, &w->off), src, n);
-        memcpy(w->bytes, src, n);
-        w->addr = b->addr, w->valid = 1;
-    }
-    return (VkDescriptorBufferInfo){w->buf, w->off, n};
+    // not in the snapshot: the block is bound live then, and so is its start, in the GPU's order
+    if (bind_range(ex, b->addr, n, LIM.ubo_align, n, VK_MUSE_UBO, 0, &bi)) return bi;
+    return zero_info(n);
 }
 
 static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot, const GfxShaderRes *r) {
