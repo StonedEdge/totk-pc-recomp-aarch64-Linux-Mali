@@ -359,6 +359,16 @@ static int first_above(uint64_t a) {
     return lo;
 }
 
+// TOTK_UB_SPLIT=1 (off): splitting big regions at their updates (below). Off since 0049's test: TotK's 64 KiB block is
+// read by its shaders at computed offsets, so its bindings stay whole, every one of them needed a joined 64 KiB copy
+// (~60 a submission, 3.9 MiB), the arena ran out, and bindings that could not be joined read live memory, which holds
+// the newest update: the terrain flickered.
+static int split_on(void) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("TOTK_UB_SPLIT");
+    return on;
+}
+
 // A binding across regions split from one (vk_usnap_update): a copy of its range joined from the regions' current
 // versions. 0 when the regions there are not contiguous, one is dropped, or the arena is full.
 static int join(int i, uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
@@ -448,7 +458,7 @@ int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
     if (r->dropped) { U.upd_dropped++; return 0; }
     if (dst < r->lo || dst + n > r->hi) { U.upd_none++; return 0; }
     uint64_t rn = r->hi - r->lo, need = (rn + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
-    if (rn > upd_max && dst + n - r->lo <= upd_max) {
+    if (rn > upd_max && dst + n - r->lo <= upd_max && split_on()) {
         // A big region updated near its start (TotK: 64 bytes at +0x10 of a 64 KiB block before every draw): split
         // there, so the versions copy the head; bindings reaching past it join the parts (join), and with
         // TOTK_UB_REACH most draws bind only the start they read.

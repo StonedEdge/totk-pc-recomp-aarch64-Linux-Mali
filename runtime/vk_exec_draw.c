@@ -910,7 +910,10 @@ static void limits_init(void) {
 // every draw; bound whole, every new version of it (vk_usnap.c) had to copy 64 KiB.
 static int ub_reach_on(void) {
     static int on = -1;
-    if (on < 0) on = vk_caps_tiler_opt("TOTK_UB_REACH");
+    if (on < 0) {   // off by default until a game needs it: it changed no frame time on its own (0049)
+        const char *e = cfg_get("TOTK_UB_REACH");
+        on = e && *e && strcmp(e, "0") != 0;
+    }
     return on;
 }
 
