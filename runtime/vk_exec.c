@@ -593,6 +593,15 @@ void vk_exec_targets_describe(VkExec *ex, char *buf, size_t cap) {
 //   on the Mali-G610 each slot's tile copy is stored at the pass end, so the unwritten slot put the loaded contents
 //   back over the drawn ones (specks and 16x16 tiles in Savage Wind). Clears into the repeat go to the first slot.
 static int opt_detach = -1, opt_frag = -1, opt_dup = -1, opt_clear_load = -1;
+// - TOTK_BARRIER_NVN: the game's own barrier (nvnCommandBufferBarrier) that orders fragments only (ORDER_FRAGMENTS or
+//   ORDER_FRAGMENTS_TILED, without ORDER_PRIMITIVES or ORDER_INDIRECT_DATA), right after a pass with nothing recorded
+//   since it and no draw's store since the last full barrier, holds back only fragment work, as NVN defines it: the
+//   next pass's vertex and tiling work may start while the previous pass's fragments shade. Every NVN barrier was a full
+//   one (ALL_COMMANDS to ALL_COMMANDS): on the Mali handheld outdoors 74% of ~250 passes a frame began behind one
+//   because of it (0038). The next pass still begins behind a full barrier when its own rules ask for one (a vertex
+//   stage that reads GPU results, a pass not seen yet, a dispatch or copy since).
+static int opt_nvn_frag = -1;
+static uint64_t st_nvn_bar, st_nvn_frag, st_nvn_noorder, st_nvn_prim;
 
 // - TOTK_CLEAR_LOAD: a clear of a whole target outside a pass (vkCmdClearColorImage / vkCmdClearDepthStencilImage
 //   behind a full barrier, and the next pass then loads the cleared image into tile memory) is held back; when the next
@@ -615,11 +624,13 @@ static void tiler_opts(void) {
     opt_frag = vk_caps_tiler_opt("TOTK_BARRIER_FRAG");
     opt_dup = vk_caps_tiler_opt("TOTK_DUP_ATTACH");
     opt_clear_load = vk_caps_tiler_opt("TOTK_CLEAR_LOAD");
+    opt_nvn_frag = opt_frag && vk_caps_tiler_opt("TOTK_BARRIER_NVN");
     rt_log("vk: tiler options: unwritten colour targets left out %s, fragment-only pass barriers %s, repeated views "
-           "attached once %s, whole-target clears into the next pass's load %s (TOTK_DETACH, TOTK_BARRIER_FRAG, "
-           "TOTK_DUP_ATTACH, TOTK_CLEAR_LOAD; unused attachments extension %d)",
+           "attached once %s, whole-target clears into the next pass's load %s, the game's fragment-ordering barriers "
+           "fragment-only %s (TOTK_DETACH, TOTK_BARRIER_FRAG, TOTK_DUP_ATTACH, TOTK_CLEAR_LOAD, TOTK_BARRIER_NVN; unused "
+           "attachments extension %d)",
            opt_detach ? "on" : "off", opt_frag ? "on" : "off", opt_dup ? "on" : "off", opt_clear_load ? "on" : "off",
-           vk_ctx()->has_unused_attachments);
+           opt_nvn_frag ? "on" : "off", vk_ctx()->has_unused_attachments);
 }
 
 #define PT_N 8192   // direct-mapped: a slot another key took reads as unknown (everything attached, a full barrier)
@@ -678,6 +689,10 @@ static void tiler_stats(void) {
            (unsigned long long)st_passes, (unsigned long long)st_left_out, (unsigned long long)st_det_miss,
            (unsigned long long)st_frag, (unsigned long long)st_frag_restarts, (unsigned long long)st_dups,
            (unsigned long long)st_cl_load, (unsigned long long)st_cl_flushed);
+    rt_log("vk: tiler: the game's barriers %llu: fragment-only %llu, ordering primitives or indirect data %llu, no ordering "
+           "bit %llu (4 s)", (unsigned long long)st_nvn_bar, (unsigned long long)st_nvn_frag,
+           (unsigned long long)st_nvn_prim, (unsigned long long)st_nvn_noorder);
+    st_nvn_bar = st_nvn_frag = st_nvn_prim = st_nvn_noorder = 0;
     rt_log("vk: tiler: full pass barriers because of: a dispatch since the last pass %llu, a copy %llu, a clear %llu, "
            "other commands %llu; a draw's store %llu; a vertex read restart %llu; a pass not seen yet %llu; a vertex stage "
            "reading GPU results %llu (4 s)",
@@ -756,6 +771,25 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
 }
 
 void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0, 0); }
+
+// OP_BARRIER (nvnCommandBufferBarrier): TOTK_BARRIER_NVN above.
+static void op_barrier(VkExec *ex, int bits) {
+    tiler_opts();
+    st_nvn_bar++;
+    int order_frag = bits & (NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT);
+    int order_all = bits & (NVN_BARRIER_ORDER_PRIMITIVES_BIT | NVN_BARRIER_ORDER_INDIRECT_DATA_BIT);
+    if (order_all) st_nvn_prim++;
+    else if (!order_frag) st_nvn_noorder++;
+    vk_exec_pass_end(ex);
+    if (!opt_nvn_frag || !order_frag || order_all || ex->pass_end_at != ex->recorded || ex->store_hazard || npend ||
+        vk_dump_armed) {
+        vk_exec_barrier(ex);
+        return;
+    }
+    barrier_to(ex, NULL, NULL, 0, 1);
+    ex->pass_end_at = ex->recorded;   // nothing but passes and this barrier since: the next pass may begin behind it
+    st_nvn_frag++;
+}
 
 // The held-back clears not in `keep` (a bit per entry) recorded as before: a full barrier, then the clear commands.
 static void clears_flush(VkExec *ex, uint32_t keep) {
@@ -1258,7 +1292,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_COPY_STRIDE: ex->copy_stride = ((const p_copy_stride *)a)->stride; break;
         case OP_SET_TEX_POOL: ex->tex_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; break;
         case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool; break;
-        case OP_BARRIER: vk_exec_barrier(ex); break;
+        case OP_BARRIER: op_barrier(ex, ((const p_barrier *)a)->bits); break;
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
             if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
             if (h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND) vk_exec_frame.dispatches++, split_draws++;
