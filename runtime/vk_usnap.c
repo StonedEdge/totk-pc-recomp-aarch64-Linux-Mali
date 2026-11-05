@@ -28,6 +28,9 @@
 #define MAX_RANGE (64u << 10)
 #define ARENA_MIN (4u << 20)
 #define CALL_DEPTH 16
+// vk_usnap_update (TOTK_UB_INPLACE): room after the copies for new versions, and the largest region versioned
+#define UPD_SLACK (4u << 20)
+#define UPD_MAX_REGION (16u << 10)
 
 typedef struct Arena {
     struct Arena *next;
@@ -54,6 +57,9 @@ static struct {
     int nwr, cwr;
     // since the last summary
     uint64_t subs, regions, bytes, copy_ns, hits, drops, inflight, refused, off_subs;
+    uint64_t used;              // bytes of the arena in use (copies, then versions)
+    int random;                 // arenas in host-cached memory (TOTK_UB_INPLACE reads old versions back)
+    uint64_t upd_done, upd_bytes, upd_big, upd_none, upd_full;
 } U;
 
 static Arena *free_arenas;
@@ -84,8 +90,10 @@ static Arena *arena_get(uint64_t need) {
                              // transfer source: DLAA copies the camera block out (vk_dlaa.c mv_pass)
                              .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
     // Device-local through the BAR when the device has it (the GPU reads constants on every draw), else host memory.
+    // With TOTK_UB_INPLACE host-cached memory: a new version copies the old one out of the arena.
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                  .flags = (U.random ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+                                                     : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT) |
                                            VMA_ALLOCATION_CREATE_MAPPED_BIT};
     VmaAllocationInfo info;
     VkResult res = vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &a->buf, &a->alloc, &info);
@@ -214,11 +222,17 @@ static void summary(void) {
            "flight), %.1f refused (not an imported pool)",
            (unsigned long long)U.subs, (unsigned long long)U.off_subs, U.regions / s, U.bytes / s / 1024.0,
            U.copy_ns / s / 1e6, U.hits / s, U.drops / s, U.inflight / s, U.refused / s);
+    if (U.random)
+        rt_log("vk_usnap: UpdateUniformBuffer in the snapshot (TOTK_UB_INPLACE), per submission: %.1f versions "
+               "(%.1f KiB copied), %.1f in a region over %u KiB, %.1f outside a region, %.1f with the arena full",
+               U.upd_done / s, U.upd_bytes / s / 1024.0, U.upd_big / s, UPD_MAX_REGION >> 10, U.upd_none / s,
+               U.upd_full / s);
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
+    U.upd_done = U.upd_bytes = U.upd_big = U.upd_none = U.upd_full = 0;
 }
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
-    if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
+    if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1, U.random = vk_caps_tiler_opt("TOTK_UB_INPLACE");
     U.on = 0, U.fence = fence, U.gen++;
     summary();
     if (!RT_KNOB_ON(U.mode - 1)) {
@@ -253,7 +267,8 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
         total += (hi - lo + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     }
     if (!U.nreg) return;
-    if (!(U.arena = arena_get(total))) return;
+    if (!(U.arena = arena_get(total + (U.random ? UPD_SLACK : 0)))) return;
+    U.used = total;
     for (int i = 0; i < U.nreg; i++)
         memcpy(U.arena->map + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
     vmaFlushAllocation(vk_ctx()->vma, U.arena->alloc, 0, total);   // a no-op on coherent memory
@@ -297,6 +312,28 @@ void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.on) return;
     for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
         if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, U.gen++;
+}
+
+// TOTK_UB_INPLACE (vk_exec_draw.c op_update_ub): nvnCommandBufferUpdateUniformBuffer of [dst, dst+n) as a new version
+// of the snapshot region holding it: the region's bytes as the earlier draws read them, with the update applied, at a
+// new place in the arena; the draws bound from here on read the new version, the earlier ones keep theirs. 1 when done;
+// 0 (no region, a region over UPD_MAX_REGION, the arena full) leaves the update to the caller.
+int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
+    if (!U.on || !U.arena || !U.random || !n) return 0;
+    int i = first_above(dst);
+    Reg *r = i < U.nreg ? &U.reg[i] : NULL;
+    if (!r || r->dropped || dst < r->lo || dst + n > r->hi) { U.upd_none++; return 0; }
+    uint64_t rn = r->hi - r->lo, need = (rn + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
+    if (rn > UPD_MAX_REGION) { U.upd_big++; return 0; }
+    if (U.used + need > U.arena->size) { U.upd_full++; return 0; }
+    memcpy(U.arena->map + U.used, U.arena->map + r->off, rn);
+    memcpy(U.arena->map + U.used + (dst - r->lo), data, n);
+    vmaFlushAllocation(vk_ctx()->vma, U.arena->alloc, U.used, need);   // host-cached memory may not be coherent
+    r->off = U.used;
+    U.used += need;
+    U.gen++;   // bound descriptors of the region resolve again (vk_exec_draw.c)
+    U.upd_done++, U.upd_bytes += rn;
+    return 1;
 }
 
 uint64_t vk_usnap_gen(void) { return U.gen; }

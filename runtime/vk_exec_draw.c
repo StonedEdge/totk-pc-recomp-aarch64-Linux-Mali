@@ -2490,6 +2490,17 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     if (!u->size) return;
     VkMemSpan sp;
     if (!vk_mem_resolve(u->dst, u->size, &sp)) return warn_once(W_UB, "UpdateUniformBuffer to %#llx is not backed: dropped", (unsigned long long)u->dst);
+    // TOTK_UB_INPLACE (tilers, Mali by default): the update becomes a new version of the uniform snapshot (vk_usnap.c)
+    // and is written into guest memory now, for later submissions' snapshots. A copy on the GPU timeline would end the
+    // pass behind a full barrier: the terrain updates a block before every draw, and each such draw became a pass of
+    // its own that loads and stores every target (the Mali handheld outdoors: ~180 of ~250 passes a frame).
+    if (vk_usnap_update(u->dst, u->size, u->data)) {
+        mem_thaw(u->dst, u->size);
+        memcpy((void *)(uintptr_t)u->dst, u->data, u->size);
+        vk_guest_written(u->dst, u->size);
+        upd_note(ex, u);
+        return;
+    }
     cb_res(ex);
     vk_exec_barrier(ex);   // earlier draws finished with the old contents
     VkBuffer b;
