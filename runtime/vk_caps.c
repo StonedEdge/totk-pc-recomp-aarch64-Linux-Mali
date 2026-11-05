@@ -96,6 +96,10 @@ void vk_caps_init(VkCtx *c) {
                                             .pNext = c->has_provoking_vertex ? &pvf : NULL};
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13};
     vkGetPhysicalDeviceFeatures2(c->phys, &f2);
+    // Storage writes from the vertex and fragment stages (TotK's Ultra Hand reads back results vertex shaders write)
+    rt_log("vk caps: vertexPipelineStoresAndAtomics %d, fragmentStoresAndAtomics %d, shaderStorageBufferArrayDynamicIndexing %d",
+           (int)f2.features.vertexPipelineStoresAndAtomics, (int)f2.features.fragmentStoresAndAtomics,
+           (int)f2.features.shaderStorageBufferArrayDynamicIndexing);
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(c->phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);

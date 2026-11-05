@@ -371,6 +371,8 @@ void vk_gpuw_note(VkExec *ex, uint64_t addr, uint64_t size, int st) {
     vk_completion_add(ex->fence, gw_cb, (void *)(intptr_t)i);
 }
 
+static void sh_dump(const GfxShader *s);   // TOTK_SH_DUMP (below)
+
 static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
     CbRes *r = cb_res(ex);
     for (int i = 0; i < r->nwritten; i++)
@@ -2325,6 +2327,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     }
     if (!vs || (has_fs && !fs)) return 0;
     gw_sh[NVN_STAGE_VS] = vs, gw_sh[NVN_STAGE_FS] = fs;
+    sh_dump(vs), sh_dump(fs);
     if (vk_dlaa_skip_draw(ex, fs)) return 0;   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
@@ -2547,6 +2550,27 @@ static int cs_listed(const GfxShader *cs, const char *name) {
         p += n + (p[n] == ',');
     }
     return 0;
+}
+
+// TOTK_SH_DUMP: the same for the shaders of draws (vertex and fragment): logs/sh-<id>.spv, once each.
+static void sh_dump(const GfxShader *s) {
+    static const GfxShader *dumped[16];
+    static int ndumped;
+    if (!s || !cs_listed(s, "TOTK_SH_DUMP")) return;
+    for (int i = 0; i < ndumped; i++)
+        if (dumped[i] == s) return;
+    if (ndumped == 16) return;
+    dumped[ndumped++] = s;
+    const uint8_t *iid = gfx_shader_input_id(s);
+    char path[64];
+    int n = snprintf(path, sizeof path, "logs/sh-");
+    for (int i = 0; i < 8; i++) n += snprintf(path + n, sizeof path - n, "%02x", iid[i]);
+    snprintf(path + n, sizeof path - n, ".spv");
+    uint64_t words = 0;
+    const uint32_t *spv = gfx_shader_spirv(s, &words);
+    FILE *f = spv ? fopen(path, "wb") : NULL;
+    if (f) fwrite(spv, 4, (size_t)words, f), fclose(f);
+    rt_log("vk_exec: TOTK_SH_DUMP: %s %s (%llu words)", f ? "wrote" : "could not write", path, (unsigned long long)words);
 }
 
 static int cs_debug(const GfxShader *cs) {   // 1: skip this dispatch
