@@ -156,7 +156,12 @@ static struct {
     int cmds;                            // check mode: pushes, binds and set writes the build recorded
     uint32_t ckn;                        // check mode: the last build's packed descriptors (bytes in ck)
     uint8_t ck[DS_SIG_BYTES];
-} RS = {-1};
+    uint64_t ugen;                       // vk_usnap_gen at the last signature
+    int ubo_only;                        // bind_sig: only vk_usnap_gen differs from the draw before
+    int d_full;                          // bind_resources' packed descriptors hold a whole graphics build of RS.info
+    int partial;                         // TOTK_BIND_PARTIAL (default 1): such a draw refreshes only its uniform blocks
+    uint64_t partials;
+} RS = {-1, .partial = -1};
 
 // The bound-slot bytes of VkExec a pipeline's descriptors read, as ranges merged where they touch, built once per
 // pipeline info: c0's storage table, the uniform and storage ranges of the bound slots and the texture and image
@@ -1810,7 +1815,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
 // Check mode compares them anyway and stops when the bind op generation said they could not differ but they do.
 static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
     const RsList *l = rs_list(ex, info);
-    if (!l->ok) return RS.hn = 0, RS.info = NULL, 0;
+    if (!l->ok) return RS.hn = 0, RS.info = NULL, RS.ubo_only = 0, 0;
     uint64_t *h = RS.h, diff = 0;
     uint32_t n = 0;
 #define PUT(v) do { uint64_t v_ = (uint64_t)(v); diff |= h[n] ^ v_; h[n++] = v_; } while (0)
@@ -1819,7 +1824,12 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
     PUT(ex->prog->serial);
     PUT((uint64_t)vk_texture_slots_gen() << 32 | vk_texture_epoch());
     PUT((uint64_t)vk_sampler_gen() << 32 | (uint32_t)ex->nfbl);
-    PUT(vk_mem_gen() + vk_usnap_gen());   // both only grow
+    PUT(vk_mem_gen());
+    // vk_usnap_gen apart: TotK updates a uniform block before most draws, and then only the uniform bindings resolve
+    // differently (bind_resources refreshes those alone, RS.ubo_only)
+    uint64_t ug = vk_usnap_gen();
+    int udiff = ug != RS.ugen;
+    RS.ugen = ug;
     for (int i = 0; i < ex->nfbl && i < 9; i++) PUT((uintptr_t)ex->fbl_img[i]);
     if (l->sup) {
         float in[3];
@@ -1836,7 +1846,7 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
     diff |= n != RS.hn;
     RS.hn = n;
     int fast = RS.info == info && RS.gen == bind_gen;
-    if (fast && RS.on != 2) return !diff;
+    if (fast && RS.on != 2) return RS.ubo_only = !diff && udiff, !diff && !udiff;
     const uint8_t *e = (const uint8_t *)ex;
     uint8_t *d = RS.body;
     int bd = 0;
@@ -1848,7 +1858,8 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
     }
     if (fast && bd) rt_fatal("vk_exec: descriptor build skip check: bound slots changed without a bind op");
     RS.info = info, RS.gen = bind_gen;
-    return !diff && !bd;
+    RS.ubo_only = !diff && !bd && udiff;
+    return !diff && !bd && !udiff;
 }
 
 // Writes allocated set s from its packed descriptors d: through the layout's update template, or with the write
@@ -1877,7 +1888,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     if (info->n_bindings > MAX_BINDINGS) rt_fatal("vk: %u descriptor bindings exceed the replay's %d", info->n_bindings, MAX_BINDINGS);
     bind_stats(info);
     int gfx = info->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS;
-    int skip = gfx ? bind_skip_on() : 0, same = 0, was_valid = B.res_valid;
+    int skip = gfx ? bind_skip_on() : 0, same = 0, was_valid = B.res_valid, partial = 0;
     if (skip) {
         same = bind_sig(ex, info);
         if (same && was_valid && skip == 1) {
@@ -1887,6 +1898,16 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             return;
         }
         B.res_valid = 0;   // until the build below ends
+        if (RS.partial < 0) {
+            const char *e = cfg_get("TOTK_BIND_PARTIAL");
+            RS.partial = !(e && *e == '0');
+        }
+        // Only the uniform snapshot moved on since the draw before, whose build was whole and repeatable: its packed
+        // descriptors stand for everything but the uniform blocks (textures, storage buffers, the support buffer)
+        partial = skip == 1 && RS.partial && !same && RS.ubo_only && was_valid && RS.d_full;
+        if (partial && ++RS.partials % 100000 == 0 && (rt_trace & RT_TRACE_PERF))
+            rt_log("vk_exec: %llu descriptor builds refreshed only their uniform blocks (TOTK_BIND_PARTIAL)",
+                   (unsigned long long)RS.partials);
         if (skip == 2) memcpy(RS.pcnt, RS.cnt, sizeof RS.cnt), RS.pncnt = RS.ncnt;
         RS.rec = 1, RS.ncnt = 0, RS.cnt_over = 0, RS.volatile_ = 0, RS.cmds = 0;
     }
@@ -1906,6 +1927,10 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         uint32_t cnt = b->count ? b->count : 1;
         if (nd + cnt > MAX_DESC) rt_fatal("vk: %u descriptors exceed the replay's %d", nd + cnt, MAX_DESC);
         if (n_sets == 2 && i == lo[1]) d0[1] = nd;
+        if (partial && b->kind != GFX_RES_UBO) {   // as the draw before built it (its write struct too)
+            nd += cnt;
+            continue;
+        }
         VkDescSlot *o = &d[nd];
         int st = nvn_stage_of(b->stage), kind = 0;   // kind: 0 buffer, 1 image, 2 texel buffer view
         if (b->kind == VK_PIPE_SUPPORT) {
@@ -2025,6 +2050,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             }
         }
     }
+    RS.d_full = gfx;   // a compute build overwrites the packed descriptors
     if (skip) {
         RS.rec = 0;
         // An equal next draw records nothing when every push set holds its push (TOTK_PUSH_SKIP on) and nothing made
