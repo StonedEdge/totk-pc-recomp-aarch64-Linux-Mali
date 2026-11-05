@@ -347,11 +347,18 @@ static int create_device(void) {
     {
         const char *e = cfg_get("TOTK_FEEDBACK");
         int layout_ok = has_fbl && has_lr && c->fbl.attachmentFeedbackLoopLayout && c->lr.dynamicRenderingLocalRead;
+        // Mali (a tiler) without the feedback layout: off by default. A fragment's own-pixel read of an attachment
+        // fetches memory, which holds the target as it was when the pass began; the restart before every such draw
+        // (130-150 a frame outdoors) cost the Mali-G610 ~8 ms of GPU a frame (19.1 -> 23.2 fps) with no visible
+        // difference on Great Sky Island. TOTK_FEEDBACK=restart brings the restarts back.
+        int restart_wanted = e && !strcmp(e, "restart");
         g_vk.feedback = e && !strcmp(e, "0") ? VK_FEEDBACK_OFF
-                      : layout_ok && !(e && !strcmp(e, "restart")) ? VK_FEEDBACK_LAYOUT : VK_FEEDBACK_RESTART;
+                      : layout_ok && !restart_wanted ? VK_FEEDBACK_LAYOUT
+                      : vk_caps.mali && !restart_wanted && !(e && *e) ? VK_FEEDBACK_OFF : VK_FEEDBACK_RESTART;
         rt_log("vk: feedback loops: %s (attachmentFeedbackLoopLayout %d, dynamicRenderingLocalRead %d)",
                g_vk.feedback == VK_FEEDBACK_LAYOUT ? "feedback layout + by-region barrier"
-               : g_vk.feedback == VK_FEEDBACK_RESTART ? "pass restart + full barrier" : "off (TOTK_FEEDBACK=0)",
+               : g_vk.feedback == VK_FEEDBACK_RESTART ? "pass restart + full barrier"
+               : e && *e ? "off (TOTK_FEEDBACK=0)" : "off (Mali default; TOTK_FEEDBACK=restart for restarts)",
                has_fbl && c->fbl.attachmentFeedbackLoopLayout, has_lr && c->lr.dynamicRenderingLocalRead);
     }
 
