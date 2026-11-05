@@ -131,6 +131,10 @@ typedef struct VkExec {
     int barrier_full;                    // the last barrier recorded was a full one
 } VkExec;
 
+// TOTK_GPUW_LOG=1 (vk_exec_draw.c): a GPU write of [addr, addr+size) into CPU-visible memory by stage st (7: a copy)
+void vk_gpuw_note(VkExec *ex, uint64_t addr, uint64_t size, int st);
+int vk_gpuw_on(void);
+
 // Ends the open pass and begins it again (tiler options): attach names colour slots a draw or clear is about to write
 // that the pass left out; full makes the new pass begin behind a full barrier (a vertex stage reads GPU results).
 void vk_exec_pass_restart(VkExec *ex, uint8_t attach, int full);

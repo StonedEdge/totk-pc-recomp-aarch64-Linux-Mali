@@ -270,6 +270,64 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
     return p;
 }
 
+// ---- TOTK_GPUW_LOG=1 (diagnostic): what the GPU writes into memory the game can read
+// Every range a storage binding or a copy writes into CPU-visible memory is checked once its submission completed:
+// a line when it is first seen and each time its contents change (a hash of the first 64 KiB), with the shader (or
+// "copy") and the count of nonzero bytes. A range the game reads back but the GPU never fills stays unchanged; aiming
+// Ultra Hand should make its readback change.
+typedef struct { uint64_t addr, size, sid, fence; uint32_t hash, nz, st; int seen; } Gw;
+static Gw gw[512];
+static volatile int32_t ngw;
+static int gw_on = -1, gw_logged;
+static uint64_t gw_t0;
+static const GfxShader *gw_sh[8];
+static unsigned long long gw_sid(const GfxShader *s) {
+    if (!s) return 0;
+    const uint8_t *iid = gfx_shader_input_id(s);
+    unsigned long long v = 0;
+    for (int i = 0; i < 8; i++) v = v << 8 | iid[i];
+    return v;
+}
+static void gw_cb(void *arg) {   // completion thread, after the submission finished
+    Gw *g = &gw[(intptr_t)arg];
+    uint64_t n = g->size < 65536 ? g->size : 65536;
+    uint32_t h = 2166136261u, nz = 0;
+    const volatile uint8_t *p = (const volatile uint8_t *)(uintptr_t)g->addr;
+    for (uint64_t k = 0; k < n; k++) h = (h ^ p[k]) * 16777619u, nz += p[k] != 0;
+    if ((!g->seen || h != g->hash) && gw_logged < 1500) {
+        gw_logged++;
+        rt_log("gpuw: %.1f s frame %llu: %#llx+%#llx by %s %016llx: %s, %u of %llu bytes nonzero",
+               (plat_now_ns() - gw_t0) / 1e9, (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED),
+               (unsigned long long)g->addr, (unsigned long long)g->size,
+               g->st == 7 ? "copy" : g->st == NVN_STAGE_CS ? "cs" : g->st == NVN_STAGE_FS ? "fs" : g->st == NVN_STAGE_VS ? "vs" : "stage",
+               (unsigned long long)g->sid, g->seen ? "changed" : "first", nz, (unsigned long long)n);
+    }
+    g->seen = 1, g->hash = h, g->nz = nz;
+}
+int vk_gpuw_on(void) {
+    if (gw_on < 0) {
+        const char *e = cfg_get("TOTK_GPUW_LOG");
+        gw_on = e && *e && strcmp(e, "0");
+        gw_t0 = plat_now_ns();
+        if (gw_on) rt_log("gpuw: TOTK_GPUW_LOG: GPU writes into CPU-visible memory are logged when their contents change");
+    }
+    return gw_on;
+}
+void vk_gpuw_note(VkExec *ex, uint64_t addr, uint64_t size, int st) {
+    if (!vk_gpuw_on() || !size || !addr || nvn_gpu_only(addr)) return;
+    uint64_t sid = st >= 0 && st < 8 ? gw_sid(gw_sh[st]) : 0;
+    int n = ngw, i = 0;
+    while (i < n && !(gw[i].addr == addr && gw[i].size == size && gw[i].sid == sid && gw[i].st == (uint32_t)st)) i++;
+    if (i == n) {
+        if (n == (int)(sizeof gw / sizeof *gw)) return;
+        gw[n] = (Gw){addr, size, sid, 0, 0, 0, (uint32_t)st, 0};
+        __atomic_store_n(&ngw, n + 1, __ATOMIC_RELEASE);
+    }
+    if (gw[i].fence == ex->fence) return;   // once per submission
+    gw[i].fence = ex->fence;
+    vk_completion_add(ex->fence, gw_cb, (void *)(intptr_t)i);
+}
+
 static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
     CbRes *r = cb_res(ex);
     for (int i = 0; i < r->nwritten; i++)
@@ -1046,7 +1104,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         uint64_t lead = vk_caps.sbuf_align ? b->addr & (vk_caps.sbuf_align - 1) : 0;
         if (bind_range(ex, b->addr - lead, b->size ? b->size + lead : 0, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO,
                        written, &bi)) {
-            if (written && bi.buffer != VK_NULL_HANDLE) note_written(ex, b->addr - lead, bi.range);
+            if (written && bi.buffer != VK_NULL_HANDLE) note_written(ex, b->addr - lead, bi.range), vk_gpuw_note(ex, b->addr - lead, bi.range, st);
             return bi;
         }
         if (b->addr) warn_once(W_SSBO_ALIGN, "storage buffer %#llx is not backed or not aligned: a zero buffer is bound",
@@ -2202,6 +2260,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
     }
     if (!vs || (has_fs && !fs)) return 0;
+    gw_sh[NVN_STAGE_VS] = vs, gw_sh[NVN_STAGE_FS] = fs;
     if (vk_dlaa_skip_draw(ex, fs)) return 0;   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
@@ -2468,6 +2527,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);   // synchronous: a skipped dispatch changes results
     if (!cs) return;
+    gw_sh[NVN_STAGE_CS] = cs;
     if (cs_debug(cs)) return;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
@@ -2497,6 +2557,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);
     if (!cs) return;
+    gw_sh[NVN_STAGE_CS] = cs;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");

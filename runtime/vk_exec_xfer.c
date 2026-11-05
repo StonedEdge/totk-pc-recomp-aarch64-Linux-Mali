@@ -80,6 +80,7 @@ static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size) {
     *r = (Range){addr, size};
     vk_mem_gpu_pending(addr, size);
     vk_completion_add(ex->fence, guest_written_cb, r);
+    vk_gpuw_note(ex, addr, size, 7);   // TOTK_GPUW_LOG (vk_exec_draw.c)
 }
 
 typedef struct { volatile uint32_t *val; uint32_t mode, value; } EventWrite;
@@ -259,6 +260,17 @@ static void oq_cb(void *arg) {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
         if (s->addr) write_counter(s->addr, oq_count);
+        if (vk_gpuw_on()) {   // TOTK_GPUW_LOG: how the samples-passed reports come out, every ~2 s
+            static uint64_t n, zero, big, t;
+            n++, zero += !oq_count, big += oq_count > 1000;
+            uint64_t now = kern_now_ns();
+            if (!t) t = now;
+            if (now - t > 2000000000ull) {
+                rt_log("gpuw: occlusion reports in the last %.1f s: %llu, %llu with 0 samples, %llu over 1000",
+                       (now - t) / 1e9, (unsigned long long)n, (unsigned long long)zero, (unsigned long long)big);
+                n = zero = big = 0, t = now;
+            }
+        }
     }
     free(s);
 }
