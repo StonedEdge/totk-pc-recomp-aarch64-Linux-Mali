@@ -578,16 +578,34 @@ void vk_exec_targets_describe(VkExec *ex, char *buf, size_t cap) {
 // - TOTK_DUP_ATTACH: a view bound to two colour slots is attached once. Vulkan leaves the same view twice undefined;
 //   on the Mali-G610 each slot's tile copy is stored at the pass end, so the unwritten slot put the loaded contents
 //   back over the drawn ones (specks and 16x16 tiles in Savage Wind). Clears into the repeat go to the first slot.
-static int opt_detach = -1, opt_frag = -1, opt_dup = -1;
+static int opt_detach = -1, opt_frag = -1, opt_dup = -1, opt_clear_load = -1;
+
+// - TOTK_CLEAR_LOAD: a clear of a whole target outside a pass (vkCmdClearColorImage / vkCmdClearDepthStencilImage
+//   behind a full barrier, and the next pass then loads the cleared image into tile memory) is held back; when the next
+//   pass attaches that target, the pass clears it as it begins (VK_ATTACHMENT_LOAD_OP_CLEAR: the tiles start cleared,
+//   nothing is written to memory or read back, and no full barrier is needed for it). Any other command first (a copy,
+//   a dispatch, a barrier, the submission's end) or a pass that does not attach the target records the clear as before.
+typedef struct {
+    VkImage image;
+    VkImageAspectFlags aspect;           // colour, or depth and/or stencil
+    uint32_t level, base_layer, layers, w, h;
+    VkClearValue v;
+} PendClear;
+static PendClear pend[9];
+static int npend, pend_flushing;
+static uint64_t st_cl_load, st_cl_flushed;
 
 static void tiler_opts(void) {
     if (opt_detach >= 0) return;
     opt_detach = vk_caps_tiler_opt("TOTK_DETACH");
     opt_frag = vk_caps_tiler_opt("TOTK_BARRIER_FRAG");
     opt_dup = vk_caps_tiler_opt("TOTK_DUP_ATTACH");
+    opt_clear_load = vk_caps_tiler_opt("TOTK_CLEAR_LOAD");
     rt_log("vk: tiler options: unwritten colour targets left out %s, fragment-only pass barriers %s, repeated views "
-           "attached once %s (TOTK_DETACH, TOTK_BARRIER_FRAG, TOTK_DUP_ATTACH; unused attachments extension %d)",
-           opt_detach ? "on" : "off", opt_frag ? "on" : "off", opt_dup ? "on" : "off", vk_ctx()->has_unused_attachments);
+           "attached once %s, whole-target clears into the next pass's load %s (TOTK_DETACH, TOTK_BARRIER_FRAG, "
+           "TOTK_DUP_ATTACH, TOTK_CLEAR_LOAD; unused attachments extension %d)",
+           opt_detach ? "on" : "off", opt_frag ? "on" : "off", opt_dup ? "on" : "off", opt_clear_load ? "on" : "off",
+           vk_ctx()->has_unused_attachments);
 }
 
 #define PT_N 8192   // direct-mapped: a slot another key took reads as unknown (everything attached, a full barrier)
@@ -637,10 +655,12 @@ static void tiler_stats(void) {
     if (!st_t0) st_t0 = now;
     if (now - st_t0 < 4000000000ull) return;
     rt_log("vk: tiler: passes %llu, colour targets left out %llu, wrong guesses %llu; fragment-only barriers %llu, "
-           "restarts for vertex reads %llu; repeated views %llu (4 s)",
+           "restarts for vertex reads %llu; repeated views %llu; whole-target clears done by the pass's load %llu, "
+           "recorded as clears %llu (4 s)",
            (unsigned long long)st_passes, (unsigned long long)st_left_out, (unsigned long long)st_det_miss,
-           (unsigned long long)st_frag, (unsigned long long)st_frag_restarts, (unsigned long long)st_dups);
-    st_passes = st_left_out = st_det_miss = st_frag = st_frag_restarts = st_dups = 0;
+           (unsigned long long)st_frag, (unsigned long long)st_frag_restarts, (unsigned long long)st_dups,
+           (unsigned long long)st_cl_load, (unsigned long long)st_cl_flushed);
+    st_passes = st_left_out = st_det_miss = st_frag = st_frag_restarts = st_dups = st_cl_load = st_cl_flushed = 0;
     st_t0 = now;
 }
 
@@ -674,8 +694,12 @@ static VkImageMemoryBarrier2 layout_barrier(VkImage img, VkImageAspectFlags aspe
 // Full barrier. The images in the feedback layout become want[] (pass begin) or none (every other barrier): the others
 // go back to GENERAL and the new ones leave it, in the same command.
 // frag: the memory barrier holds back only fragment work (TOTK_BARRIER_FRAG, vk_exec_pass_begin).
+static int in_pass_begin;   // barrier_to called by vk_exec_pass_begin: it consumed or recorded the held-back clears
+static void clears_flush(VkExec *ex, uint32_t keep);
+
 static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags *wasp, int nwant, int frag) {
     vk_exec_pass_end(ex);
+    if (npend && !in_pass_begin && !pend_flushing) clears_flush(ex, 0);
     VkImageMemoryBarrier2 ib[18];
     uint32_t n = 0;
     for (int i = 0; i < ex->nfbl; i++)
@@ -708,6 +732,73 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
 
 void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0, 0); }
 
+// The held-back clears not in `keep` (a bit per entry) recorded as before: a full barrier, then the clear commands.
+static void clears_flush(VkExec *ex, uint32_t keep) {
+    int any = 0;
+    for (int k = 0; k < npend; k++) any |= !(keep >> k & 1);
+    if (!any) return;
+    pend_flushing = 1;
+    vk_exec_barrier(ex);
+    pend_flushing = 0;
+    int out = 0;
+    for (int k = 0; k < npend; k++) {
+        PendClear *c = &pend[k];
+        if (keep >> k & 1) {
+            pend[out++] = *c;
+            continue;
+        }
+        VkImageSubresourceRange r = {c->aspect, c->level, 1, c->base_layer, c->layers};
+        if (c->aspect & VK_IMAGE_ASPECT_COLOR_BIT)
+            vkCmdClearColorImage(ex->cb, c->image, VK_IMAGE_LAYOUT_GENERAL, &c->v.color, 1, &r);
+        else
+            vkCmdClearDepthStencilImage(ex->cb, c->image, VK_IMAGE_LAYOUT_GENERAL, &c->v.depthStencil, 1, &r);
+        ex->recorded++;
+        st_cl_flushed++;
+    }
+    npend = out;
+}
+
+// Hold back a whole-target clear (TOTK_CLEAR_LOAD). Returns 0 when it is not held back (the caller records it).
+static int clear_hold(VkExec *ex, const VkExecTarget *t, VkImageAspectFlags aspect, const VkClearValue *v) {
+    tiler_opts();
+    if (!opt_clear_load || ex->in_pass || vk_dump_armed) return 0;
+    for (int k = 0; k < npend; k++) {
+        PendClear *c = &pend[k];
+        if (c->image != t->image || c->level != t->level || c->base_layer != t->base_layer || c->layers != t->layers)
+            continue;
+        if (aspect & VK_IMAGE_ASPECT_COLOR_BIT) c->v = *v;   // a later clear of the same target wins
+        else {
+            if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) c->v.depthStencil.depth = v->depthStencil.depth;
+            if (aspect & VK_IMAGE_ASPECT_STENCIL_BIT) c->v.depthStencil.stencil = v->depthStencil.stencil;
+            c->aspect |= aspect;
+        }
+        return 1;
+    }
+    if (npend == (int)(sizeof pend / sizeof pend[0])) clears_flush(ex, 0);
+    pend[npend++] = (PendClear){t->image, aspect, t->level, t->base_layer, t->layers, t->width, t->height, *v};
+    return 1;
+}
+
+static int pend_matches(const VkExec *ex, const PendClear *c, const VkExecTarget *t) {
+    return t->image == c->image && t->level == c->level && t->base_layer == c->base_layer && t->layers == c->layers &&
+           c->w == ex->pass_w && c->h == ex->pass_h && ex->pass_layers == c->layers;
+}
+
+// Colour slot i of the pass about to begin is attached as itself: not left out (TOTK_DETACH), not a repeat of an
+// earlier slot's view (TOTK_DUP_ATTACH, the same test as the attachment loop below).
+static int slot_attached(const VkExec *ex, uint32_t i) {
+    const VkExecTarget *t = &ex->color[i];
+    if (!t->image || (ex->pass_detached >> i & 1)) return 0;
+    if (!opt_dup) return 1;
+    for (uint32_t j = 0; j < i; j++) {
+        const VkExecTarget *o = &ex->color[j];
+        if (o->image == t->image && o->format == t->format && o->level == t->level && o->base_layer == t->base_layer &&
+            o->layers == t->layers && !(ex->pass_detached >> j & 1))
+            return 0;
+    }
+    return 1;
+}
+
 void vk_exec_pass_begin(VkExec *ex) {
     if (ex->in_pass) return;
     resolve_rt(ex);
@@ -739,7 +830,36 @@ void vk_exec_pass_begin(VkExec *ex) {
     ex->pass_written = 0;
     ex->pass_vsread = 0;
     ex->force_full = 0;
+    // Held-back whole-target clears (TOTK_CLEAR_LOAD): those of targets this pass attaches become its load op; the
+    // others are recorded first, as before.
+    int8_t cl_slot[9];   // per pending clear: colour slot 0..7, 8 for the depth/stencil target, -1 none
+    uint32_t keep = 0;
+    for (int k = 0; k < npend; k++) {
+        cl_slot[k] = -1;
+        const PendClear *c = &pend[k];
+        if (c->aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
+            for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; i++)
+                if (pend_matches(ex, c, &ex->color[i]) && slot_attached(ex, i)) { cl_slot[k] = (int8_t)i; break; }
+        } else if (pend_matches(ex, c, &ex->depth) && (c->aspect & ~ex->depth.aspect) == 0 &&
+                   (!(c->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || ex->pass_depth) &&
+                   (!(c->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) || ex->pass_stencil)) {
+            cl_slot[k] = 8;
+        }
+        if (cl_slot[k] >= 0) keep |= 1u << k;
+    }
+    if (npend) {
+        clears_flush(ex, keep);   // (keeps the kept ones in order at the front)
+        int8_t s2[9];
+        int m = 0;
+        for (int k = 0; k < 9 && m < npend; k++)
+            if (keep >> k & 1) s2[m++] = cl_slot[k];
+        memcpy(cl_slot, s2, sizeof s2);
+        if (!npend) frag = 0;   // (recorded clears: the pass begins behind a full barrier, as before)
+        else if (ex->pass_end_at != ex->recorded) frag = 0;
+    }
+    in_pass_begin = 1;
     barrier_to(ex, want, wasp, nwant, frag);   // passes, clears, copies and dispatches see each other's results
+    in_pass_begin = 0;
     if (!frag) ex->store_hazard = 0;
     ex->pass_frag_only = frag;
     st_passes++, st_frag += (uint64_t)frag, st_left_out += (uint64_t)__builtin_popcount(ex->pass_detached);
@@ -781,6 +901,19 @@ void vk_exec_pass_begin(VkExec *ex) {
         if (d->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) da = a;
         if (d->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) sa = a;
     }
+    for (int k = 0; k < npend; k++) {   // the held-back clears this pass takes over (all that are left: see above)
+        const PendClear *c = &pend[k];
+        if (cl_slot[k] >= 0 && cl_slot[k] < 8) {
+            ca[cl_slot[k]].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            ca[cl_slot[k]].clearValue = c->v;
+            ex->pass_written |= (uint8_t)(1u << cl_slot[k]);
+        } else if (cl_slot[k] == 8) {
+            if (c->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.clearValue = c->v;
+            if (c->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, sa.clearValue = c->v;
+        }
+        st_cl_load++;
+    }
+    npend = 0;
     // The start mark goes between the barrier and vkCmdBeginRendering, its end right after vkCmdEndRendering
     // (vk_exec_pass_end): outside the pass, and without breaking it.
     VkPassMark *m = ex->mark = vk_pass_mark_begin(ex->cb, VK_MARK_PASS, ex->fence);
@@ -931,6 +1064,12 @@ static void clear_color(VkExec *ex, const p_clear_color *c) {
     VkClearColorValue cv;
     memcpy(cv.float32, c->rgba, sizeof cv.float32);   // integer targets: the payload's bits as the front end stored them
     if (whole_target(ex, t)) {
+        VkClearValue hv = {.color = cv};
+        if (clear_hold(ex, t, VK_IMAGE_ASPECT_COLOR_BIT, &hv)) {
+            ex->det_force |= (uint8_t)(1u << i);   // the next pass attaches this slot to clear it (TOTK_DETACH)
+            vk_texture_gpu_written(t->tex);
+            return;
+        }
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, t->level, 1, t->base_layer, t->layers};
         vkCmdClearColorImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &r);
@@ -959,6 +1098,11 @@ static void clear_ds(VkExec *ex, const p_clear_ds *c) {
     float d = c->depth < 0.0f ? 0.0f : c->depth > 1.0f ? 1.0f : c->depth;
     VkClearDepthStencilValue v = {d, (uint32_t)c->stencil & 0xff};
     if (whole_target(ex, t)) {
+        VkClearValue hv = {.depthStencil = v};
+        if (clear_hold(ex, t, asp, &hv)) {
+            vk_texture_gpu_written(t->tex);
+            return;
+        }
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {asp, t->level, 1, t->base_layer, t->layers};
         vkCmdClearDepthStencilImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
@@ -1130,6 +1274,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     }
     vk_exec_pass_end(ex);
     x_here = 0;
+    if (npend) clears_flush(ex, 0);   // held-back clears no pass took over (TOTK_CLEAR_LOAD)
     if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
     if (n) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
     if (ex->nviews) {
