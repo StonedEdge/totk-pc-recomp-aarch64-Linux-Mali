@@ -37,6 +37,7 @@ typedef struct Arena {
     VkBuffer buf;
     VmaAllocation alloc;
     uint8_t *map;
+    uint8_t *shadow;            // TOTK_UB_INPLACE: the same bytes in cached host memory, for reading old versions
     uint64_t size;
 } Arena;
 
@@ -58,7 +59,7 @@ static struct {
     // since the last summary
     uint64_t subs, regions, bytes, copy_ns, hits, drops, inflight, refused, off_subs;
     uint64_t used;              // bytes of the arena in use (copies, then versions)
-    int random;                 // arenas in host-cached memory (TOTK_UB_INPLACE reads old versions back)
+    int random;                 // TOTK_UB_INPLACE: arenas keep a cached shadow and room for new versions
     uint64_t upd_done, upd_bytes, upd_big, upd_none, upd_full;
 } U;
 
@@ -90,10 +91,8 @@ static Arena *arena_get(uint64_t need) {
                              // transfer source: DLAA copies the camera block out (vk_dlaa.c mv_pass)
                              .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
     // Device-local through the BAR when the device has it (the GPU reads constants on every draw), else host memory.
-    // With TOTK_UB_INPLACE host-cached memory: a new version copies the old one out of the arena.
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-                                  .flags = (U.random ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-                                                     : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT) |
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
                                            VMA_ALLOCATION_CREATE_MAPPED_BIT};
     VmaAllocationInfo info;
     VkResult res = vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &a->buf, &a->alloc, &info);
@@ -104,6 +103,9 @@ static Arena *arena_get(uint64_t need) {
         return NULL;
     }
     a->map = info.pMappedData;
+    // TOTK_UB_INPLACE: a new version copies the previous one; reading it back from write-combined memory is slow, and
+    // host-cached arena memory needs a flush per version (a driver call on the Mali): the old bytes come from here.
+    if (U.random && !(a->shadow = malloc(a->size))) rt_fatal("vk_usnap: out of memory");
     rt_log("vk_usnap: new arena of %.1f MiB", a->size / 1048576.0);
     return a;
 }
@@ -215,7 +217,7 @@ static int wr_hits(uint64_t lo, uint64_t hi) {   // wr_prune ran: disjoint, sort
 }
 
 static void summary(void) {
-    if (U.subs + U.off_subs < 3600) return;
+    if (U.subs + U.off_subs < (U.random ? 600u : 3600u)) return;
     double s = U.subs ? (double)U.subs : 1.0;
     rt_log("vk_usnap: %llu submissions with a snapshot, %llu without; per submission %.0f ranges, %.1f KiB copied in "
            "%.3f ms, %.0f uniform bindings from the copy, %.1f dropped by GPU writes, %.1f left out (GPU writes in "
@@ -271,6 +273,9 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     U.used = total;
     for (int i = 0; i < U.nreg; i++)
         memcpy(U.arena->map + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
+    if (U.arena->shadow)
+        for (int i = 0; i < U.nreg; i++)
+            memcpy(U.arena->shadow + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
     vmaFlushAllocation(vk_ctx()->vma, U.arena->alloc, 0, total);   // a no-op on coherent memory
     U.on = 1;
     U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += total, U.copy_ns += kern_now_ns() - t0;
@@ -319,16 +324,17 @@ void vk_usnap_drop(uint64_t addr, uint64_t n) {
 // new place in the arena; the draws bound from here on read the new version, the earlier ones keep theirs. 1 when done;
 // 0 (no region, a region over UPD_MAX_REGION, the arena full) leaves the update to the caller.
 int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
-    if (!U.on || !U.arena || !U.random || !n) return 0;
+    if (!U.on || !U.arena || !U.arena->shadow || !n) return 0;
     int i = first_above(dst);
     Reg *r = i < U.nreg ? &U.reg[i] : NULL;
     if (!r || r->dropped || dst < r->lo || dst + n > r->hi) { U.upd_none++; return 0; }
     uint64_t rn = r->hi - r->lo, need = (rn + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     if (rn > UPD_MAX_REGION) { U.upd_big++; return 0; }
     if (U.used + need > U.arena->size) { U.upd_full++; return 0; }
-    memcpy(U.arena->map + U.used, U.arena->map + r->off, rn);
-    memcpy(U.arena->map + U.used + (dst - r->lo), data, n);
-    vmaFlushAllocation(vk_ctx()->vma, U.arena->alloc, U.used, need);   // host-cached memory may not be coherent
+    uint8_t *v = U.arena->shadow + U.used;
+    memcpy(v, U.arena->shadow + r->off, rn);
+    memcpy(v + (dst - r->lo), data, n);
+    memcpy(U.arena->map + U.used, v, rn);   // a sequential write into the GPU's copy
     r->off = U.used;
     U.used += need;
     U.gen++;   // bound descriptors of the region resolve again (vk_exec_draw.c)
@@ -341,7 +347,8 @@ uint64_t vk_usnap_gen(void) { return U.gen; }
 // The arenas back on the free list (vk_exec_draw_shutdown: the device is idle, every completion ran).
 void vk_usnap_shutdown(void) {
     plat_mutex_lock(&free_lock);
-    for (Arena *a = free_arenas, *next; a; a = next) next = a->next, vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a);
+    for (Arena *a = free_arenas, *next; a; a = next)
+        next = a->next, vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a->shadow), free(a);
     free_arenas = NULL;
     plat_mutex_unlock(&free_lock);
 }
