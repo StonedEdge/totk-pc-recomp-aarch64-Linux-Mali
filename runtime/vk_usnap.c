@@ -355,11 +355,23 @@ static int first_above(uint64_t a) {
     return lo;
 }
 
+// TOTK_UB_INPLACE: the first updates into and bindings of regions over the version limit, logged once (how the game
+// uses them decides how such a region can get versions).
+static int big_logged;
+static void big_note(const char *what, const Reg *r, uint64_t addr, uint64_t n) {
+    if (big_logged >= 120) return;
+    big_logged++;
+    rt_log("vk_usnap: big region %#llx+%#llx (%s): %s at +%#llx, %#llx bytes", (unsigned long long)r->lo,
+           (unsigned long long)(r->hi - r->lo), r->dropped ? "dropped" : "live copy", what,
+           (unsigned long long)(addr - r->lo), (unsigned long long)n);
+}
+
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
     if (!U.on || !n) return 0;
     int i = first_above(addr);
     if (i >= U.nreg) return 0;
     Reg *r = &U.reg[i];
+    if (U.random && r->hi - r->lo > upd_max && addr >= r->lo && addr < r->hi) big_note("bind", r, addr, n);
     if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
@@ -408,6 +420,7 @@ int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
         U.upd_direct++;
         return 2;
     }
+    if (U.random && r->hi - r->lo > upd_max && dst >= r->lo && dst < r->hi) big_note("update", r, dst, n);
     if (r->dropped) { U.upd_dropped++; return 0; }
     if (dst < r->lo || dst + n > r->hi) { U.upd_none++; return 0; }
     uint64_t rn = r->hi - r->lo, need = (rn + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
