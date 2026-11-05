@@ -266,6 +266,7 @@ void vk_usnap_end(uint64_t fence);
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out, int base_ok);
 int vk_usnap_check_on(void);   // TOTK_UB_CHECK=1 (diagnostic)
 void vk_usnap_check(uint64_t addr, const VkDescriptorBufferInfo *bi, int stage, int slot);
+void vk_usnap_check_twin(uint64_t addr, const uint8_t *src, uint64_t n, int stage, int slot);
 const uint8_t *vk_usnap_peek(uint64_t addr, uint64_t n);   // TOTK_UB_WINDOW: the bytes as the replay is at now
 int vk_usnap_update(uint64_t dst, uint64_t n, const void *data);   // TOTK_UB_INPLACE: 1 when the snapshot took it
 void vk_usnap_drop(uint64_t addr, uint64_t n);

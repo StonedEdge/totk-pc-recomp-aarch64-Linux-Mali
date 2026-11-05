@@ -280,7 +280,9 @@ static void summary(void) {
 static int first_above(uint64_t a);
 static int join(int i, uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
 
+static void ubc_summary(void);
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
+    ubc_summary();
     if (!U.mode) {
         U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1, U.random = vk_caps_tiler_opt("TOTK_UB_INPLACE");
         const char *m = cfg_get("TOTK_UB_INPLACE_MAX_KB");
@@ -457,8 +459,11 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
 // its window (the twin reads it). Differences are logged (the first 400): how the binding was made, the range, the
 // first and last differing byte and the region. Updates still on the GPU timeline (earlier submissions' copies) and
 // the game writing ahead also differ, so a few lines are expected; a stream of them at the same block is the bug.
-static int ubc_on = -1, ubc_logged;
-static uint64_t ubc_checked, ubc_bad;
+static int ubc_on = -1;
+enum { UBC_VERSION, UBC_JOIN, UBC_BASE, UBC_BASE_NOJOIN, UBC_TWIN, UBC_KINDS };
+static const char *const ubc_name[UBC_KINDS] = {"version", "join", "base", "base (join failed)", "twin"};
+static uint64_t ubc_checked[UBC_KINDS], ubc_bad[UBC_KINDS], ubc_subs;
+static int ubc_logged[UBC_KINDS];
 int vk_usnap_check_on(void) {
     if (ubc_on < 0) {
         const char *e = cfg_get("TOTK_UB_CHECK");
@@ -467,29 +472,51 @@ int vk_usnap_check_on(void) {
     }
     return ubc_on;
 }
-void vk_usnap_check(uint64_t addr, const VkDescriptorBufferInfo *bi, int stage, int slot) {
-    if (!U.arena || !U.arena->shadow || bi->buffer != U.arena->buf) return;
-    const uint8_t *a = U.arena->shadow + bi->offset, *g = (const uint8_t *)(uintptr_t)addr;
-    const Reg *r = find_reg;
-    uint64_t n = bi->range, wlo = 0, whi = 0, first = UINT64_MAX, last = 0, diff = 0;
-    if (r && r->split && find_kind[0] == 'b' && addr == r->blo) wlo = 0x10, whi = 0x50;
+// a: the bytes the GPU gets, g: guest memory now; [wlo, whi) not compared
+static void ubc_compare(int kind, uint64_t addr, const uint8_t *a, uint64_t n, uint64_t wlo, uint64_t whi, int stage,
+                        int slot, const Reg *r) {
+    const uint8_t *g = (const uint8_t *)(uintptr_t)addr;
+    uint64_t first = UINT64_MAX, last = 0, diff = 0;
     for (uint64_t k = 0; k < n; k++)
         if (a[k] != g[k] && !(k >= wlo && k < whi)) {
             if (first == UINT64_MAX) first = k;
             last = k, diff++;
         }
-    ubc_checked++;
-    if (diff) ubc_bad++;
-    if (diff && ubc_logged < 400) {
-        ubc_logged++;
-        rt_log("ubcheck: %s stage %d slot %d %#llx+%#llx: %llu bytes differ, +%#llx..+%#llx; region %#llx+%#llx%s%s "
-               "(base %#llx+%#llx); %llu of %llu bindings differed so far",
-               find_kind, stage, slot, (unsigned long long)addr, (unsigned long long)n, (unsigned long long)diff,
-               (unsigned long long)first, (unsigned long long)last, r ? (unsigned long long)r->lo : 0ull,
-               r ? (unsigned long long)(r->hi - r->lo) : 0ull, r && r->split ? " split" : "", r && r->dropped ? " dropped" : "",
-               r ? (unsigned long long)r->blo : 0ull, r ? (unsigned long long)(r->bhi - r->blo) : 0ull,
-               (unsigned long long)ubc_bad, (unsigned long long)ubc_checked);
-    }
+    ubc_checked[kind]++;
+    if (!diff) return;
+    ubc_bad[kind]++;
+    // small differences of a version are mostly the game writing ahead: only the first few; others up to 150 each
+    if (ubc_logged[kind] >= (kind == UBC_VERSION ? 20 : 150)) return;
+    ubc_logged[kind]++;
+    rt_log("ubcheck: %s stage %d slot %d %#llx+%#llx: %llu bytes differ, +%#llx..+%#llx; region %#llx+%#llx%s%s (base "
+           "%#llx+%#llx)", ubc_name[kind], stage, slot, (unsigned long long)addr, (unsigned long long)n,
+           (unsigned long long)diff, (unsigned long long)first, (unsigned long long)last,
+           r ? (unsigned long long)r->lo : 0ull, r ? (unsigned long long)(r->hi - r->lo) : 0ull,
+           r && r->split ? " split" : "", r && r->dropped ? " dropped" : "", r ? (unsigned long long)r->blo : 0ull,
+           r ? (unsigned long long)(r->bhi - r->blo) : 0ull);
+}
+void vk_usnap_check(uint64_t addr, const VkDescriptorBufferInfo *bi, int stage, int slot) {
+    if (!U.arena || !U.arena->shadow || bi->buffer != U.arena->buf) return;
+    const Reg *r = find_reg;
+    int kind = find_kind[0] == 'v' ? UBC_VERSION : find_kind[0] == 'j' ? UBC_JOIN
+               : find_kind[4] == ' ' ? UBC_BASE_NOJOIN : UBC_BASE;
+    uint64_t wlo = 0, whi = 0;
+    if (r && r->split && (kind == UBC_BASE || kind == UBC_BASE_NOJOIN) && addr == r->blo) wlo = 0x10, whi = 0x50;
+    ubc_compare(kind, addr, U.arena->shadow + bi->offset, bi->range, wlo, whi, stage, slot, r);
+}
+void vk_usnap_check_twin(uint64_t addr, const uint8_t *src, uint64_t n, int stage, int slot) {
+    ubc_compare(UBC_TWIN, addr, src, n, 0, 0, stage, slot, NULL);
+}
+// once per submission (vk_usnap_begin): a line every 600 submissions with the counts per kind
+static void ubc_summary(void) {
+    if (ubc_on <= 0 || ++ubc_subs % 600) return;
+    rt_log("ubcheck: differing / checked bindings: version %llu / %llu, join %llu / %llu, base %llu / %llu, base (join "
+           "failed) %llu / %llu, twin %llu / %llu",
+           (unsigned long long)ubc_bad[0], (unsigned long long)ubc_checked[0], (unsigned long long)ubc_bad[1],
+           (unsigned long long)ubc_checked[1], (unsigned long long)ubc_bad[2], (unsigned long long)ubc_checked[2],
+           (unsigned long long)ubc_bad[3], (unsigned long long)ubc_checked[3], (unsigned long long)ubc_bad[4],
+           (unsigned long long)ubc_checked[4]);
+    memset(ubc_bad, 0, sizeof ubc_bad), memset(ubc_checked, 0, sizeof ubc_checked);
 }
 
 void vk_usnap_drop_ub(uint64_t addr, uint64_t n, int ub) {

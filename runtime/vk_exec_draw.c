@@ -935,6 +935,7 @@ static VkDescriptorBufferInfo window_info(VkExec *ex, int st, int slot, uint32_t
             return zero_info(n);
         src = (const uint8_t *)(uintptr_t)b->addr;   // guest memory: written in replay order (op_update_ub)
     }
+    if (vk_usnap_check_on()) vk_usnap_check_twin(b->addr, src, n, st, slot);
     typeof(WIN[0]) *w = &WIN[st];
     if (!w->valid || w->addr != b->addr || memcmp(w->bytes, src, n)) {
         memcpy(scratch(ex, n, &w->buf, &w->off), src, n);
