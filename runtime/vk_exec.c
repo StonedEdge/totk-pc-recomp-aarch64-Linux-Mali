@@ -63,8 +63,21 @@ void vk_exec_frame_written(const tex_t *t) {
 }
 
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
-    if (!(rt_trace & RT_TRACE_GFX)) return;
     VkExecFrame *f = &vk_exec_frame;
+    if (!(rt_trace & RT_TRACE_GFX)) {
+        // TOTK_TRACE=perf alone: the same counts as a per-frame average over 60 frames
+        static uint64_t n;
+        if (!(rt_trace & RT_TRACE_PERF) || ++n < 60) return;
+        rt_log("frame %llu: per frame over the last %llu: submits %.1f passes %.1f draws %.1f clears %.1f copies %.1f "
+               "dispatches %.1f; feedback draws %.1f barriers %.1f restarts %.1f layouts %.1f",
+               (unsigned long long)frame, (unsigned long long)n, f->submits / (double)n, f->passes / (double)n,
+               f->draws / (double)n, f->clears / (double)n, f->copies / (double)n, f->dispatches / (double)n,
+               f->fb_draws / (double)n, f->fb_barriers / (double)n, f->fb_restarts / (double)n, f->fb_layouts / (double)n);
+        memset(f, 0, sizeof *f);
+        nfw = 0;
+        n = 0;
+        return;
+    }
     int hit = 0;
     char list[512] = "";
     size_t o = 0;
