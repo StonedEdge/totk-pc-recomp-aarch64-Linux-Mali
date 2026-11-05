@@ -168,6 +168,7 @@ static const CfgMeta metas[] = {
     {"TRACE", "", NULL, RESTART}, {"FLIGHT", "0", "0|1", RESTART}, {"FLIGHT_SPIKE_MS", "100", "0..60000", RESTART},
     {"WB_FENCE_LIMIT", "65536", "0..1073741824", RESTART}, {"WB_EXACT", "1", "0|1", RESTART},
     {"PASS_CRUMBS", "", "0|1", RESTART},   // vk_crumbs.c pass marks; unset: VK_AMD_buffer_marker only
+    {"SYNC_AHEAD", "0", "0|1", RESTART},   // nvn_api_core.c: the game a frame further ahead of the GPU
     {"INPUT_RECORD", "", NULL, RESTART},
 };
 
