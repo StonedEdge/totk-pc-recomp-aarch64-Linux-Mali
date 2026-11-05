@@ -124,7 +124,8 @@ uint64_t kern_now_ns(void) { return plat_now_ns(); }
 // every present over those frames, written to TOTK_CRIT_OUT (default crit.bin) at the last one, for
 // tools/crit_path.py, which walks the chain of waits back from each present (holding G). TOTK_CRIT=w<lo>-<hi> takes
 // world-clock seconds instead (frame_step_world_us): from the first present at or after lo to the first after hi, so a
-// session covers the same game time at any frame rate.
+// session covers the same game time at any frame rate. TOTK_CRIT=/<path> (an absolute path): CRIT_TRIG_FRAMES frames
+// from the first present after a file appears there, for a recording started by hand or by a script.
 typedef struct { uint64_t ts, obj; uint32_t a, b; uint16_t kind, st; uint32_t pad; } CritEv;
 enum { CRIT_STATE, CRIT_WAKE, CRIT_FRAME };   // a: thread; b: its waker (STATE), the waker (WAKE); st: new S_* state
 #define CRIT_N (1u << 22)                // 128 MiB, about 2000 fight frames
@@ -133,6 +134,8 @@ static uint32_t g_crit_n;
 static int g_crit_on;
 static uint64_t g_crit_lo, g_crit_hi;   // frames; UINT64_MAX in world mode until the world clock fixes them
 static int64_t g_crit_wlo, g_crit_whi;  // world mode: the window in microseconds of world clock, else 0
+static char g_crit_trig[512];           // TOTK_CRIT=/<path>: CRIT_TRIG_FRAMES frames from the first after a file appears
+#define CRIT_TRIG_FRAMES 120
 
 static void crit_add(int kind, uint32_t a, uint32_t b, int st, uint64_t obj, uint64_t ts) {
     if (g_crit_n < CRIT_N) g_crit[g_crit_n++] = (CritEv){ts, obj, a, b, (uint16_t)kind, (uint16_t)st, 0};
@@ -1192,11 +1195,20 @@ static void crit_frame(RtThread *self, uint64_t frame) {
             g_crit_wlo = (int64_t)(wl * 1e6), g_crit_whi = (int64_t)(wh * 1e6);
             g_crit_lo = g_crit_hi = UINT64_MAX;
             rt_log("crit: recording world seconds %g-%g", wl, wh);
+        } else if (e && e[0] == '/' && (g_crit = malloc(CRIT_N * sizeof *g_crit))) {
+            snprintf(g_crit_trig, sizeof g_crit_trig, "%s", e);
+            remove(g_crit_trig);   // a file left from an earlier run would start the recording at once
+            g_crit_lo = g_crit_hi = UINT64_MAX;
+            rt_log("crit: recording %d frames once %s appears (looked for every 30 frames)", CRIT_TRIG_FRAMES, g_crit_trig);
         } else if (e && sscanf(e, "%llu-%llu", &lo, &hi) == 2 && lo < hi && (g_crit = malloc(CRIT_N * sizeof *g_crit))) {
             g_crit_lo = lo;
             g_crit_hi = hi;
             rt_log("crit: recording frames %llu-%llu", lo, hi);
         }
+    }
+    if (g_crit && g_crit_trig[0] && g_crit_lo == UINT64_MAX && frame % 30 == 0) {
+        FILE *t = fopen(g_crit_trig, "r");
+        if (t) fclose(t), g_crit_lo = frame + 1, g_crit_hi = frame + CRIT_TRIG_FRAMES;
     }
     if (g_crit && g_crit_whi && g_crit_hi == UINT64_MAX) {   // world mode: fix the frames as the clock passes lo and hi
         int64_t w = frame_step_world_us();
