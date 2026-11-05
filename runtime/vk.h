@@ -52,6 +52,7 @@ enum { VK_FEEDBACK_OFF, VK_FEEDBACK_RESTART, VK_FEEDBACK_LAYOUT };
 typedef struct {
     int float64;                       // shaderFloat64 enabled; 0: shaders are translated with softfloat64
     uint32_t sbuf_align;               // nonzero: storage buffers bind at their address rounded down to this
+    int no_vs_stores;                  // no vertexPipelineStoresAndAtomics: vertex shaders' storage writes are dropped
     uint32_t sg_size;                  // requiredSubgroupSize on sg_pin_stages (32)
     VkShaderStageFlags sg_pin_stages;  // 0: no pin, stages run at the device's subgroupSize
     int gpl;                           // VK_EXT_graphics_pipeline_library enabled with fast linking (TOTK_GPL=0: off)
@@ -551,6 +552,7 @@ int vk_pipeline_async_on(void);   // 1 after vk_pipeline_async_enable: graphics 
 // No-op without vk_pipeline_async_enable, with TOTK_PIPE_PREBUILD=0 or with TOTK_GPU=null.
 void vk_pipeline_prewarm(void);
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info);
+VkPipeline vk_pipeline_vs_compute(const GfxShader *vs, const VkPipeInfo **info);   // vk_exec_draw.c vs_as_compute
 // Records every dynamic state that VkPipeState determines, after binding a graphics pipeline: cull mode, front face,
 // topology, depth and stencil tests and ops, depth bias enable, rasterizer discard, vertex input, and, where the GPU
 // has them dynamic, depth clamp, polygon mode, blend enables, equations, write masks and alpha to coverage. The replay

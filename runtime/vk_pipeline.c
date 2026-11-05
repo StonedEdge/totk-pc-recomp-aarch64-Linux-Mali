@@ -1048,9 +1048,10 @@ static uint32_t binding_span(const GfxShader *s) {
 }
 
 // Adds a stage's resources with bindings b >= 1 moved by off; binding 0 (support buffer) is shared.
-static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
+// The bindings of shader s; bit: the Vulkan stage they are declared for (the shader's own, or COMPUTE for a vertex shader
+// run as a compute shader: vk_pipeline_vs_compute), while VkPipeBinding.stage keeps the shader's NVN stage.
+static int add_stage_as(Bindings *B, const GfxShader *s, uint32_t off, VkShaderStageFlags bit) {
     int stage = gfx_shader_stage(s);
-    VkShaderStageFlags bit = stage_bit(stage);
     if (!B->n) {
         B->b[0] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL};
         B->pb[0] = (VkPipeBinding){0, (uint8_t)stage, VK_PIPE_SUPPORT, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL};
@@ -1071,6 +1072,10 @@ static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
         }
     }
     return 1;
+}
+
+static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
+    return add_stage_as(B, s, off, stage_bit(gfx_shader_stage(s)));
 }
 
 // The first binding a module's resource variables use that the binding list b[0..n) lacks (module bindings >= 1 moved
@@ -2636,9 +2641,13 @@ static void prebuild_start(void) {
 }
 
 // A compute pipeline for cs in layout l; VK_NULL_HANDLE on failure. No lock needed (P.cache is driver-synchronised).
+static VkPipeline compute_create_code(const uint32_t *code, uint64_t words, const Layout *l);
 static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
+    return compute_create_code(code, words, l);
+}
+static VkPipeline compute_create_code(const uint32_t *code, uint64_t words, const Layout *l) {
     VkShaderModule m = make_module(code, words);
     if (!m) return VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;
@@ -2857,6 +2866,47 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
         } else {
             P.stats.compute++;
             LB.cs_draw++;
+        }
+        p = pipe_add(&k, sizeof k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
+    }
+    plat_mutex_unlock(&P.lock);
+    if (!p) return VK_NULL_HANDLE;
+    if (info) *info = &p->info;
+    return p->info.pipeline;
+}
+
+// A vertex shader that writes storage buffers, as a compute shader (gfx_vs2cs.c), for a device without
+// vertexPipelineStoresAndAtomics: one invocation per vertex, its bindings those of the vertex stage (declared for
+// COMPUTE). vk_exec_draw.c runs it after the draw. Cached like vk_pipeline_compute; VK_NULL_HANDLE when it cannot be.
+VkPipeline vk_pipeline_vs_compute(const GfxShader *vs, const VkPipeInfo **info) {
+    if (info) *info = NULL;
+    if (!vs || gfx_shader_stage(vs) != GFX_STAGE_VS || !ensure_init()) return VK_NULL_HANDLE;
+    struct { const GfxShader *cs; uint32_t compute; } k = {vs, 2};
+    uint64_t h = key_hash(&k, sizeof k);
+    plat_mutex_lock(&P.lock);
+    Pipe *p = pipe_find(&k, sizeof k, h);
+    if (p) {
+        P.stats.hits++;
+    } else {
+        const char *why = NULL;
+        Bindings B = {0};
+        Layout *l = NULL;
+        VkPipeline pipe = VK_NULL_HANDLE;
+        uint64_t words = 0, cw = 0;
+        const uint32_t *code = gfx_shader_spirv(vs, &words);
+        uint32_t *cc = NULL;
+        if (!add_stage_as(&B, vs, 0, VK_SHADER_STAGE_COMPUTE_BIT)) why = "too many bindings";
+        else if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
+        else if (!code || !gfx_vs_to_cs(code, words, &cc, &cw)) why = "its inputs or entry point do not allow it";
+        else if (!(pipe = compute_create_code(cc, cw, l))) why = "pipeline creation failed";
+        free(cc);
+        if (why) {
+            P.stats.failures++;
+            rt_log("vk_pipeline: vertex shader as a compute shader not built: %s", why);
+        } else {
+            P.stats.compute++;
+            rt_log("vk_pipeline: a vertex shader that writes storage buffers runs as a compute shader (no "
+                   "vertexPipelineStoresAndAtomics)");
         }
         p = pipe_add(&k, sizeof k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
     }

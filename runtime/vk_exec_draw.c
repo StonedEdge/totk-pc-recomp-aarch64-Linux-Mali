@@ -289,6 +289,7 @@ static int gw_on = -1, gw_logged, gw_armed;
 static char gw_path[512];
 static uint64_t gw_t0, gw_check, gw_win;
 static const GfxShader *gw_sh[8];
+static const GfxShader *draw_vs;   // prepare_draw: the vertex shader of the draw being recorded
 static unsigned long long gw_sid(const GfxShader *s) {
     if (!s) return 0;
     const uint8_t *iid = gfx_shader_input_id(s);
@@ -2328,6 +2329,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (!vs || (has_fs && !fs)) return 0;
     gw_sh[NVN_STAGE_VS] = vs, gw_sh[NVN_STAGE_FS] = fs;
     sh_dump(vs), sh_dump(fs);
+    draw_vs = vs;
     if (vk_dlaa_skip_draw(ex, fs)) return 0;   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
@@ -2422,6 +2424,49 @@ static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType
     ex->recorded++;
 }
 
+// ---- a vertex shader's storage writes on a device without vertexPipelineStoresAndAtomics (the Mali-G610)
+// The driver takes such a vertex shader and drops its writes. TotK draws points whose vertex shaders sample a texture at
+// a screen position and write the texel into a storage buffer the CPU reads: Ultra Hand's target is found that way,
+// and with the writes dropped it found nothing (no highlight, nothing to grab). After such a draw the same shader runs
+// as a compute shader (vk_pipeline_vs_compute: one invocation per vertex, the vertex stage's bindings) outside the
+// pass. Non-indexed draws from vertex 0 only (gl_VertexIndex is the invocation index); others are logged once.
+// TOTK_VS_COMPUTE=0 turns it off.
+static int vs_writes(const GfxShader *vs) {
+    const GfxShaderRes *r;
+    int n = gfx_shader_resources(vs, GFX_RES_SSBO, &r);
+    for (int i = 0; i < n; i++)
+        if (r[i].flags & 1) return 1;
+    return 0;
+}
+
+static void vs_as_compute(VkExec *ex, const GfxShader *vs, uint32_t first, uint32_t n) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_VS_COMPUTE");
+        on = !(e && *e == '0');
+    }
+    if (!on || !vk_caps.no_vs_stores || !vs || !n || !vs_writes(vs)) return;
+    if (first) {
+        static int said;
+        if (!said++) rt_log("vk_exec: a vertex shader that writes storage buffers drawn from vertex %u: not run as a "
+                            "compute shader", first);
+        return;
+    }
+    const VkPipeInfo *info = NULL;
+    VkPipeline p = vk_pipeline_vs_compute(vs, &info);
+    if (!p || !info) return;
+    vk_exec_barrier(ex);   // ends the pass; what the draws before wrote is visible to the shader
+    bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+    twin_dispatch = 1;
+    bind_resources(ex, info);
+    twin_dispatch = 0;
+    vkCmdDispatch(ex->cb, n, 1, 1);
+    ex->recorded++;
+    static uint64_t runs;
+    if (++runs <= 4 || runs % 1000 == 0)
+        rt_log("vk_exec: vertex shader storage writes run as a compute shader: %llu draws so far", (unsigned long long)runs);
+}
+
 static void op_draw(VkExec *ex, const p_draw *d) {
     c0_binst = (uint32_t)d->base_instance;
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0)) return;
@@ -2449,6 +2494,7 @@ static void op_draw(VkExec *ex, const p_draw *d) {
     } else {
         vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
     }
+    vs_as_compute(ex, draw_vs, first, n);
     ex->recorded++;
 }
 

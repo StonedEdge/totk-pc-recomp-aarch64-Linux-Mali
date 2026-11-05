@@ -97,6 +97,7 @@ void vk_caps_init(VkCtx *c) {
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13};
     vkGetPhysicalDeviceFeatures2(c->phys, &f2);
     // Storage writes from the vertex and fragment stages (TotK's Ultra Hand reads back results vertex shaders write)
+    vk_caps.no_vs_stores = !f2.features.vertexPipelineStoresAndAtomics;
     rt_log("vk caps: vertexPipelineStoresAndAtomics %d, fragmentStoresAndAtomics %d, shaderStorageBufferArrayDynamicIndexing %d",
            (int)f2.features.vertexPipelineStoresAndAtomics, (int)f2.features.fragmentStoresAndAtomics,
            (int)f2.features.shaderStorageBufferArrayDynamicIndexing);
