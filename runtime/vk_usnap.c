@@ -54,13 +54,15 @@ static struct {
     int ncol, ccol;
     Reg *reg;                   // merged, sorted by lo, disjoint
     int nreg, creg;
+    Rng *excl;                  // bound uniform ranges left out of the copy (refused, GPU write in flight), sorted
+    int nexcl, cexcl;
     Wrote *wr;                  // GPU writes of submissions not known to be complete
     int nwr, cwr;
     // since the last summary
     uint64_t subs, regions, bytes, copy_ns, hits, drops, inflight, refused, off_subs;
     uint64_t used;              // bytes of the arena in use (copies, then versions)
     int random;                 // TOTK_UB_INPLACE: arenas keep a cached shadow and room for new versions
-    uint64_t upd_done, upd_bytes, upd_big, upd_none, upd_full;
+    uint64_t upd_done, upd_bytes, upd_big, upd_none, upd_full, upd_direct;
 } U;
 
 static Arena *free_arenas;
@@ -226,11 +228,12 @@ static void summary(void) {
            U.copy_ns / s / 1e6, U.hits / s, U.drops / s, U.inflight / s, U.refused / s);
     if (U.random)
         rt_log("vk_usnap: UpdateUniformBuffer in the snapshot (TOTK_UB_INPLACE), per submission: %.1f versions "
-               "(%.1f KiB copied), %.1f in a region over %u KiB, %.1f outside a region, %.1f with the arena full",
-               U.upd_done / s, U.upd_bytes / s / 1024.0, U.upd_big / s, UPD_MAX_REGION >> 10, U.upd_none / s,
-               U.upd_full / s);
+               "(%.1f KiB copied), %.1f of a range no uniform binding of the submission touches (written to memory "
+               "only), %.1f in a region over %u KiB, %.1f partly in a region, %.1f with the arena full",
+               U.upd_done / s, U.upd_bytes / s / 1024.0, U.upd_direct / s, U.upd_big / s, UPD_MAX_REGION >> 10,
+               U.upd_none / s, U.upd_full / s);
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
-    U.upd_done = U.upd_bytes = U.upd_big = U.upd_none = U.upd_full = 0;
+    U.upd_done = U.upd_bytes = U.upd_big = U.upd_none = U.upd_full = U.upd_direct = 0;
 }
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
@@ -248,20 +251,20 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     sort_col();
     wr_prune();
     // merge, keeping only what lies wholly in one imported pool and no GPU write in flight touches
-    U.nreg = 0;
+    U.nreg = U.nexcl = 0;
     uint64_t total = 0;
     for (int i = 0; i < U.ncol;) {
         uint64_t lo = U.col[i].lo, hi = U.col[i].hi;
         for (i++; i < U.ncol && U.col[i].lo <= hi; i++)
             if (U.col[i].hi > hi) hi = U.col[i].hi;
         VkMemSpan sp;
-        if (!vk_mem_resolve(lo, hi - lo, &sp) || sp.alloc || !sp.pool || sp.avail < hi - lo ||
-            (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC)) {
-            U.refused++;
-            continue;
-        }
-        if (wr_hits(lo, hi)) {
-            U.inflight++;
+        int refused = !vk_mem_resolve(lo, hi - lo, &sp) || sp.alloc || !sp.pool || sp.avail < hi - lo ||
+                      (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC);
+        if (refused || wr_hits(lo, hi)) {
+            if (refused) U.refused++;
+            else U.inflight++;
+            if (U.nexcl == U.cexcl) U.excl = grow(U.excl, &U.cexcl, sizeof *U.excl);
+            U.excl[U.nexcl++] = (Rng){lo, hi};   // bound live: vk_usnap_update must not write it early
             continue;
         }
         if (U.nreg == U.creg) U.reg = grow(U.reg, &U.creg, sizeof *U.reg);
@@ -322,12 +325,28 @@ void vk_usnap_drop(uint64_t addr, uint64_t n) {
 // TOTK_UB_INPLACE (vk_exec_draw.c op_update_ub): nvnCommandBufferUpdateUniformBuffer of [dst, dst+n) as a new version
 // of the snapshot region holding it: the region's bytes as the earlier draws read them, with the update applied, at a
 // new place in the arena; the draws bound from here on read the new version, the earlier ones keep theirs. 1 when done;
-// 0 (no region, a region over UPD_MAX_REGION, the arena full) leaves the update to the caller.
+// 2 when no uniform binding of the submission touches [dst, dst+n): nothing of it reads the range through the
+// snapshot, and the caller only writes guest memory (the update is for a later submission or frame: about half of the
+// ~440 updates a frame outdoors); 0 (partly in a region, a region over UPD_MAX_REGION, the arena full) leaves the
+// update to the caller's copy on the GPU timeline.
 int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
     if (!U.on || !U.arena || !U.arena->shadow || !n) return 0;
     int i = first_above(dst);
     Reg *r = i < U.nreg ? &U.reg[i] : NULL;
-    if (!r || r->dropped || dst < r->lo || dst + n > r->hi) { U.upd_none++; return 0; }
+    if (!r || r->lo >= dst + n) {
+        int a = 0, b = U.nexcl;   // the first left-out range ending above dst
+        while (a < b) {
+            int m = (a + b) / 2;
+            if (U.excl[m].hi <= dst) a = m + 1;
+            else b = m;
+        }
+        if (a < U.nexcl && U.excl[a].lo < dst + n) { U.upd_none++; return 0; }   // bound live in this submission
+        for (int k = 0; k < U.nwr; k++)   // a GPU write still to come in this submission would land after this one
+            if (U.wr[k].fence >= U.fence && U.wr[k].lo < dst + n && U.wr[k].hi > dst) { U.upd_none++; return 0; }
+        U.upd_direct++;
+        return 2;
+    }
+    if (r->dropped || dst < r->lo || dst + n > r->hi) { U.upd_none++; return 0; }
     uint64_t rn = r->hi - r->lo, need = (rn + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     if (rn > UPD_MAX_REGION) { U.upd_big++; return 0; }
     if (U.used + need > U.arena->size) { U.upd_full++; return 0; }
