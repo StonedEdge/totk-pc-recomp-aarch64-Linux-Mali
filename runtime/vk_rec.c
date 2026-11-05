@@ -21,7 +21,10 @@ static volatile uint64_t head, tail;   // words published by the producer / cons
 static volatile int32_t sleeping;         // the recorder waits for wake_ev
 static PlatEvent wake_ev;              // auto-reset
 static uint64_t put_h;                 // producer: words written (published up to head)
-static VkCommandBuffer rec_cb;         // the part being recorded (set while the recorder is idle)
+static VkCommandBuffer rec_cb;         // producer: the part being recorded
+static VkCommandBuffer exec_cb;        // recorder: the command buffer its calls go into (rec_begin, R_EndSubmit)
+static uint64_t sub_h;                 // producer: put_h after the last R_EndSubmit (rec_wait_submitted)
+static int end_mode = -1;              // TOTK_REC_END (rec_end_cb)
 static int rec_live;                   // producer: rec_begin started the recorder for rec_cb
 static PlatThread *rec_thread;
 static int rec_prio;                   // the submitting thread's priority, which the recorder takes
@@ -31,7 +34,7 @@ static volatile uint64_t part_h0;      // put_h at rec_begin: where the packets 
 static volatile uint64_t part_fence;   // the value of the part being recorded (rec_begin)
 
 // Producer statistics, logged by rec_stats_log.
-static struct { uint64_t packets, words, drains, fallbacks, drain_ns, full_waits, parts, parts_on; } RS_;
+static struct { uint64_t packets, words, drains, fallbacks, drain_ns, full_waits, parts, parts_on, async_parts, sub_waits, sub_wait_ns; } RS_;
 
 enum {
     R_PAD, R_BeginQuery, R_BeginRendering, R_BindDescriptorSets, R_BindIndexBuffer, R_BindPipeline, R_BindVertexBuffers2,
@@ -43,7 +46,7 @@ enum {
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
     R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb,
-    R_PassMark,
+    R_PassMark, R_EndSubmit,
 };
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
@@ -169,7 +172,7 @@ void rec_begin(VkCommandBuffer cb, uint64_t fence) {
     RS_.parts++;
     if (!RT_KNOB_ON(mode)) return;
     RS_.parts_on++;
-    rec_cb = cb;   // the recorder is idle: rec_end drained it
+    rec_cb = exec_cb = cb;   // the recorder is idle: rec_end drained it
     __atomic_store_n(&part_h0, put_h, __ATOMIC_RELEASE);
     __atomic_store_n(&part_fence, fence, __ATOMIC_RELEASE);
     rec_live = 1;
@@ -190,8 +193,9 @@ void rec_end(void) {
 // switch changes nothing, and reports read an unconditional line as proof that the recorder was running (#315).
 typedef struct { int kind; uint64_t n; } A_EndCb;
 int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n) {
-    static int mode = -1, said;
-    if (mode < 0) mode = rt_knob("REC_END", "1");
+    static int said;
+    if (end_mode < 0) end_mode = rt_knob("REC_END", "1");
+    int mode = end_mode;
     if (rec_live && cb == rec_cb && !said) {
         said = 1;
         rt_log("vk_rec: a part the recorder records is ended by %s (TOTK_REC_END=%d)",
@@ -210,6 +214,39 @@ int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n) {
     return 1;
 }
 
+// TOTK_SPLIT_ASYNC (vk_sync.c vk_sync_split): a part of a submission is ended, submitted and followed by the next one
+// on the recorder thread, so the submitting thread goes on replaying without waiting for the recorder to catch up (a
+// drain per part, ~1.9 ms a frame on the Mali handheld). Only for a part the recorder records and ends (TOTK_REC_END);
+// next is a command buffer of the same pool that nothing uses (only the recorder touches that pool meanwhile).
+typedef struct { VkCommandBuffer next; uint64_t fence; } A_EndSubmit;
+int rec_split_async(VkCommandBuffer cb, VkCommandBuffer next, uint64_t fence) {
+    if (end_mode < 0) end_mode = rt_knob("REC_END", "1");
+    if (!rec_live || cb != rec_cb || !end_mode) return 0;
+    A_EndSubmit *a = put(R_EndSubmit, sizeof *a);
+    *a = (A_EndSubmit){next, fence};
+    sub_h = put_h;
+    pub();
+    rec_cb = next;
+    __atomic_store_n(&part_h0, put_h, __ATOMIC_RELEASE);
+    RS_.async_parts++;
+    return 1;
+}
+
+// Waits until the recorder submitted every part rec_split_async handed it (before a submission of uploads that must
+// come after them in queue order).
+void rec_wait_submitted(void) {
+    if (!rec_thread || __atomic_load_n(&tail, __ATOMIC_ACQUIRE) >= sub_h) return;
+    uint64_t t0 = now_ns();
+    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
+    wake();
+    for (int i = 0; __atomic_load_n(&tail, __ATOMIC_ACQUIRE) < sub_h; i++)
+        if (i < 20000) plat_pause();
+        else plat_yield();
+    RS_.sub_waits++, RS_.sub_wait_ns += now_ns() - t0;
+}
+
+int rec_owns(VkCommandBuffer cb) { return rec_live && cb == rec_cb; }
+
 void rec_stats_log(void) {
     if (!(rt_trace & RT_TRACE_PERF) || !RS_.parts) return;
     rt_log("vk_rec: %llu of %llu parts recorded by the recorder: %llu packets (%.1f MiB), %llu drains (%llu for a call "
@@ -217,6 +254,10 @@ void rec_stats_log(void) {
            (unsigned long long)RS_.parts_on, (unsigned long long)RS_.parts, (unsigned long long)RS_.packets,
            RS_.words * 8 / 1048576.0, (unsigned long long)RS_.drains, (unsigned long long)RS_.fallbacks,
            RS_.drain_ns / 1e6, (unsigned long long)RS_.full_waits);
+    if (RS_.async_parts)
+        rt_log("vk_rec: %llu parts ended and submitted by the recorder (TOTK_SPLIT_ASYNC); %llu waits for them before "
+               "uploads, %.2f ms in all", (unsigned long long)RS_.async_parts, (unsigned long long)RS_.sub_waits,
+               RS_.sub_wait_ns / 1e6);
     memset(&RS_, 0, sizeof RS_);
 }
 
@@ -632,7 +673,7 @@ TARGET_CMD(rec_write_mask, R_WriteMask, PFN_vkCmdSetColorWriteMaskEXT, VkColorCo
 // ---- the recorder's side
 
 static void exec_packet(uint32_t op, void *p) {
-    VkCommandBuffer cb = rec_cb;
+    VkCommandBuffer cb = exec_cb;
     switch (op) {
 #define F(name, ...) case R_##name: { A_##name *a = p; vkCmd##name(cb, __VA_ARGS__); break; }
     F(BeginQuery, a->p, a->q, a->f)
@@ -707,6 +748,16 @@ static void exec_packet(uint32_t op, void *p) {
         A_EndCb *a = p;
         if (a->kind) vk_crumb(cb, a->kind, a->n);
         vkEndCommandBuffer(cb);
+        break;
+    }
+    case R_EndSubmit: {   // rec_split_async: end and submit the part, begin the next one
+        A_EndSubmit *a = p;
+        vkEndCommandBuffer(cb);
+        vk_sync_part_submit(cb, a->fence);
+        VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        vkBeginCommandBuffer(a->next, &bi);
+        exec_cb = a->next;
         break;
     }
     default: rt_fatal("vk_rec: unknown packet %u", op);

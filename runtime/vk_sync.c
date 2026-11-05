@@ -379,9 +379,66 @@ static int part_wait_on(void) {
     return on;
 }
 
+// TOTK_SPLIT_ASYNC (default on): the recorder thread submits the part (vk_rec.c rec_split_async).
+void vk_sync_part_submit(VkCommandBuffer cb, uint64_t fence) {
+    VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi};
+    vk_queue_lock();
+    VkResult r = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, &si, VK_NULL_HANDLE);
+    vk_queue_unlock();
+    if (r != VK_SUCCESS) {
+        vk_device_fault_report(r);
+        rt_fatal("vk: vkQueueSubmit2 of a part of value %llu failed (%d)", (unsigned long long)fence, (int)r);
+    }
+}
+
+// A slot whose command buffer the GPU is done with, without allocating one (-1 for none).
+static int free_slot(VkCtx *c, uint64_t fence) {
+    uint64_t gpu = 0;
+    vkGetSemaphoreCounterValue(c->device, c->timeline, &gpu);
+    for (int i = 0; i < nslots; i++)
+        if (slots[i].fence <= gpu && i != cur_slot) {
+            slots[i].fence = fence;
+            return i;
+        }
+    return -1;
+}
+
+static int split_async_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_SPLIT_ASYNC");
+        on = !(e && *e == '0');
+        if (on) rt_log("vk: TOTK_SPLIT_ASYNC: parts of a submission are ended and submitted by the recorder thread");
+    }
+    return on;
+}
+
 VkCommandBuffer vk_sync_split(void) {
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
+    // The recorder ends and submits this part and begins the next while the replay goes on: no drain here. Uploads
+    // this part asked for are submitted first (now); the previous part must be in the queue before them.
+    if (split_async_on() && rec_owns(cb) && !part_wait_on() && !vk_crumb_on() && !vk_mem_mirror_pending()) {
+        ts_end(cb, cur_fence);   // through the recorder
+        rec_wait_submitted();
+        vk_upload_flush(0);
+        vk_mem_shadow_sync();
+        int i = free_slot(c, cur_fence);
+        if (i < 0) {             // a new command buffer: allocating from the pool while the recorder uses it is not allowed
+            rec_drain();
+            i = claim_slot(c, cur_fence);
+        }
+        VkCommandBuffer next = slots[i].cb;
+        ts_submitted();
+        if (rec_split_async(cb, next, cur_fence)) {
+            cur_slot = i;
+            vk_mem_note_submit(cur_fence);
+            ts_begin(next);      // through the recorder, into next once it began it
+            return next;
+        }
+        slots[i].fence = 0;      // not handed over (cannot happen with rec_owns): the old way below
+    }
     ts_end(cb, cur_fence);
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of the part is in cb, ended by its recorder
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order

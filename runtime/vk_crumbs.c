@@ -93,6 +93,8 @@ void vk_crumbs_release(void) {
     vk_pass_marks_on = pm_amd = pm_fill = pm_cpu = 0, set_checkpoint = NULL;
 }
 
+int vk_crumb_on(void) { return write_marker != NULL; }
+
 void vk_crumb(VkCommandBuffer cb, int kind, uint64_t n) {
     if (!write_marker || !cb) return;
     uint32_t code = (uint32_t)kind << 28 | (uint32_t)(n & 0x0fffffff);

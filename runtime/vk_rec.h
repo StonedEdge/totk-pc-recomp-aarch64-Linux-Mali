@@ -21,6 +21,12 @@ void rec_end(void);                   // waits for the recorder; no-op when rec_
 // when it records cb, and the wait for it (1); otherwise rec_end and the breadcrumb, and the caller ends cb (0).
 int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n);
 void rec_drain(void);                 // waits until the recorder made every call queued so far
+// TOTK_SPLIT_ASYNC (vk_sync.c): the recorder ends cb, submits it (vk_sync_part_submit) and begins next; 0 when it does
+// not record cb. rec_wait_submitted: until it submitted every such part. rec_owns: cb is the part it records.
+int rec_split_async(VkCommandBuffer cb, VkCommandBuffer next, uint64_t fence);
+void rec_wait_submitted(void);
+int rec_owns(VkCommandBuffer cb);
+void vk_sync_part_submit(VkCommandBuffer cb, uint64_t fence);   // vk_sync.c, on the recorder thread
 void rec_stats_log(void);             // TOTK_TRACE=perf: packets, bytes, drains and waits since the last call
 // TOTK_REC_CHECK=1 (debug, recorder on): vk_memory.c reports each object it defers (destroy 0, stamped tl) or destroys
 // (destroy 1) with the value the GPU reached (gpu); a packet of the part being recorded that still names it is logged

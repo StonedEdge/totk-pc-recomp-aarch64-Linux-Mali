@@ -89,6 +89,7 @@ void vk_pass_time_frame(uint64_t frame);   // TOTK_PASS_TIME (vk_crumbs.c): at e
 void vk_crumbs_release(void);
 // Records crumb kind with number n (a timeline value, a batch number; the low 28 bits are kept) into cb. Only the
 // thread that records cb may call it: never into a replay part while the recorder thread owns it (vk_rec.h).
+int vk_crumb_on(void);   // breadcrumbs are written (a driver call outside the recorder)
 void vk_crumb(VkCommandBuffer cb, int kind, uint64_t n);
 void vk_crumbs_report(void);         // logs the two codes and what they name
 
