@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "vk.h"
@@ -30,7 +31,7 @@
 #define CALL_DEPTH 16
 // vk_usnap_update (TOTK_UB_INPLACE): room after the copies for new versions, and the largest region versioned
 #define UPD_SLACK (4u << 20)
-#define UPD_MAX_REGION (16u << 10)
+static uint32_t upd_max = 16u << 10;   // TOTK_UB_INPLACE_MAX_KB (default 16): the largest region versioned
 
 typedef struct Arena {
     struct Arena *next;
@@ -62,7 +63,7 @@ static struct {
     uint64_t subs, regions, bytes, copy_ns, hits, drops, inflight, refused, off_subs;
     uint64_t used;              // bytes of the arena in use (copies, then versions)
     int random;                 // TOTK_UB_INPLACE: arenas keep a cached shadow and room for new versions
-    uint64_t upd_done, upd_bytes, upd_big, upd_none, upd_full, upd_direct;
+    uint64_t upd_done, upd_bytes, upd_big, upd_none, upd_full, upd_direct, upd_dropped, upd_big_bytes;
 } U;
 
 static Arena *free_arenas;
@@ -238,15 +239,21 @@ static void summary(void) {
     if (U.random)
         rt_log("vk_usnap: UpdateUniformBuffer in the snapshot (TOTK_UB_INPLACE), per submission: %.1f versions "
                "(%.1f KiB copied), %.1f of a range no uniform binding of the submission touches (written to memory "
-               "only), %.1f in a region over %u KiB, %.1f partly in a region, %.1f with the arena full",
-               U.upd_done / s, U.upd_bytes / s / 1024.0, U.upd_direct / s, U.upd_big / s, UPD_MAX_REGION >> 10,
-               U.upd_none / s, U.upd_full / s);
+               "only), %.1f in a region over %u KiB (avg %.1f KiB), %.1f in a region dropped by a GPU write, %.1f partly "
+               "in a region, %.1f with the arena full",
+               U.upd_done / s, U.upd_bytes / s / 1024.0, U.upd_direct / s, U.upd_big / s, upd_max >> 10,
+               U.upd_big ? U.upd_big_bytes / (double)U.upd_big / 1024.0 : 0.0, U.upd_dropped / s, U.upd_none / s,
+               U.upd_full / s);
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
-    U.upd_done = U.upd_bytes = U.upd_big = U.upd_none = U.upd_full = U.upd_direct = 0;
+    U.upd_done = U.upd_bytes = U.upd_big = U.upd_none = U.upd_full = U.upd_direct = U.upd_dropped = U.upd_big_bytes = 0;
 }
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
-    if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1, U.random = vk_caps_tiler_opt("TOTK_UB_INPLACE");
+    if (!U.mode) {
+        U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1, U.random = vk_caps_tiler_opt("TOTK_UB_INPLACE");
+        const char *m = cfg_get("TOTK_UB_INPLACE_MAX_KB");
+        if (m && atoi(m) > 0) upd_max = (uint32_t)atoi(m) << 10;
+    }
     U.on = 0, U.fence = fence, U.gen++;
     summary();
     if (!RT_KNOB_ON(U.mode - 1)) {
@@ -337,7 +344,7 @@ void vk_usnap_drop(uint64_t addr, uint64_t n) {
 // new place in the arena; the draws bound from here on read the new version, the earlier ones keep theirs. 1 when done;
 // 2 when no uniform binding of the submission touches [dst, dst+n): nothing of it reads the range through the
 // snapshot, and the caller only writes guest memory (the update is for a later submission or frame: about half of the
-// ~440 updates a frame outdoors); 0 (partly in a region, a region over UPD_MAX_REGION, the arena full) leaves the
+// ~440 updates a frame outdoors); 0 (partly in a region, a region over TOTK_UB_INPLACE_MAX_KB, dropped by a GPU write, the arena full) leaves the
 // update to the caller's copy on the GPU timeline.
 int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
     if (!U.on || !U.arena || !U.arena->shadow || !n) return 0;
@@ -356,9 +363,10 @@ int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
         U.upd_direct++;
         return 2;
     }
-    if (r->dropped || dst < r->lo || dst + n > r->hi) { U.upd_none++; return 0; }
+    if (r->dropped) { U.upd_dropped++; return 0; }
+    if (dst < r->lo || dst + n > r->hi) { U.upd_none++; return 0; }
     uint64_t rn = r->hi - r->lo, need = (rn + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
-    if (rn > UPD_MAX_REGION) { U.upd_big++; return 0; }
+    if (rn > upd_max) { U.upd_big++, U.upd_big_bytes += rn; return 0; }
     if (U.used + need > U.arena->size) { U.upd_full++; return 0; }
     uint8_t *v = U.arena->shadow + U.used;
     memcpy(v, U.arena->shadow + r->off, rn);
