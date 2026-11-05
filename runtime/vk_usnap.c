@@ -42,7 +42,7 @@ typedef struct Arena {
 } Arena;
 
 typedef struct { uint64_t lo, hi; } Rng;
-typedef struct { uint64_t lo, hi, off; int dropped; } Reg;
+typedef struct { uint64_t lo, hi, off; int dropped, found; } Reg;   // found: bound since its last version
 typedef struct { uint64_t lo, hi, fence; } Wrote;
 
 static struct {
@@ -136,6 +136,15 @@ static void collect(const op_hdr *h, int depth) {
                 if (U.ncol == U.ccol) U.col = grow(U.col, &U.ccol, sizeof *U.col);
                 uint64_t n = b->size < MAX_RANGE ? b->size : MAX_RANGE;
                 U.col[U.ncol++] = (Rng){b->addr & ~(uint64_t)(ALIGN - 1), b->addr + n};
+            }
+        }
+        // TOTK_UB_INPLACE: an update's range too, so that it lies wholly in one region (an update reaching past the
+        // ranges bound around it fell back to the copy on the GPU timeline: ~140 a submission outdoors).
+        if (h->op == OP_UPDATE_UB && U.random) {
+            const p_update_ub *u = a;
+            if (u->dst && u->size && u->size <= MAX_RANGE) {
+                if (U.ncol == U.ccol) U.col = grow(U.col, &U.ccol, sizeof *U.col);
+                U.col[U.ncol++] = (Rng){u->dst & ~(uint64_t)(ALIGN - 1), u->dst + u->size};
             }
         }
         h = nvn_op_next(h);
@@ -268,7 +277,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
             continue;
         }
         if (U.nreg == U.creg) U.reg = grow(U.reg, &U.creg, sizeof *U.reg);
-        U.reg[U.nreg++] = (Reg){lo, hi, total, 0};
+        U.reg[U.nreg++] = (Reg){lo, hi, total, 0, 0};
         total += (hi - lo + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     }
     if (!U.nreg) return;
@@ -304,10 +313,11 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (!U.on || !n) return 0;
     int i = first_above(addr);
     if (i >= U.nreg) return 0;
-    const Reg *r = &U.reg[i];
+    Reg *r = &U.reg[i];
     if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
+    r->found = 1;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
     U.hits++;
     return 1;
@@ -356,7 +366,10 @@ int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
     memcpy(U.arena->map + U.used, v, rn);   // a sequential write into the GPU's copy
     r->off = U.used;
     U.used += need;
-    U.gen++;   // bound descriptors of the region resolve again (vk_exec_draw.c)
+    // Bound descriptors of the region resolve again (vk_exec_draw.c bind_sig compares a draw with the one before it);
+    // only when a draw bound it since its last version: a draw that binds it later differs from the one before anyway.
+    // A bump per version made every next draw rebuild its descriptor sets (~230 a frame outdoors).
+    if (r->found) U.gen++, r->found = 0;
     U.upd_done++, U.upd_bytes += rn;
     return 1;
 }
