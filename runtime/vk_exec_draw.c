@@ -2499,6 +2499,7 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
         mem_thaw(u->dst, u->size);
         memcpy((void *)(uintptr_t)u->dst, u->data, u->size);
         vk_guest_written(u->dst, u->size);
+        vk_usnap_written(u->dst, u->size, u->data);   // again after an earlier submission's copy still in flight
         upd_note(ex, u);
         return;
     }
@@ -2512,6 +2513,7 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     vkCmdCopyBuffer(ex->cb, b, sp.buffer, 1, &cp);
     vk_mem_gpu_wrote(&sp, u->size);
     vk_usnap_drop_ub(u->dst, u->size, 1);
+    vk_usnap_ub_copy(u->dst, u->size, u->data);
     ex->recorded++;
     vk_mem_count(sp.cls, VK_MUSE_GPU_WRITE, u->size);
     note_written(ex, u->dst, u->size);

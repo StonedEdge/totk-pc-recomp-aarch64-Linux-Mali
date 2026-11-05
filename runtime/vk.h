@@ -266,7 +266,9 @@ void vk_usnap_end(uint64_t fence);
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
 int vk_usnap_update(uint64_t dst, uint64_t n, const void *data);   // TOTK_UB_INPLACE: 1 when the snapshot took it
 void vk_usnap_drop(uint64_t addr, uint64_t n);
-void vk_usnap_drop_ub(uint64_t addr, uint64_t n, int ub);   // ub: the write is an UpdateUniformBuffer copy   // the replay makes the GPU write [addr, addr+n) of guest memory
+void vk_usnap_drop_ub(uint64_t addr, uint64_t n, int ub);
+void vk_usnap_ub_copy(uint64_t dst, uint64_t n, const void *data);   // TOTK_UB_INPLACE: an update copy's bytes
+void vk_usnap_written(uint64_t dst, uint64_t n, const void *data);   // TOTK_UB_INPLACE: an update written early   // ub: the write is an UpdateUniformBuffer copy   // the replay makes the GPU write [addr, addr+n) of guest memory
 uint64_t vk_usnap_gen(void);                      // changes whenever a binding may resolve differently
 void vk_usnap_shutdown(void);                     // vk_exec_draw_shutdown: frees the arenas
 void vk_mem_mirror_begin(void);

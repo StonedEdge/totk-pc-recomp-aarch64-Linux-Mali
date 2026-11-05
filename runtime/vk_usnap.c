@@ -45,6 +45,7 @@ typedef struct Arena {
 typedef struct { uint64_t lo, hi; } Rng;
 typedef struct { uint64_t lo, hi, off; int dropped, found; } Reg;   // found: bound since its last version
 typedef struct { uint64_t lo, hi, fence; int ub; } Wrote;   // ub: an UpdateUniformBuffer copy
+typedef struct { uint64_t lo, hi, fence; uint8_t *data; } PendUb;   // an update copy on the GPU timeline, its bytes
 
 static struct {
     int mode;                   // rt_knob: 0 off, 1 on, 2 ab
@@ -60,12 +61,15 @@ static struct {
     int nexcl, cexcl;
     Wrote *wr;                  // GPU writes of submissions not known to be complete
     int nwr, cwr;
+    PendUb *pub;                // TOTK_UB_INPLACE: update copies of submissions not known to be complete, in order
+    int npub, cpub;
     // since the last summary
     uint64_t subs, regions, bytes, copy_ns, hits, drops, inflight, refused, off_subs;
     uint64_t used;              // bytes of the arena in use (copies, then versions)
     int random;                 // TOTK_UB_INPLACE: arenas keep a cached shadow and room for new versions
     uint64_t upd_done, upd_bytes, upd_big, upd_none, upd_full, upd_direct, upd_dropped, upd_big_bytes, upd_live, upd_live_ub;
     uint64_t ex_ub;             // ranges left out as in flight because of an UpdateUniformBuffer copy of an earlier submission
+    uint64_t in_ub, late;       // ranges copied with update copies in flight applied; guest writes redone after one
 } U;
 
 static Arena *free_arenas;
@@ -205,6 +209,11 @@ static void sort_col(void) {
 // one block before every draw: hundreds of equal entries), each with the newest fence among its parts.
 static void wr_prune(void) {
     uint64_t done = vk_sync_fence_done();
+    int np = 0;
+    for (int i = 0; i < U.npub; i++)
+        if (U.pub[i].fence > done) U.pub[np++] = U.pub[i];
+        else free(U.pub[i].data);
+    U.npub = np;
     int n = 0;
     for (int i = 0; i < U.nwr; i++)
         if (U.wr[i].fence > done) U.wr[n++] = U.wr[i];
@@ -247,14 +256,17 @@ static void summary(void) {
                "(%.1f KiB copied), %.1f of a range no uniform binding of the submission touches (written to memory "
                "only), %.1f in a region over %u KiB (avg %.1f KiB), %.1f in a region dropped by a GPU write, %.1f bound "
                "live (left out of the copy; %.1f of them by an earlier submission's update copy in flight), %.1f "
-               "partly in a region, %.1f with the arena full; ranges left out by an update copy in flight %.1f",
+               "partly in a region, %.1f with the arena full; ranges left out by an update copy in flight %.1f, copied "
+               "with those copies applied %.1f, guest writes redone after one %.1f",
                U.upd_done / s, U.upd_bytes / s / 1024.0, U.upd_direct / s, U.upd_big / s, upd_max >> 10,
                U.upd_big ? U.upd_big_bytes / (double)U.upd_big / 1024.0 : 0.0, U.upd_dropped / s, U.upd_live / s,
-               U.upd_live_ub / s, U.upd_none / s, U.upd_full / s, U.ex_ub / s);
+               U.upd_live_ub / s, U.upd_none / s, U.upd_full / s, U.ex_ub / s, U.in_ub / s, U.late / s);
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
     U.upd_done = U.upd_bytes = U.upd_big = U.upd_none = U.upd_full = U.upd_direct = U.upd_dropped = U.upd_big_bytes = 0;
-    U.upd_live = U.upd_live_ub = U.ex_ub = 0;
+    U.upd_live = U.upd_live_ub = U.ex_ub = U.in_ub = U.late = 0;
 }
+
+static int first_above(uint64_t a);
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.mode) {
@@ -285,6 +297,10 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
         int refused = !vk_mem_resolve(lo, hi - lo, &sp) || sp.alloc || !sp.pool || sp.avail < hi - lo ||
                       (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC);
         int wh = refused ? 0 : wr_hits(lo, hi);
+        // Only update copies of earlier submissions in flight: the copy below applies their bytes (TOTK_UB_INPLACE).
+        // Left out, every update into the range took a copy on the GPU timeline again, so the next submission left
+        // it out too: on the Mali handheld outdoors ~150-180 updates a submission, each ending its pass.
+        if (wh == 2 && U.random) wh = 0, U.in_ub++;
         if (refused || wh) {
             if (refused) U.refused++;
             else U.inflight++;
@@ -309,6 +325,15 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (U.arena->shadow)
         for (int i = 0; i < U.nreg; i++)
             memcpy(U.arena->shadow + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
+    // The update copies still in flight, in submission order, over the bytes guest memory does not hold yet
+    for (int k = 0; k < U.npub; k++) {
+        const PendUb *p = &U.pub[k];
+        for (int i = first_above(p->lo); i < U.nreg && U.reg[i].lo < p->hi; i++) {
+            uint64_t a = p->lo > U.reg[i].lo ? p->lo : U.reg[i].lo, b = p->hi < U.reg[i].hi ? p->hi : U.reg[i].hi;
+            memcpy(U.arena->map + U.reg[i].off + (a - U.reg[i].lo), p->data + (a - p->lo), b - a);
+            if (U.arena->shadow) memcpy(U.arena->shadow + U.reg[i].off + (a - U.reg[i].lo), p->data + (a - p->lo), b - a);
+        }
+    }
     vmaFlushAllocation(vk_ctx()->vma, U.arena->alloc, 0, total);   // a no-op on coherent memory
     U.on = 1;
     U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += total, U.copy_ns += kern_now_ns() - t0;
@@ -400,6 +425,46 @@ int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
     if (r->found) U.gen++, r->found = 0;
     U.upd_done++, U.upd_bytes += rn;
     return 1;
+}
+
+// An update this submission wrote into guest memory over bytes an update copy of an earlier submission is still to
+// write on the GPU timeline: that copy would land after it with older bytes. The write is done again once the newest
+// such copy completed (completion thread).
+typedef struct { uint64_t dst, n; uint8_t data[]; } Late;
+static void late_write(void *arg) {
+    Late *l = arg;
+    mem_thaw(l->dst, l->n);
+    memcpy((void *)(uintptr_t)l->dst, l->data, l->n);
+    vk_guest_written(l->dst, l->n);
+    free(l);
+}
+void vk_usnap_written(uint64_t dst, uint64_t n, const void *data) {
+    uint64_t fence = 0;
+    for (int k = 0; k < U.npub; k++) {
+        PendUb *p = &U.pub[k];
+        if (p->lo >= dst + n || p->hi <= dst) continue;
+        if (p->fence > fence) fence = p->fence;
+        // The bytes guest memory ends up with once the copy and the redone write ran: the later snapshots apply them
+        uint64_t a = p->lo > dst ? p->lo : dst, b = p->hi < dst + n ? p->hi : dst + n;
+        memcpy(p->data + (a - p->lo), (const uint8_t *)data + (a - dst), b - a);
+    }
+    if (!fence || fence <= vk_sync_fence_done()) return;
+    Late *l = malloc(sizeof *l + n);
+    if (!l) rt_fatal("vk_usnap: out of memory");
+    l->dst = dst, l->n = n;
+    memcpy(l->data, data, n);
+    vk_completion_add(fence, late_write, l);
+    U.late++;
+}
+
+// An update copy on the GPU timeline (op_update_ub's fallback): its bytes, for later submissions' snapshots.
+void vk_usnap_ub_copy(uint64_t dst, uint64_t n, const void *data) {
+    if (!U.random || !n || n > MAX_RANGE) return;
+    if (U.npub == U.cpub) U.pub = grow(U.pub, &U.cpub, sizeof *U.pub);
+    uint8_t *d = malloc(n);
+    if (!d) rt_fatal("vk_usnap: out of memory");
+    memcpy(d, data, n);
+    U.pub[U.npub++] = (PendUb){dst, dst + n, U.fence, d};
 }
 
 uint64_t vk_usnap_gen(void) { return U.gen; }
