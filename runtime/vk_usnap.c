@@ -413,8 +413,11 @@ static void big_note(const char *what, const Reg *r, uint64_t addr, uint64_t n) 
            (unsigned long long)(addr - r->lo), (unsigned long long)n);
 }
 
+static const char *find_kind;   // TOTK_UB_CHECK: how vk_usnap_find answered last
+static const Reg *find_reg;
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out, int base_ok) {
     if (!U.on || !n) return 0;
+    find_kind = "version", find_reg = NULL;
     int i = first_above(addr);
     if (i >= U.nreg) return 0;
     Reg *r = &U.reg[i];
@@ -424,14 +427,17 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
         (r->boff + (addr - r->blo)) % align == 0) {
         *out = (VkDescriptorBufferInfo){U.arena->buf, r->boff + (addr - r->blo), n};
         U.hits++, U.bases++;
+        find_kind = "base", find_reg = r;
         return 1;
     }
     if (!r->dropped && addr >= r->lo && addr + n > r->hi && U.arena && U.arena->shadow) {
+        find_kind = "join", find_reg = r;
         if (join(i, addr, n, align, out)) return 1;
         // no room for the join: the base rather than live memory, which holds the newest update (0049's flicker)
         if (r->split && addr >= r->blo && addr + n <= r->bhi && (r->boff + (addr - r->blo)) % align == 0) {
             *out = (VkDescriptorBufferInfo){U.arena->buf, r->boff + (addr - r->blo), n};
             U.hits++, U.bases++;
+            find_kind = "base (join failed)";
             return 1;
         }
         return 0;
@@ -442,7 +448,48 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     r->found = 1;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
     U.hits++;
+    find_reg = r;
     return 1;
+}
+
+// TOTK_UB_CHECK=1 (diagnostic): the bytes a uniform binding from the snapshot gives the GPU against guest memory at
+// replay time, which holds every update before the draw (op_update_ub writes them as it versions them). A base skips
+// its window (the twin reads it). Differences are logged (the first 400): how the binding was made, the range, the
+// first and last differing byte and the region. Updates still on the GPU timeline (earlier submissions' copies) and
+// the game writing ahead also differ, so a few lines are expected; a stream of them at the same block is the bug.
+static int ubc_on = -1, ubc_logged;
+static uint64_t ubc_checked, ubc_bad;
+int vk_usnap_check_on(void) {
+    if (ubc_on < 0) {
+        const char *e = cfg_get("TOTK_UB_CHECK");
+        ubc_on = e && *e && strcmp(e, "0");
+        if (ubc_on) rt_log("vk_usnap: TOTK_UB_CHECK: uniform bindings from the snapshot are compared with guest memory");
+    }
+    return ubc_on;
+}
+void vk_usnap_check(uint64_t addr, const VkDescriptorBufferInfo *bi, int stage, int slot) {
+    if (!U.arena || !U.arena->shadow || bi->buffer != U.arena->buf) return;
+    const uint8_t *a = U.arena->shadow + bi->offset, *g = (const uint8_t *)(uintptr_t)addr;
+    const Reg *r = find_reg;
+    uint64_t n = bi->range, wlo = 0, whi = 0, first = UINT64_MAX, last = 0, diff = 0;
+    if (r && r->split && find_kind[0] == 'b' && addr == r->blo) wlo = 0x10, whi = 0x50;
+    for (uint64_t k = 0; k < n; k++)
+        if (a[k] != g[k] && !(k >= wlo && k < whi)) {
+            if (first == UINT64_MAX) first = k;
+            last = k, diff++;
+        }
+    ubc_checked++;
+    if (diff) ubc_bad++;
+    if (diff && ubc_logged < 400) {
+        ubc_logged++;
+        rt_log("ubcheck: %s stage %d slot %d %#llx+%#llx: %llu bytes differ, +%#llx..+%#llx; region %#llx+%#llx%s%s "
+               "(base %#llx+%#llx); %llu of %llu bindings differed so far",
+               find_kind, stage, slot, (unsigned long long)addr, (unsigned long long)n, (unsigned long long)diff,
+               (unsigned long long)first, (unsigned long long)last, r ? (unsigned long long)r->lo : 0ull,
+               r ? (unsigned long long)(r->hi - r->lo) : 0ull, r && r->split ? " split" : "", r && r->dropped ? " dropped" : "",
+               r ? (unsigned long long)r->blo : 0ull, r ? (unsigned long long)(r->bhi - r->blo) : 0ull,
+               (unsigned long long)ubc_bad, (unsigned long long)ubc_checked);
+    }
 }
 
 void vk_usnap_drop_ub(uint64_t addr, uint64_t n, int ub) {

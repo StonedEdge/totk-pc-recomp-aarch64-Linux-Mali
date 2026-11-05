@@ -964,6 +964,7 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot, const GfxSh
         const p_bind_buf *b = &ex->ubo[st][slot - 3];
         if (b->size && vk_usnap_find(b->addr, b->size < max ? b->size : max, align, &bi,
                                      (r->flags & (GFX_UBO_WINDOWED | GFX_UBO_BASE)) != 0)) {   // as of the submit call
+            if (vk_usnap_check_on()) vk_usnap_check(b->addr, &bi, st, slot);
             count_use(VK_MCLS_SCRATCH, VK_MUSE_UBO, bi.range);
             return bi;
         }
