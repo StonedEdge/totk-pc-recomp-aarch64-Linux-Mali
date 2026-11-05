@@ -1184,6 +1184,7 @@ static PlatMutex mirror_stat_lock = PLAT_MUTEX_INIT;
 static volatile int64_t m_live_n, m_live_bytes, m_refused_n[MR_N], m_refused_bytes[MR_N];
 static volatile int64_t m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mismatch;
 
+static int class_mali;                 // vk_mem_class_log: an Arm Mali (vk_caps.mali is set only later, by vk_caps_driver)
 static void mirror_mode(int discrete) {
     const char *e = cfg_value("TOTK_MEMORY");
     int mode = discrete ? 1 : 0;   // 0 import, 1 mirror, 2 verify
@@ -1210,7 +1211,7 @@ static void mirror_mode(int discrete) {
 #else
     // Off on Mali: the blob imports host memory, and the copies cost 1.2 GB of RAM outdoors (with the handheld's 8 GB
     // the game swapped) plus 3-4 ms a frame of syncing; pools it refuses fall back to shadow storage one by one.
-    shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : !vk_caps.mali;
+    shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : !class_mali;
 #endif
     if (vk_ctx() && !vk_ctx()->has_external_memory_host && !shadow_on) {
         shadow_on = 1;   // nothing to import with
@@ -1736,6 +1737,7 @@ void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDevic
     else if (host_heap < 0) cls = "uma", why = "every heap is device-local";
     else cls = "discrete", why = "device-local heap separate from host memory";
     int discrete = cls[0] == 'd';
+    class_mali = p->vendorID == 0x13B5;
     char line[2048];
     size_t k = (size_t)snprintf(line, sizeof line, "mem: class %s (%s; device type %d %s, %s)", cls, why, t, tn, p->deviceName);
     for (uint32_t h = 0; h < m->memoryHeapCount; h++)
