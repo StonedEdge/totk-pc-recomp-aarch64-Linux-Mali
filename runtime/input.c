@@ -540,10 +540,16 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
     static int combo_held;
     int32_t st[4] = {sl[0], sl[1], sr[0], sr[1]};
     int toggle = input_menu_gate(&combo_held, menu_is_open(), &b, st);
-    // The gamepad's Guide (Home / logo) button opens or closes the menu too, as F1 does: handhelds with a Guide button
-    // have no F1, and the game has no use for it. Toggled on the press only.
-    static int guide_held;
-    int guide = state == 1 && pad && SDL_GamepadConnected(pad) && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_GUIDE);
+    // TOTK_GUIDE_MENU=1: the gamepad's Guide (Home / logo) button opens or closes the menu too, as F1 does. Off by
+    // default: handhelds often map Guide to a system shortcut already (on the Mali handheld, MangoHud's toggle), and both
+    // then happened at once. Toggled on the press only.
+    static int guide_held, guide_on = -1;
+    if (guide_on < 0) {
+        const char *g = cfg_get("TOTK_GUIDE_MENU");
+        guide_on = g && *g && strcmp(g, "0");
+    }
+    int guide = guide_on && state == 1 && pad && SDL_GamepadConnected(pad) &&
+                SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_GUIDE);
     if (guide && !guide_held) toggle = 1;
     guide_held = guide;
     static int overlay_held;   // L3+R3 step the performance overlay (F10)
