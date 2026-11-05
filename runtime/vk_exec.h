@@ -112,6 +112,7 @@ typedef struct VkExec {
     const void *fb_fs;                   // feedback_scan's memo: fragment shader, texture bind serial, pass serial
     uint32_t fb_serial, fb_pass, fb_sampled;
     uint32_t tex_serial, pass_serial;    // bumped by every texture or image bind and pass begin
+    uint64_t end_copies, end_dispatches, end_clears;   // vk_exec_frame's counts at the last pass end (tiler stats)
 
     // Tiler options (vk_exec.c "tiler options"; on by default on Mali GPUs, vk_caps_tiler_opt). A pass's key names its
     // render targets and the program of its first draw; the pass table remembers per key which colour slots its draws

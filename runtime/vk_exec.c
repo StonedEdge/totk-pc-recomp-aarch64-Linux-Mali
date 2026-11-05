@@ -625,6 +625,10 @@ static void tiler_opts(void) {
 #define PT_N 8192   // direct-mapped: a slot another key took reads as unknown (everything attached, a full barrier)
 static struct { uint64_t key; uint8_t written, vsread; } PT[PT_N];
 static uint64_t st_passes, st_left_out, st_det_miss, st_frag, st_frag_restarts, st_dups, st_t0;
+// Why a pass began behind a full barrier: work since the last pass end (a dispatch, a copy, a clear, anything else such
+// as a new part's prologue), a draw's store since the last full barrier, a restart for a vertex read, a pass the table
+// does not know yet, one whose vertex stage reads GPU results.
+static uint64_t st_why_disp, st_why_copy, st_why_clear, st_why_other, st_why_store, st_why_forced, st_why_new, st_why_vs;
 
 static uint64_t pass_key_of(const VkExec *ex) {
     uint64_t h = 1469598103934665603ull;
@@ -674,7 +678,14 @@ static void tiler_stats(void) {
            (unsigned long long)st_passes, (unsigned long long)st_left_out, (unsigned long long)st_det_miss,
            (unsigned long long)st_frag, (unsigned long long)st_frag_restarts, (unsigned long long)st_dups,
            (unsigned long long)st_cl_load, (unsigned long long)st_cl_flushed);
+    rt_log("vk: tiler: full pass barriers because of: a dispatch since the last pass %llu, a copy %llu, a clear %llu, "
+           "other commands %llu; a draw's store %llu; a vertex read restart %llu; a pass not seen yet %llu; a vertex stage "
+           "reading GPU results %llu (4 s)",
+           (unsigned long long)st_why_disp, (unsigned long long)st_why_copy, (unsigned long long)st_why_clear,
+           (unsigned long long)st_why_other, (unsigned long long)st_why_store, (unsigned long long)st_why_forced,
+           (unsigned long long)st_why_new, (unsigned long long)st_why_vs);
     st_passes = st_left_out = st_det_miss = st_frag = st_frag_restarts = st_dups = st_cl_load = st_cl_flushed = 0;
+    st_why_disp = st_why_copy = st_why_clear = st_why_other = st_why_store = st_why_forced = st_why_new = st_why_vs = 0;
     st_t0 = now;
 }
 
@@ -838,6 +849,17 @@ void vk_exec_pass_begin(VkExec *ex) {
     int k = pt_find(key);
     int frag = opt_frag && ex->pass_end_at == ex->recorded && !ex->store_hazard && !ex->force_full && k >= 0 &&
                !PT[k].vsread;
+    if (opt_frag && !frag) {   // the first reason that applies (tiler stats)
+        if (ex->pass_end_at != ex->recorded) {
+            if (vk_exec_frame.dispatches != ex->end_dispatches) st_why_disp++;
+            else if (vk_exec_frame.copies != ex->end_copies) st_why_copy++;
+            else if (vk_exec_frame.clears != ex->end_clears) st_why_clear++;
+            else st_why_other++;
+        } else if (ex->store_hazard) st_why_store++;
+        else if (ex->force_full) st_why_forced++;
+        else if (k < 0) st_why_new++;
+        else st_why_vs++;
+    }
     ex->pass_key = key;
     ex->pass_detached = det_predict(ex, key);
     ex->det_force = 0;
@@ -960,6 +982,7 @@ void vk_exec_pass_end(VkExec *ex) {
     ex->recorded++;
     ex->in_pass = 0;
     ex->pass_end_at = ex->recorded;   // what is recorded from here to the next pass begin is outside any pass
+    ex->end_copies = vk_exec_frame.copies, ex->end_dispatches = vk_exec_frame.dispatches, ex->end_clears = vk_exec_frame.clears;
     pt_note(ex->pass_key, ex->pass_written, ex->pass_vsread);
     ex->pass_key = 0;
     ex->pass_detached = ex->pass_dup = 0;
