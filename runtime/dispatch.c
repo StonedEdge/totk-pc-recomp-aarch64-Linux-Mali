@@ -10,6 +10,7 @@
 // The table is filled once by rt_dispatch_init and then made read-only, so any number of threads read it without
 // locks or per-thread caches. Host (HLE) functions at addresses outside the modules live in a small hash table that
 // is also fixed at init; they are looked up only after the flat table misses.
+#include "cfg.h"
 #include "dispatch.h"
 #include "host.h"
 #include "platform/platform.h"
@@ -155,6 +156,18 @@ void rt_dispatch_init(const RtModule *mods, int count) {
     uint64_t slots = (hi - lo) >> 2, bytes = (slots * 4 + 0xFFFF) & ~0xFFFFull;
     uint32_t *slot = table_alloc(bytes);
     if (!slot) rt_fatal("dispatch: cannot allocate a %llu-byte table", (unsigned long long)bytes);
+    // TOTK_HUGEPAGES (default on): every indirect call reads a slot of this table, spread over tens of MiB; with 4 KiB
+    // pages most of those reads miss the data TLB on the CM5 (perf stat: 3-5 dTLB misses per 1000 instructions on
+    // the game's threads, rt_dispatch the hottest function of a worker). The table is filled at once, so 2 MiB pages
+    // cost no memory beyond what it uses anyway. TOTK_HUGE_CODE=1 asks the same for the lifted code (file-backed;
+    // needs a kernel with read-only file THP; makes the whole code resident, ~250 MiB): iTLB misses.
+    const char *hp = cfg_get("TOTK_HUGEPAGES");
+    int huge = !hp || !*hp || atoi(hp) != 0;
+    char note[160];
+    if (huge) {
+        plat_mem_hugepages(slot, bytes, 0, note, sizeof note);
+        rt_log("dispatch: table %llu MiB, 2 MiB pages asked: %s", (unsigned long long)(bytes >> 20), note);
+    }
     for (int i = 0; i < g_nmods; i++) {
         const RtModule *m = g_mods[i];
         for (uint64_t k = 0; k < m->count; k++)
@@ -162,6 +175,16 @@ void rt_dispatch_init(const RtModule *mods, int count) {
         g_functions += m->count;
     }
     table_seal(slot, bytes);
+    if (huge) {
+        plat_mem_hugepages(slot, bytes, 1, note, sizeof note);
+        rt_log("dispatch: table collapse: %s", note);
+    }
+    const char *hc = cfg_get("TOTK_HUGE_CODE");
+    if (hc && atoi(hc) > 0) {
+        plat_mem_hugepages((void *)host_lo, host_hi - host_lo, 1, note, sizeof note);
+        rt_log("dispatch: lifted code %#llx..%#llx, 2 MiB pages asked: %s", (unsigned long long)host_lo,
+               (unsigned long long)host_hi, note);
+    }
 
     g_table_bytes = bytes;
     D.slot = slot;

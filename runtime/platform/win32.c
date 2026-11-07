@@ -574,6 +574,12 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
 
 void *plat_mem_alloc(size_t n) { return VirtualAlloc(NULL, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); }
 
+int plat_mem_hugepages(void *p, size_t n, int collapse, char *note, size_t note_n) {
+    (void)p, (void)n, (void)collapse;
+    if (note && note_n) snprintf(note, note_n, "not on Windows");
+    return 0;
+}
+
 int plat_mem_commit(uint64_t addr, size_t n) {
     return VirtualAlloc((void *)(uintptr_t)addr, n, MEM_COMMIT, PAGE_READWRITE) != NULL;
 }

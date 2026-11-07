@@ -1082,6 +1082,33 @@ void *plat_mem_alloc(size_t n) {
     return p == MAP_FAILED ? NULL : p;
 }
 
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25   // Linux 6.1
+#endif
+
+int plat_mem_hugepages(void *p, size_t n, int collapse, char *note, size_t note_n) {
+    uintptr_t lo = ((uintptr_t)p + (2u << 20) - 1) & ~(uintptr_t)((2u << 20) - 1);   // whole 2 MiB pages inside
+    uintptr_t hi = ((uintptr_t)p + n) & ~(uintptr_t)((2u << 20) - 1);
+    char mode[64] = "?";
+    FILE *f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+    if (f) {
+        if (!fgets(mode, sizeof mode, f)) mode[0] = 0;
+        fclose(f);
+        mode[strcspn(mode, "\n")] = 0;
+    }
+    if (hi <= lo) {
+        if (note && note_n) snprintf(note, note_n, "under 2 MiB (THP %s)", mode);
+        return 0;
+    }
+    int ok = madvise((void *)lo, hi - lo, MADV_HUGEPAGE) == 0;
+    int e1 = ok ? 0 : errno, e2 = 0;
+    if (collapse && madvise((void *)lo, hi - lo, MADV_COLLAPSE)) e2 = errno;
+    if (note && note_n)
+        snprintf(note, note_n, "%zu MiB, THP %s, MADV_HUGEPAGE %s%s%s", (size_t)((hi - lo) >> 20), mode,
+                 ok ? "ok" : strerror(e1), collapse ? ", MADV_COLLAPSE " : "", collapse ? (e2 ? strerror(e2) : "ok") : "");
+    return ok;
+}
+
 int plat_mem_commit(uint64_t addr, size_t n) {
     soft_unarm(addr, n, 0);
     if (mprotect((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE)) return 0;
