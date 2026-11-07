@@ -99,6 +99,8 @@ static struct {
     VkPipeline pipe[2];                  // bound per bind point: 0 graphics, 1 compute
     VkPipeState st;                      // the state vk_pipeline_set_dynamic last recorded
     int st_valid;
+    int dyn_valid;                       // vk_pipeline_set_dynamic_delta's record of this command buffer's dynamic state
+                                         // holds (TOTK_DYN_DELTA); pipeline binds keep it, the memset clears it
     uint32_t vmask;                      // the vertex bindings st's vertex input reads (valid with st_valid)
     uint32_t vres;                       // the streams whose vb entry was resolved from vin (others: the zero buffer)
     VkBuffer vb[17];                     // vertex buffers last bound
@@ -138,6 +140,10 @@ static struct {
     int on;
     uint64_t draws, bind[2], desc[2], push, push_skip, set_new, set_reuse, ac_miss, same_prog, same_all, bind_skip;
 } BS = {-1};
+
+// TOTK_DYN_DELTA (prepare_draw): the mode and, for the perf line, the set_dynamic calls, the commands they recorded
+// (a full call counts 1) and the calls that recorded none.
+static struct { int mode; uint64_t calls, cmds, empty; } DD = {-1};
 
 // The inputs of the last graphics bind_resources (bind_sig) and what its build counted for the traffic census, which a
 // skipped build counts again. RS_BYTES bounds the bound-slot bytes a pipeline reads (RsList): per binding at most one
@@ -2413,8 +2419,20 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     tiler_draw(ex, &s);   // may restart the pass (vk_exec.c tiler options)
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
-        B.vmask = vk_pipeline_set_dynamic(ex->cb, &s);
-        ex->recorded++;
+        // TOTK_DYN_DELTA: only the dynamic states whose values changed since the last call in this command buffer. A
+        // pipeline bind clears st_valid but not dyn_valid: every pipeline here declares the same dynamic states, which
+        // the bind leaves as they were (the viewport, scissor and stencil values of record_fixed rely on that too).
+        if (DD.mode < 0) DD.mode = rt_knob("DYN_DELTA", "1");
+        uint32_t cmds = 1;
+        if (RT_KNOB_ON(DD.mode)) {
+            B.vmask = vk_pipeline_set_dynamic_delta(ex->cb, &s, B.dyn_valid, &cmds);
+            B.dyn_valid = 1;
+        } else {
+            B.vmask = vk_pipeline_set_dynamic(ex->cb, &s);
+            B.dyn_valid = 0;   // the delta's record is stale from here on
+        }
+        DD.calls++, DD.cmds += cmds, DD.empty += !cmds;
+        ex->recorded += cmds != 0;
         B.st = s, B.st_valid = 1;
         if (ex->mark && vk_exec_frame.draws == ex->mark_draws0) ex->mark->first[0] = vs, ex->mark->first[1] = fs;
     }
