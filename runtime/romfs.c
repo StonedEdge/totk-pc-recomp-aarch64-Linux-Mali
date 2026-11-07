@@ -95,8 +95,16 @@ static double now_s(void) { return (double)plat_now_ns() / 1e9; }
 // reading threads; they are a diagnostic.
 static uint64_t rd_n, rd_bytes, rd_ns, rd_max, rd_slow, rd_t0;
 
-static void read_timed(uint64_t ns, int64_t got) {
+static void read_timed(uint64_t ns, int64_t got, uint64_t off) {
     if (!(rt_trace & RT_TRACE_PERF)) return;
+    perf_read(ns);
+    if (ns >= 50000000) {   // a read this long can be a hitch by itself: which thread, how big, which frame
+        static int slow_lines;
+        if (slow_lines++ < 400)
+            rt_log("RomFS slow read: %.1f ms, %lld KiB at %#llx, thread %#x, frame %llu", ns / 1e6,
+                   (long long)(got > 0 ? got / 1024 : got), (unsigned long long)off, kern_self_handle(),
+                   (unsigned long long)perf_frame_no());
+    }
     uint64_t now = plat_now_ns();
     rd_n++, rd_ns += ns, rd_bytes += got > 0 ? (uint64_t)got : 0;
     if (ns > rd_max) rd_max = ns;
@@ -115,7 +123,7 @@ static int64_t read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
     mem_thaw((uintptr_t)buf, n);   // the kernel's write would fail on a frozen page instead of faulting
     uint64_t t0 = plat_now_ns();
     int64_t got = plat_file_pread(f, buf, n, off);
-    read_timed(plat_now_ns() - t0, got);
+    read_timed(plat_now_ns() - t0, got, off);
     if (got == -2)   // a read-only page in the buffer: a frozen region missed its thaw
         rt_log("RomFS: read of %u bytes into %p refused: the buffer is not writable", n, buf);
     return got < 0 ? -1 : got;

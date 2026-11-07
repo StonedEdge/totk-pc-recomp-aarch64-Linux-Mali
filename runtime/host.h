@@ -36,6 +36,8 @@ void perf_end(int kind, uint64_t t0);           // counts render-thread time onl
 void perf_replay(uint64_t t0);                  // replay (NVN -> Vulkan recording) time on any thread, waits inside it included
 void perf_replay_thread(void);                  // the calling thread replays for the render thread: perf_end counts its waits
 void perf_main_thread(void);                    // the calling thread is the guest main thread (TOTK_PROFILE_MAIN)
+void perf_read(uint64_t ns);                    // romfs.c: a RomFS read took ns on the calling thread (any thread)
+uint64_t perf_frame_no(void);                   // the number of the last presented frame
 // Events per 60-frame window: graphics pipelines finished by the background workers, draws skipped while pending,
 // first texture uploads and re-uploads after CPU writes, draws skipped while a shader translates in the background,
 // draws that waited for their pending pipeline and got it, draws into a target the previous frame did not render that
@@ -214,6 +216,7 @@ extern int kern_host_track;
 static inline int *kern_host_depth(void *thread) { return (int *)thread + 1; }
 void kern_host_left(void *thread);                         // back at depth 0 with a preempt request pending
 int kern_core_diag_on(void);                               // TOTK_CORE_DIAG
+uint32_t kern_self_handle(void);                // the calling guest thread's handle (0x10xx), 0 on a host thread
 void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns);   // perf_present, every present (also logs the
                                                            // asynchronous preemption counters)
 void kern_sched_report(uint64_t frame);                    // TOTK_TRACE=sched: per-thread time split, on present

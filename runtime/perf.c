@@ -62,6 +62,16 @@ uint64_t perf_begin(void) { return kern_now_ns(); }
 void perf_replay_thread(void) { prof_replay_tid = plat_thread_id(); }
 void perf_main_thread(void) { prof_main_tid = plat_thread_id(); }
 
+// RomFS read time since the previous present: all threads, and the guest main thread's share (the slow-frame line)
+static uint64_t frame_read_ns, frame_read_main_ns, g_frame_no;
+
+void perf_read(uint64_t ns) {
+    __atomic_fetch_add(&frame_read_ns, ns, __ATOMIC_RELAXED);
+    if (plat_thread_id() == prof_main_tid) __atomic_fetch_add(&frame_read_main_ns, ns, __ATOMIC_RELAXED);
+}
+
+uint64_t perf_frame_no(void) { return __atomic_load_n(&g_frame_no, __ATOMIC_RELAXED); }
+
 void perf_end(int kind, uint64_t t0) {
     if (!t0) return;
     uint32_t tid = plat_thread_id();
@@ -273,6 +283,9 @@ void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start, ab_b;
     static int64_t win_prev[PERF_CNT_N];
     prof_render_tid = plat_thread_id();
+    __atomic_store_n(&g_frame_no, frame, __ATOMIC_RELAXED);
+    uint64_t rd_all = __atomic_exchange_n(&frame_read_ns, 0, __ATOMIC_RELAXED);
+    uint64_t rd_main = __atomic_exchange_n(&frame_read_main_ns, 0, __ATOMIC_RELAXED);
     if (rt_trace & RT_TRACE_SCHED) kern_sched_report(frame);
     uint64_t now = kern_now_ns(), d = last ? now - last : 0;
     prof_sampler_frame(frame, now, last ? d : 0);
@@ -298,10 +311,11 @@ void perf_present(uint64_t frame) {
         n++;
         if (d > max) max = d, memcpy(worst_ns, frame_ns, sizeof worst_ns);
         if (d >= slow_ns)
-            rt_log("perf: slow frame %llu: %.1f ms; blocked pipeline %.1f xlate %.1f texture %.1f astc %.1f fence %.1f pacing %.1f",
+            rt_log("perf: slow frame %llu: %.1f ms; blocked pipeline %.1f xlate %.1f texture %.1f astc %.1f fence %.1f pacing %.1f"
+                   "; RomFS reads %.1f (guest main %.1f)",
                    (unsigned long long)frame, d / 1e6, frame_ns[PERF_PIPE] / 1e6, frame_ns[PERF_XLATE] / 1e6,
                    frame_ns[PERF_TEX] / 1e6, frame_ns[PERF_ASTC] / 1e6, frame_ns[PERF_FENCE] / 1e6,
-                   frame_ns[PERF_PACE] / 1e6);
+                   frame_ns[PERF_PACE] / 1e6, rd_all / 1e6, rd_main / 1e6);
     }
     memset(frame_ns, 0, sizeof frame_ns);
     last = now;

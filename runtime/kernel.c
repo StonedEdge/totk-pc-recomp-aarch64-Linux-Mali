@@ -1545,6 +1545,8 @@ uint64_t kern_threads_created(void) {
 
 Cpu *kern_cpu(void) { return tcur ? tcur->cur : NULL; }
 
+uint32_t kern_self_handle(void) { return tcur ? tcur->handle : 0; }
+
 uint32_t kern_main_thread(Cpu **cpu) {
     if (tcur) {
         if (!tcur->is_main) rt_fatal("kern_main_thread on guest thread %#x, not the main thread", tcur->handle);
