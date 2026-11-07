@@ -234,6 +234,7 @@ static void migrate(void) {
 
 int cfg_load(const char *path) {
     clear();
+    __atomic_add_fetch(&version, 1, __ATOMIC_RELEASE);   // drops the cfg_get caches
     uint64_t size = 0;
     uint8_t *data = plat_file_read(path, &size);
     if (!data) return 0;
@@ -317,12 +318,38 @@ static const char *raw_get(const char *name) {
     return NULL;
 }
 
-const char *cfg_get(const char *name) {
+static const char *cfg_get_slow(const char *name) {
     const char *v = raw_get(name);
     if (v || strncmp(name, PREFIX, PREFIX_LEN) || !profile_of()) return v;
     for (size_t i = 0; i < sizeof DECK / sizeof *DECK; i++)
         if (!strcasecmp(DECK[i].key, name + PREFIX_LEN)) return DECK[i].value;
     return NULL;
+}
+
+// cfg_get runs on hot paths too (cs_listed in vk_exec_draw.c at every compute dispatch, and others), and each call
+// scanned the environment, the totk.ini keys and the device table with strcasecmp: 13 % of the render thread on the
+// CM5 (perf, 2026-11-07). A per-thread direct-mapped cache of answers, keyed by the name's text and dropped when
+// cfg_version changes (cfg_set, cfg_reset, cfg_load), answers a repeated name with one strcmp. Values stay valid for
+// the process (cfg_set keeps old strings), so a cached pointer is as good as a fresh one. Names without the TOTK_
+// prefix go to getenv each time, as before (plat_setenv changes some of those).
+#define CG_N 64
+#define CG_KEY 56
+static _Thread_local struct { char key[CG_KEY]; const char *value; unsigned ver; } cg[CG_N];
+
+const char *cfg_get(const char *name) {
+    if (strncmp(name, PREFIX, PREFIX_LEN)) return getenv(name);
+    size_t n = strlen(name);
+    if (n >= CG_KEY) return cfg_get_slow(name);
+    uint32_t h = 2166136261u;
+    for (size_t i = PREFIX_LEN; i < n; i++) h = (h ^ (uint8_t)name[i]) * 16777619u;
+    unsigned ver = cfg_version();
+    __typeof__(&cg[0]) e = &cg[h & (CG_N - 1)];
+    if (e->ver == ver + 1 && !strcmp(e->key, name)) return e->value;   // ver + 1: 0 marks an empty slot
+    const char *v = cfg_get_slow(name);
+    memcpy(e->key, name, n + 1);
+    e->value = v;
+    e->ver = ver + 1;
+    return v;
 }
 
 // Whether name's value comes from the player (the environment or totk.ini), not a profile or the table.
