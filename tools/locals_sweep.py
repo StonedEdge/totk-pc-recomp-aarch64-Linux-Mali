@@ -1,6 +1,7 @@
 """Static cost of the hottest lifted functions at several --reg-locals counts, compiled for this machine.
 
-Usage: locals_sweep.py --exefs DIR --order ORDER.txt [--top 300] [--locals 6,10,14,18] [--cc clang] [--work DIR]
+Usage: locals_sweep.py --exefs DIR --order ORDER.txt [--top 300] [--locals 6,10,14,18] [--opts "-O1;-O2"] [--cc clang]
+       [--work DIR]
 
 recomp/regs.py keeps a function's LOCALS most used guest registers in C locals; the rest are loads and stores of
 the Cpu (c->x[n]) at every use, which the compiler cannot keep in host registers across guest stores. LOCALS = 6 was
@@ -9,6 +10,10 @@ functions of an order file (tools/hot_order.py: hottest first) with each count, 
 (-O1, -fno-strict-aliasing) and counts per count: instructions, loads, stores, and the loads and stores relative to
 the register that holds the Cpu pointer. Fewer is better; the hottest functions count most when --weight is given
 (1/rank). Static counts, not executed ones: the game run decides, this picks the candidates.
+
+--opts compares optimisation flag sets as tools/build_game.py TOTK_GEN_OPT would use them (each replaces -O1, and
+--cflags too when it names -march or -mcpu), e.g. "-O1;-O2;-O1 -mcpu=cortex-a76;-O2 -mcpu=cortex-a76" on the CM5. The
+table then also gives the code bytes: the game's threads there wait on instruction fetch, so smaller hot code counts.
 """
 import argparse
 import re
@@ -72,6 +77,7 @@ def main():
     ap.add_argument('--cflags', default='-march=armv8.2-a')
     ap.add_argument('--work', type=Path, default=ROOT / 'build' / 'locals-sweep')
     ap.add_argument('--weight', action='store_true', help='weight function k (hottest = 1) by 1/k')
+    ap.add_argument('--opts', default='-O1', help='optimisation flag sets separated by ";" (TOTK_GEN_OPT)')
     a = ap.parse_args()
     a.work.mkdir(parents=True, exist_ok=True)
 
@@ -100,25 +106,33 @@ def main():
                 break
     print(f'{sum(len(v) for v in picks.values())} of the {len(want)} functions found in the modules')
 
-    flags = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
-             '-ffunction-sections', '-I', str(ROOT / 'runtime')] + a.cflags.split()
-    print(f'{"locals":>6} {"instructions":>12} {"loads":>8} {"stores":>8} {"Cpu ld/st":>10} {"vs first":>9}')
+    base = ['-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
+            '-ffunction-sections', '-I', str(ROOT / 'runtime')]
+    opt_sets = [o.split() for o in a.opts.split(';') if o.strip()]
+    print(f'{"locals":>6} {"flags":<28} {"instructions":>12} {"loads":>8} {"stores":>8} {"Cpu ld/st":>10} '
+          f'{"code bytes":>10} {"vs first":>9}')
     first = None
     for n in [int(x) for x in a.locals.split(',')]:
-        tot = np.zeros(4)
+        srcs = {}
         for name, fns in picks.items():
             mod = next(m for nm, m, _, _ in mods if nm == name)
             em = gen.Emitter(mod, set(next(s for nm, _, s, _ in mods if nm == name).tolist()), reg_locals=n)
             src = a.work / f'{name}_l{n}.c'
             src.write_text(gen.chunk_text(name, 0, em, fns))
-            obj = src.with_suffix('.o')
-            subprocess.run([a.cc] + flags + ['-c', str(src), '-o', str(obj)], check=True)
-            for fn, r in count(a.objdump, obj).items():
-                w = 1.0 / rank.get(fn.replace('fb_', 'f_'), len(want)) if a.weight else 1.0
-                tot += w * np.array(r)
-        if first is None:
-            first = tot
-        print(f'{n:6d} {tot[0]:12.0f} {tot[1]:8.0f} {tot[2]:8.0f} {tot[3]:10.0f} {100 * (tot[0] / first[0] - 1):+8.1f}%')
+            srcs[name] = src
+        for k, opt in enumerate(opt_sets):
+            cflags = [] if any(f.startswith(('-march=', '-mcpu=')) for f in opt) else a.cflags.split()
+            tot = np.zeros(5)
+            for name, src in srcs.items():
+                obj = src.with_name(f'{src.stem}_o{k}.o')
+                subprocess.run([a.cc] + opt + base + cflags + ['-c', str(src), '-o', str(obj)], check=True)
+                for fn, r in count(a.objdump, obj).items():
+                    w = 1.0 / rank.get(fn.replace('fb_', 'f_'), len(want)) if a.weight else 1.0
+                    tot += w * np.array(r + [4 * r[0]])   # AArch64: 4 bytes an instruction
+            if first is None:
+                first = tot
+            print(f'{n:6d} {" ".join(opt):<28} {tot[0]:12.0f} {tot[1]:8.0f} {tot[2]:8.0f} {tot[3]:10.0f} {tot[4]:10.0f} '
+                  f'{100 * (tot[0] / first[0] - 1):+8.1f}%')
     return 0
 
 
