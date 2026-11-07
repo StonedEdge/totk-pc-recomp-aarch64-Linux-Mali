@@ -252,6 +252,8 @@ int rt_knob(const char *name, const char *def) {
 // TOTK_BIG_CORES (on by default where the cores have two maximum clocks): the process keeps the fastest cores. On the
 // RK3588 (4 A76 at 2.4 GHz, 4 A55 at 1.8 GHz) no game thread is busy more than ~40% of a core, so the scheduler put
 // guest threads on the A55s, and the frame waits on them: outdoors 17.2 -> 19.1 fps on the A76s only.
+static uint64_t g_cpu_all, g_cpu_fast;   // as cpu_placement found them before narrowing the process (bg_placement)
+
 static void cpu_placement(void) {
     static int mode = -1, applied = -1;
     static uint64_t all, one, fast;
@@ -264,6 +266,7 @@ static void cpu_placement(void) {
         else
             mode = 0;
         fast = plat_fast_cpus(all);
+        g_cpu_all = all, g_cpu_fast = fast;
         const char *b = cfg_get("TOTK_BIG_CORES");
         if (fast && (b && *b ? strcmp(b, "0") != 0 : 1))
             rt_log("cpu: the game keeps the fastest cores (mask %#llx of %#llx; TOTK_BIG_CORES=0 for all)",
@@ -298,10 +301,9 @@ static void bg_placement(uint64_t frame) {
     if (on < 0) {
         const char *e = cfg_get("TOTK_SLOW_BG");
         on = e && *e && strcmp(e, "0") != 0;
-        uint64_t all = 0, one = 0;
-        plat_cpu_cores(&all, &one);
-        uint64_t fast = plat_fast_cpus(all);
-        slow = fast ? all & ~fast : 0;
+        // the masks from before cpu_placement narrowed the process: this thread's affinity now holds the fast
+        // cores only
+        slow = g_cpu_fast ? g_cpu_all & ~g_cpu_fast : 0;
         if (on && !slow) on = 0;
         if (on) rt_log("cpu: background threads to the slower cores (mask %#llx; TOTK_SLOW_BG)", (unsigned long long)slow);
     }
