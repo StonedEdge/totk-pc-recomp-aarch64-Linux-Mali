@@ -94,7 +94,26 @@ void rt_register_host(uint64_t addr, GuestFn fn) {
     g_nhost++;
 }
 
+// TOTK_HUGEPAGES (default on): the table in reserved 2 MiB pages when the system has enough (Linux: hugetlbfs,
+// sudo sysctl vm.nr_hugepages=<n>; the log line names n). Every indirect call reads a slot of this table, spread over
+// tens of MiB; with 4 KiB pages most reads miss the data TLB (CM5, perf stat: 3-5 dTLB misses per 1000 instructions
+// on the game's threads, rt_dispatch the hottest function of a worker). The CM5's kernel has hugetlbfs but no
+// transparent huge pages, so plat_mem_hugepages below only helps where the kernel has those.
+static int g_table_huge;
+
 static void *table_alloc(uint64_t bytes) {
+    const char *hp = cfg_get("TOTK_HUGEPAGES");
+    if (!hp || !*hp || atoi(hp) != 0) {
+        void *p = plat_mem_alloc_huge(bytes);
+        unsigned need = (unsigned)((bytes + (2u << 20) - 1) >> 21);
+        if (p) {
+            g_table_huge = 1;
+            rt_log("dispatch: table in %u reserved 2 MiB pages", need);
+            return p;
+        }
+        rt_log("dispatch: no reserved 2 MiB pages for the table (it needs %u: sudo sysctl vm.nr_hugepages=%u); 4 KiB pages",
+               need, need + 4);
+    }
     return plat_mem_alloc(bytes);   // zero pages, backed on first write
 }
 
@@ -162,7 +181,7 @@ void rt_dispatch_init(const RtModule *mods, int count) {
     // cost no memory beyond what it uses anyway. TOTK_HUGE_CODE=1 asks the same for the lifted code (file-backed;
     // needs a kernel with read-only file THP; makes the whole code resident, ~250 MiB): iTLB misses.
     const char *hp = cfg_get("TOTK_HUGEPAGES");
-    int huge = !hp || !*hp || atoi(hp) != 0;
+    int huge = (!hp || !*hp || atoi(hp) != 0) && !g_table_huge;   // transparent huge pages, where the kernel has them
     char note[160];
     if (huge) {
         plat_mem_hugepages(slot, bytes, 0, note, sizeof note);
@@ -174,7 +193,8 @@ void rt_dispatch_init(const RtModule *mods, int count) {
             slot[(m->addrs[k] - lo) >> 2] = (uint32_t)((uintptr_t)m->fns[k] - anchor);
         g_functions += m->count;
     }
-    table_seal(slot, bytes);
+    // a mapping of reserved 2 MiB pages changes protection only in whole pages (EINVAL otherwise)
+    table_seal(slot, g_table_huge ? (bytes + (2u << 20) - 1) & ~(uint64_t)((2u << 20) - 1) : bytes);
     if (huge) {
         plat_mem_hugepages(slot, bytes, 1, note, sizeof note);
         rt_log("dispatch: table collapse: %s", note);

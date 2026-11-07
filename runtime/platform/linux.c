@@ -1082,6 +1082,12 @@ void *plat_mem_alloc(size_t n) {
     return p == MAP_FAILED ? NULL : p;
 }
 
+void *plat_mem_alloc_huge(size_t n) {
+    size_t m = (n + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+    void *p = mmap(NULL, m, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
 #ifndef MADV_COLLAPSE
 #define MADV_COLLAPSE 25   // Linux 6.1
 #endif

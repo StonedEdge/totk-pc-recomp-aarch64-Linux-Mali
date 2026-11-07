@@ -211,6 +211,9 @@ void *plat_mem_alloc(size_t n);
 // file-backed code where the kernel allows it). Writes one log-ready line about the outcome to note (may be NULL).
 // Returns 1 when the kernel accepted the request. Windows: 0 (large pages need a privilege).
 int plat_mem_hugepages(void *p, size_t n, int collapse, char *note, size_t note_n);
+// Zeroed read-write memory in reserved 2 MiB pages (Linux: MAP_HUGETLB, from vm.nr_hugepages), n rounded up to
+// 2 MiB; NULL when there are not enough reserved pages (or on Windows). Free with plat_mem_free_huge.
+void *plat_mem_alloc_huge(size_t n);
 int plat_mem_commit(uint64_t addr, size_t n);             // read-write pages inside a reserved range; 1 on success
 int plat_mem_decommit(uint64_t addr, uint64_t n);          // contents dropped: committed again, the pages read zero
 int plat_mem_protect(uint64_t addr, uint64_t n, int prot); // committed pages only; 1 on success
