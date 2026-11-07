@@ -105,6 +105,15 @@ MARCH = '-march=armv8.2-a' if ARM64 else '-march=x86-64-v3'
 GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
              MARCH]
 RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', MARCH]
+# TOTK_GEN_OPT: other optimisation flags for the generated code, e.g. "-O2 -mcpu=cortex-a76" on the CM5, where the
+# game's own threads set the frame rate. They replace -O1, and -march too when they name -march or -mcpu. Ninja sees
+# the changed command lines and recompiles every chunk. Compiles at -O2 take more memory: JOB_MEM grows with it.
+GEN_OPT = os.environ.get('TOTK_GEN_OPT', '').split()
+if GEN_OPT:
+    GEN_FLAGS.remove('-O1')
+    if any(f.startswith(('-march=', '-mcpu=')) for f in GEN_OPT):
+        GEN_FLAGS.remove(MARCH)
+    GEN_FLAGS[:0] = GEN_OPT
 
 
 def set_cpu(cpu):
@@ -113,7 +122,8 @@ def set_cpu(cpu):
     if ARM64:
         return   # no CPU levels there: the build is armv8.2-a
     march = f'-march=x86-64-{cpu}'
-    GEN_FLAGS[GEN_FLAGS.index(MARCH)] = march
+    if MARCH in GEN_FLAGS:   # not when TOTK_GEN_OPT names its own -march
+        GEN_FLAGS[GEN_FLAGS.index(MARCH)] = march
     RT_FLAGS[RT_FLAGS.index(MARCH)] = march
     RT_FLAGS.append(f'-DRT_CPU_LEVEL={3 if cpu == "v3" else 2}')
 if WIN:
@@ -177,6 +187,8 @@ GiB = 1 << 30
 # Peak commit of one compile, 1.2.1 at -O1 (2026-10-20): 120-180 MiB per ~3 MiB chunk, 568 MiB for main_table.c
 # (295k-entry tables). 768 MiB leaves headroom for the largest file.
 JOB_MEM = 768 << 20
+if any(f in ('-O2', '-O3', '-Os') for f in os.environ.get('TOTK_GEN_OPT', '').split()):
+    JOB_MEM = 1280 << 20   # -O2 keeps more of a chunk's functions in memory at once
 MEM_BUDGET = 50 * GiB  # total for all compile jobs
 
 
