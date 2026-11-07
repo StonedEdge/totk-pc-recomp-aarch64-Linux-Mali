@@ -711,6 +711,38 @@ int plat_cond_wait_ns(PlatCond *c, PlatMutex *m, uint64_t ns) {
     return !timed_out;
 }
 
+// ---- PlatXLock (platform.h): Drepper's futex mutex ("Futexes Are Tricky", mutex 3) after a short spin. The
+// reader-writer lock above wakes every sleeper at each release; on kernel.c's G, which a dozen game threads take
+// tens of thousands of times a second, those herds kept a woken thread 60-120 us from running again on the CM5
+// (TOTK_TRACE=sched wake to run; a bare condvar wake there takes 5 us).
+#define XL_SPINS 200
+
+void plat_xlock(PlatXLock *l) {
+    volatile uint32_t *w = &l->v;
+    uint32_t s = 0;
+    if (__atomic_compare_exchange_n(w, &s, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    for (int i = 0; i < XL_SPINS; i++) {
+        plat_pause();
+        s = __atomic_load_n(w, __ATOMIC_RELAXED);
+        if (!s && __atomic_compare_exchange_n(w, &s, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    }
+    while (__atomic_exchange_n(w, 2, __ATOMIC_ACQUIRE) != 0) futex(w, FUTEX_WAIT, 2, NULL);
+}
+
+void plat_xunlock(PlatXLock *l) {
+    if (__atomic_exchange_n(&l->v, 0, __ATOMIC_RELEASE) == 2) futex(&l->v, FUTEX_WAKE, 1, NULL);
+}
+
+int plat_xcond_wait_ns(PlatCond *c, PlatXLock *l, uint64_t ns) {
+    uint32_t seq = __atomic_load_n(cv(c), __ATOMIC_RELAXED);
+    struct timespec ts = {(time_t)(ns / 1000000000u), (long)(ns % 1000000000u)};
+    plat_xunlock(l);
+    long r = futex(cv(c), FUTEX_WAIT, seq, ns ? &ts : NULL);
+    int timed_out = r == -1 && errno == ETIMEDOUT;
+    plat_xlock(l);
+    return !timed_out;
+}
+
 void plat_cond_signal(PlatCond *c) {
     __atomic_add_fetch(cv(c), 1, __ATOMIC_RELEASE);
     futex(cv(c), FUTEX_WAKE, 1, NULL);

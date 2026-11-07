@@ -115,8 +115,32 @@ static RtThread *g_all, *g_wait, *g_main;
 static uint64_t g_next_id = 0x51, g_wseq, g_created;
 static uint64_t g_main_stack;
 
-static void lock(void) { plat_mutex_lock(&G); }
-static void unlock(void) { plat_mutex_unlock(&G); }
+// TOTK_KLOCK=0: G as a PlatMutex (wakes every sleeper at each release) instead of a PlatXLock (one); decided at the
+// first lock, before a second thread exists.
+static PlatXLock GX;
+static int g_xlock = -1;
+
+static void lock(void) {
+    if (__builtin_expect(g_xlock < 0, 0)) {
+        const char *e = getenv("TOTK_KLOCK");
+        g_xlock = !(e && *e == '0');
+    }
+    if (g_xlock) plat_xlock(&GX);
+    else plat_mutex_lock(&G);
+}
+static void unlock(void) {
+    if (g_xlock) plat_xunlock(&GX);
+    else plat_mutex_unlock(&G);
+}
+// Condition variable waits that release and retake G, whichever lock it is. ms 0: until signalled.
+static void kcond_wait(PlatCond *c) {
+    if (g_xlock) plat_xcond_wait_ns(c, &GX, 0);
+    else plat_cond_wait(c, &G);
+}
+static void kcond_wait_ms(PlatCond *c, uint32_t ms) {
+    if (g_xlock) plat_xcond_wait_ns(c, &GX, (uint64_t)ms * 1000000u);
+    else plat_cond_wait_ms(c, &G, ms);
+}
 
 uint64_t kern_now_ns(void) { return plat_now_ns(); }
 
@@ -293,7 +317,7 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
     }
     while (!t->woke) {
         if (forever) {
-            plat_cond_wait(&t->cv, &G);
+            kcond_wait(&t->cv);
             continue;
         }
         now = kern_now_ns();
@@ -303,7 +327,7 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
             return R_TIMEOUT;
         }
         uint64_t ms = (deadline - now + 999999) / 1000000;
-        plat_cond_wait_ms(&t->cv, &G, ms > 0xFFFFFFF0u ? 0xFFFFFFF0u : (uint32_t)ms);
+        kcond_wait_ms(&t->cv, ms > 0xFFFFFFF0u ? 0xFFFFFFF0u : (uint32_t)ms);
     }
     if (t->wake_at) {
         uint64_t d = kern_now_ns() - t->wake_at;
@@ -1034,8 +1058,8 @@ static void core_take(RtThread *t) {
         if (g_ap_int && ap_try(t) != AP_NONE) ms = 1;   // the owner keeps its core: again in a millisecond
         int sample = g_diag > 0 && !sampled && (t->dg_cls == DG_GAME || t->dg_cls == DG_HOST);
         if (sample && !ms) ms = 2;
-        if (ms) plat_cond_wait_ms(&t->cv, &G, ms);
-        else plat_cond_wait(&t->cv, &G);
+        if (ms) kcond_wait_ms(&t->cv, ms);
+        else kcond_wait(&t->cv);
         if (sample && t->cur_core < 0 && kern_now_ns() - t->dg_since >= 2000000) {
             sampled = 1;
             dg_sample(t);
@@ -1521,7 +1545,7 @@ static void thread_main(void *p) {
     PlatIntr *self = ap_open_self();
     lock();
     t->hthr = self;
-    while (!t->started) plat_cond_wait(&t->cv, &G);
+    while (!t->started) kcond_wait(&t->cv);
     core_take(t);
     unlock();
     Cpu *c = t->cpu;

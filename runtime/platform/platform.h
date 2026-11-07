@@ -148,6 +148,28 @@ static inline int plat_cond_wait_ms(PlatCond *c, PlatMutex *m, uint32_t ms) {
 void plat_cond_signal(PlatCond *c);
 void plat_cond_broadcast(PlatCond *c);
 
+// An exclusive lock for one heavily contended lock (runtime/kernel.c G): a release wakes one sleeper, where PlatMutex
+// wakes them all (it also serves readers). On Linux three states in one word (0 free, 1 held, 2 held with sleepers)
+// after a short spin; elsewhere a PlatMutex. Zero-initialised is unlocked. plat_xcond_wait_ns: ns 0 waits until
+// signalled; returns 0 on timeout.
+#ifdef _WIN32
+typedef PlatMutex PlatXLock;
+static inline void plat_xlock(PlatXLock *l) { plat_mutex_lock(l); }
+static inline void plat_xunlock(PlatXLock *l) { plat_mutex_unlock(l); }
+static inline int plat_xcond_wait_ns(PlatCond *c, PlatXLock *l, uint64_t ns) {
+    if (!ns) {
+        plat_cond_wait(c, l);
+        return 1;
+    }
+    return plat_cond_wait_ns(c, l, ns);
+}
+#else
+typedef struct { uint32_t v; } PlatXLock;
+void plat_xlock(PlatXLock *l);
+void plat_xunlock(PlatXLock *l);
+int plat_xcond_wait_ns(PlatCond *c, PlatXLock *l, uint64_t ns);
+#endif
+
 // A mutex the thread that holds it may take again; unlocked as many times as locked. Zero-initialised is unlocked.
 typedef struct { PlatMutex m; uint32_t owner, depth; } PlatRMutex;
 #define PLAT_RMUTEX_INIT {PLAT_MUTEX_INIT, 0, 0}
