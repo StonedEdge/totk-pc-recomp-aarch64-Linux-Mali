@@ -937,12 +937,17 @@ static void ww_open(void) {
 // ---- software write watch, for kernels without userfaultfd (Armada OS has CONFIG_USERFAULTFD off).
 // A page the platform wants to know writes of is armed: mprotect read-only. The first write faults, the handler marks
 // the page dirty and makes it writable again. plat_mem_written lists the dirty pages and arms them again. A page
-// that was dirty at several syncs in a row is hot: it stays writable and is listed every time, because copying
-// 4 KiB costs less than a fault; every 16th sync it is armed again to find out whether it is still written.
+// found written at three queries is hot: it stays writable and is listed every time, because comparing or copying
+// 4 KiB costs less than a fault (signal, mprotect splitting the mapping, sigreturn: ~8 us on a Cortex-A76); every 16th
+// query it is armed again to find out whether it is still written. A page cools down after 8 queries in a row that
+// found it unwritten (TOTK_WW_COOL; 1 = the earlier rule, which reset it at the first such query). The same ranges
+// are queried several times a frame, so with that earlier rule a page the game writes once a frame was never hot and
+// faulted every frame: ~250 faults a frame in the woods, 16 % of the game's main thread in the handler.
 // shortcut: syscalls that write into guest memory (pread) unarm their buffer first; any other such syscall into an
 // armed page fails with EFAULT.
-enum { SW_ARMED = 1, SW_DIRTY = 2, SW_HOT_SHIFT = 2, SW_HOT_MASK = 3 << SW_HOT_SHIFT };
-static int soft_on;
+enum { SW_ARMED = 1, SW_DIRTY = 2, SW_HOT_SHIFT = 2, SW_HOT_MASK = 3 << SW_HOT_SHIFT,
+       SW_COOL_SHIFT = 4, SW_COOL_MASK = 7 << SW_COOL_SHIFT };   // cool: queries in a row that found the page unwritten
+static int soft_on, soft_cool = 8;
 static uint8_t *swpg;   // a byte per guest page, mapped lazily like pstate
 static uint64_t soft_gen, soft_faults, soft_listed, soft_armed;
 
@@ -953,6 +958,8 @@ static void soft_open(void) {
     if (p == MAP_FAILED) return;
     swpg = p;
     soft_on = 1;
+    const char *c = getenv("TOTK_WW_COOL");
+    if (c && *c) soft_cool = atoi(c) < 1 ? 1 : atoi(c) > 8 ? 8 : atoi(c);
     fprintf(stderr, "platform: software write watch (mprotect and a fault handler) over the watched memory\\n");
 }
 
@@ -1015,10 +1022,15 @@ static uint64_t soft_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_
                 if (reset) {
                     if (hot < 3) hot++;
                     arm = hot < 3 || (gen & 15) == 0;   // hot pages stay writable, except for the periodic re-test
-                    __atomic_store_n(s, (uint8_t)(hot << SW_HOT_SHIFT), __ATOMIC_RELEASE);
+                    __atomic_store_n(s, (uint8_t)(hot << SW_HOT_SHIFT), __ATOMIC_RELEASE);   // cool count back to 0
                 }
-            } else if (reset && hot) {
-                __atomic_store_n(s, (uint8_t)(v & ~SW_HOT_MASK), __ATOMIC_RELEASE);
+            } else if (reset && hot) {   // armed and unwritten since: one more query in a row without a write
+                unsigned cool = ((v & SW_COOL_MASK) >> SW_COOL_SHIFT) + 1;
+                uint8_t nv = cool >= (unsigned)soft_cool ? (uint8_t)(v & ~(SW_HOT_MASK | SW_COOL_MASK))
+                                                          : (uint8_t)((v & ~SW_COOL_MASK) | cool << SW_COOL_SHIFT);
+                // compare-exchange: the fault handler may set DIRTY at the same time; then it wins and the next query
+                // lists the page
+                __atomic_compare_exchange_n(s, &v, nv, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
             }
         }
         if (arm) {
