@@ -251,6 +251,14 @@ static void wake_sync_waiters(void) {
 
 // SleepConditionVariableSRW counts milliseconds: round up (late is legal, early is not) and re-check the deadline
 // against the performance counter, because the wait may also end early.
+// TOTK_WAIT_SPIN_US (default 0 = off): a thread that blocks (lock, condition variable, address wait, sync object)
+// first polls its wake flag that long without the kernel lock and without its virtual core, then sleeps on its
+// condition variable. A wake that comes during the poll costs neither side a futex call or the ~100 us it takes a
+// sleeping host thread to run again on the CM5 (TOTK_TRACE=sched "wake to run"); the game's main thread blocks
+// ~1,500 times a second on its workers. Costs host CPU while it polls. G held.
+static int64_t g_wait_spin_ns = -1;
+static uint64_t g_wspin_n, g_wspin_ok;
+
 static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
     t->wkind = kind;
     t->woke = 0;
@@ -265,6 +273,24 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
     uint64_t now = kern_now_ns();
     int forever = ns < 0 || (uint64_t)ns > UINT64_MAX - now;
     uint64_t deadline = forever ? 0 : now + (uint64_t)ns;
+    if (g_wait_spin_ns < 0) {
+        const char *e = cfg_get("TOTK_WAIT_SPIN_US");
+        g_wait_spin_ns = e && *e ? atoll(e) * 1000 : 0;
+        if (g_wait_spin_ns) rt_log("kernel: a blocking wait spins up to %lld us before it sleeps (TOTK_WAIT_SPIN_US)",
+                                   (long long)g_wait_spin_ns / 1000);
+    }
+    if (g_wait_spin_ns > 0 && !t->woke) {   // most of the game's waits for its workers end within microseconds
+        uint64_t end = now + (uint64_t)g_wait_spin_ns;
+        if (!forever && end > deadline) end = deadline;
+        unlock();
+        while (!__atomic_load_n(&t->woke, __ATOMIC_ACQUIRE) && kern_now_ns() < end) plat_pause();
+        lock();
+        g_wspin_n++;
+        if (t->woke) g_wspin_ok++;
+        if ((g_wspin_n & 0xffff) == 0)
+            rt_log("kernel: wait spin: %llu of %llu waits ended while spinning",
+                   (unsigned long long)g_wspin_ok, (unsigned long long)g_wspin_n);
+    }
     while (!t->woke) {
         if (forever) {
             plat_cond_wait(&t->cv, &G);
