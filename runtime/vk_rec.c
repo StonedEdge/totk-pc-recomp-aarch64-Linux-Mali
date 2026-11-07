@@ -147,7 +147,7 @@ void rec_drain(void) {
     wake();
     for (int i = 0; __atomic_load_n(&tail, __ATOMIC_ACQUIRE) != put_h; i++)
         if (i < 20000) plat_pause();
-        else plat_yield();
+        else rt_yield_count(RT_YIELD_DRAIN), plat_yield();
     RS_.drains++, RS_.drain_ns += now_ns() - t0;
 }
 
@@ -259,7 +259,7 @@ void rec_wait_submitted(void) {
     wake();
     for (int i = 0; __atomic_load_n(&tail, __ATOMIC_ACQUIRE) < sub_h; i++)
         if (i < 20000) plat_pause();
-        else plat_yield();
+        else rt_yield_count(RT_YIELD_DRAIN), plat_yield();
     RS_.sub_waits++, RS_.sub_wait_ns += now_ns() - t0;
 }
 

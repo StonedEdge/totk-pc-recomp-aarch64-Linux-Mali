@@ -217,6 +217,11 @@ static inline int *kern_host_depth(void *thread) { return (int *)thread + 1; }
 void kern_host_left(void *thread);                         // back at depth 0 with a preempt request pending
 int kern_core_diag_on(void);                               // TOTK_CORE_DIAG
 uint32_t kern_self_handle(void);
+// Host yields (sched_yield) by where they come from, for the sched report: the game's yield SVC, spin-wait
+// handoffs, the replay waiting for the recorder, frame pacing; [k][1] counts those on the render thread.
+enum { RT_YIELD_SVC, RT_YIELD_SPIN, RT_YIELD_DRAIN, RT_YIELD_PACE, RT_YIELD_N };
+extern uint64_t rt_yield_n[RT_YIELD_N][2];
+void rt_yield_count(int site);
 int kern_prio_of_tid(uint32_t tid);             // guest priority of the guest thread on host thread tid, or -1                // the calling guest thread's handle (0x10xx), 0 on a host thread
 void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns);   // perf_present, every present (also logs the
                                                            // asynchronous preemption counters)

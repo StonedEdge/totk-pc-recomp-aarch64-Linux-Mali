@@ -1159,6 +1159,7 @@ void rt_spin_gate(Cpu *c, uint64_t head) {
         return;
     t->sp_ho++;
     int away = kern_core_away();
+    rt_yield_count(RT_YIELD_SPIN);
     plat_yield();
     kern_core_back(&away);
     sw_last = kern_now_ns();
@@ -1401,6 +1402,14 @@ void kern_sched_report(uint64_t frame) {
            (unsigned long long)frame, span / 1e9, (double)all_run / span, NCORE, all_core / 1e9,
            (unsigned long long)pre_req, (unsigned long long)pre_n, pre_n ? pre_ns / 1e6 / pre_n : 0.0, pre_max / 1e6,
            (unsigned long long)sc, (unsigned long long)sb, (unsigned long long)pre_stale, self ? "" : " (render thread is not a guest thread)");
+    uint64_t y[RT_YIELD_N][2];
+    for (int k = 0; k < RT_YIELD_N; k++)
+        for (int j = 0; j < 2; j++) y[k][j] = __atomic_exchange_n(&rt_yield_n[k][j], 0, __ATOMIC_RELAXED);
+    rt_log("sched: host yields since the last report (render thread's in brackets): yield SVC %llu (%llu), spin-wait "
+           "handoffs %llu (%llu), replay waiting for the recorder %llu (%llu), frame pacing %llu (%llu)",
+           (unsigned long long)y[0][0], (unsigned long long)y[0][1], (unsigned long long)y[1][0],
+           (unsigned long long)y[1][1], (unsigned long long)y[2][0], (unsigned long long)y[2][1],
+           (unsigned long long)y[3][0], (unsigned long long)y[3][1]);
     for (int i = 0; i < nr; i++) {
         Row *r = &rows[i];
         char d[128], s[256];
@@ -1581,6 +1590,14 @@ uint64_t kern_threads_created(void) {
 Cpu *kern_cpu(void) { return tcur ? tcur->cur : NULL; }
 
 uint32_t kern_self_handle(void) { return tcur ? tcur->handle : 0; }
+
+uint64_t rt_yield_n[RT_YIELD_N][2];
+
+void rt_yield_count(int site) {
+    if (!(rt_trace & RT_TRACE_SCHED)) return;
+    __atomic_fetch_add(&rt_yield_n[site][0], 1, __ATOMIC_RELAXED);
+    if (tcur && tcur == g_render) __atomic_fetch_add(&rt_yield_n[site][1], 1, __ATOMIC_RELAXED);
+}
 
 int kern_prio_of_tid(uint32_t tid) {
     int p = -1;
@@ -1811,7 +1828,10 @@ int kern_svc(Cpu *c, uint32_t imm) {
             core_take(t);
         }
         unlock();
-        if (!give) plat_yield();
+        if (!give) {
+            rt_yield_count(RT_YIELD_SVC);
+            plat_yield();
+        }
         return 1;
     }
     case 0x0C: {   // GetThreadPriority(w1 handle -> w1)

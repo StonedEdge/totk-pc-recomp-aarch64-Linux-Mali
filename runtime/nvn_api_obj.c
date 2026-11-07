@@ -662,7 +662,7 @@ static void sleep_until(uint64_t deadline) {
         if (now >= deadline) return;
         uint64_t d = deadline - now;
         if (d >= 2000000) plat_sleep_ms((uint32_t)(d / 1000000 - 1));
-        else plat_yield();
+        else rt_yield_count(RT_YIELD_PACE), plat_yield();
     }
 }
 
