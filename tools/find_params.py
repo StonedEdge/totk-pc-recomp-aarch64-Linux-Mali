@@ -72,7 +72,7 @@ KEY = re.compile(r'lod|dist|range|radius|far|near|cull|visib|draw|densit|grass|f
                  r'priority|cost|reduc', re.I)
 NAME = re.compile(rb'(?i)lod|dist|far_|_far|near_|_near|cull|densit|grass|foliage|budget|quality|reduc|draw_?range|'
                   rb'visib|activat|load_?range|unload')
-FULL_DIRS = re.compile(r'^(System|GameParameter|Global|Environment|Sky|Field|Banc|Performance)', re.I)
+FULL_DIRS = re.compile(r'^(System|GameParameter|Global|Environment|Sky|Performance)', re.I)   # not Banc: millions of lines
 BYML_EXT = ('.byml', '.bgyml')
 PACK_EXT = ('.pack', '.sarc')
 
