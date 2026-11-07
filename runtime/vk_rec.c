@@ -25,7 +25,7 @@ static VkCommandBuffer rec_cb;         // producer: the part being recorded
 static VkCommandBuffer exec_cb;        // recorder: the command buffer its calls go into (rec_begin, R_EndSubmit)
 static uint64_t sub_h;                 // producer: put_h after the last R_EndSubmit (rec_wait_submitted)
 static int end_mode = -1;              // TOTK_REC_END (rec_end_cb)
-// TOTK_REC_SPIN_US (default 200; 0: 4096 pauses, as before): how long an idle recorder spins before it sleeps.
+// TOTK_REC_SPIN_US (default 200, 20 on AArch64 with cores of two speeds; 0: 4096 pauses, as before): how long an idle recorder spins before it sleeps.
 // TOTK_REC_WAKE_WORDS (default 2048; 0: at every packet, as before): a sleeping recorder is woken once that much of
 // the ring is waiting (drains, a full ring and the split's waits wake it at once; it also wakes by itself after 2 ms).
 // The replay makes a packet or a few per draw and the recorder is faster: it slept between draws and the replay woke it
@@ -202,7 +202,9 @@ void rec_begin(VkCommandBuffer cb, uint64_t fence) {
             const char *d = cfg_get("TOTK_REC_DELAY_US");
             rec_delay_ns = d && *d && atoi(d) > 0 ? (uint64_t)atoi(d) * 1000 : 0;
             const char *sp = cfg_get("TOTK_REC_SPIN_US"), *ww = cfg_get("TOTK_REC_WAKE_WORDS");
-            rec_spin_ns = (uint64_t)(sp && *sp ? (atoi(sp) > 0 ? atoi(sp) : 0) : 200) * 1000;
+            // 20 us where the slower cores take the background threads (perf.c bg_placement): a spinning recorder
+            // holds a fast core the game's threads queue for
+            rec_spin_ns = (uint64_t)(sp && *sp ? (atoi(sp) > 0 ? atoi(sp) : 0) : perf_slow_bg_default() ? 20 : 200) * 1000;
             rec_wake_words = (uint64_t)(ww && *ww ? (atoi(ww) > 0 ? atoi(ww) : 0) : 2048);
             rec_thread = plat_thread_new(rec_main, NULL, "vk recorder");
             if (!rec_thread) {

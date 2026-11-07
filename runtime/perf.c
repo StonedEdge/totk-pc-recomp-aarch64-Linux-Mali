@@ -252,21 +252,38 @@ int rt_knob(const char *name, const char *def) {
 // TOTK_BIG_CORES (on by default where the cores have two maximum clocks): the process keeps the fastest cores. On the
 // RK3588 (4 A76 at 2.4 GHz, 4 A55 at 1.8 GHz) no game thread is busy more than ~40% of a core, so the scheduler put
 // guest threads on the A55s, and the frame waits on them: outdoors 17.2 -> 19.1 fps on the A76s only.
-static uint64_t g_cpu_all, g_cpu_fast;   // as cpu_placement found them before narrowing the process (bg_placement)
+static uint64_t g_cpu_all, g_cpu_fast, g_cpu_one;   // as the process could use them at start (cpu_detect)
+static int g_cpu_cores;
+
+// The processors before cpu_placement narrows the process: all of them, the first of each core, and the fast ones of a
+// CPU with cores of two speeds. Read once, on the first call (cpu_placement, or perf_slow_cpus from vk_rec.c's start,
+// both on the render thread).
+static void cpu_detect(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    g_cpu_cores = plat_cpu_cores(&g_cpu_all, &g_cpu_one);
+    g_cpu_fast = plat_fast_cpus(g_cpu_all);
+}
+
+uint64_t perf_slow_cpus(void) {
+    cpu_detect();
+    return g_cpu_fast ? g_cpu_all & ~g_cpu_fast : 0;
+}
 
 static void cpu_placement(void) {
     static int mode = -1, applied = -1;
     static uint64_t all, one, fast;
     if (mode < 0) {
         mode = rt_knob("ONE_PER_CORE", "0");
-        int cores = plat_cpu_cores(&all, &one);
+        cpu_detect();
+        all = g_cpu_all, one = g_cpu_one, fast = g_cpu_fast;
+        int cores = g_cpu_cores;
         if (mode && one && one != all)
             rt_log("cpu: %d cores, %d logical processors: one per core%s", cores, __builtin_popcountll(all),
                    mode == 2 ? " in the B blocks" : "");
         else
             mode = 0;
-        fast = plat_fast_cpus(all);
-        g_cpu_all = all, g_cpu_fast = fast;
         const char *b = cfg_get("TOTK_BIG_CORES");
         if (fast && (b && *b ? strcmp(b, "0") != 0 : 1))
             rt_log("cpu: the game keeps the fastest cores (mask %#llx of %#llx; TOTK_BIG_CORES=0 for all)",
@@ -282,17 +299,29 @@ static void cpu_placement(void) {
     plat_process_affinity(m);
 }
 
-// TOTK_SLOW_BG=1 (off by default until measured): background threads to the slower cores, every 300 frames (new
-// threads inherit the fast cores from cpu_placement). On the CM5 the 4 A76 run ~3.3 cores of work while moving and
-// the game's main thread and workers wait 7-13 % of the time for a free core (/proc schedstat, 2026-11-07), while
-// the 4 A55 idle. Moved: the audio renderer, pipeline workers, the Mali driver's purge thread, the Wayland cursor
-// thread, and guest threads below the main thread's priority (guest priority 50 or more; main and its workers run at
-// 44, the render thread at 30).
+// TOTK_SLOW_BG: background threads to the slower cores, every 300 frames (new threads inherit the fast cores from
+// cpu_placement). On by default on AArch64 when the CPU has cores of two speeds; TOTK_SLOW_BG=0 turns it off, =1 turns
+// it on elsewhere. On the CM5 the 4 A76 run ~3.3 cores of work while moving and the game's main thread and workers
+// wait 7-13 % of the time for a free core (/proc schedstat, 2026-11-07), while the 4 A55 idle; with this and
+// TOTK_REC_SPIN_US=20 moving went from ~25 to ~28.5 fps and the 1 % low from ~10 to ~18. Moved: the audio renderer,
+// pipeline workers, the startup prewarm and library threads, the perfmon sampler, the Mali driver's purge thread, the
+// Wayland cursor thread, and guest threads below the main thread's priority (guest priority 50 or more; main and its
+// workers run at 44, the render thread at 30).
 static int bg_pick(uint32_t tid, const char *name) {
-    if (!strncmp(name, "audren", 6) || !strncmp(name, "pipe worker", 11) || !strncmp(name, "mali-mem-purge", 14) ||
-        !strncmp(name, "wl_cursor", 9))
-        return 1;
+    static const char *const names[] = {"audren", "pipe worker", "pipe prewarm", "shader prewarm", "prewarm",
+                                        "lib prebuild", "lib warm", "late push", "perfmon", "mali-mem-purge",
+                                        "wl_cursor"};
+    for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
+        if (!strncmp(name, names[i], strlen(names[i]))) return 1;
     return kern_prio_of_tid(tid) >= 50;
+}
+
+int perf_slow_bg_default(void) {
+#if defined(__aarch64__)
+    return perf_slow_cpus() != 0;
+#else
+    return 0;
+#endif
 }
 
 static void bg_placement(uint64_t frame) {
@@ -300,12 +329,11 @@ static void bg_placement(uint64_t frame) {
     static uint64_t slow;
     if (on < 0) {
         const char *e = cfg_get("TOTK_SLOW_BG");
-        on = e && *e && strcmp(e, "0") != 0;
-        // the masks from before cpu_placement narrowed the process: this thread's affinity now holds the fast
-        // cores only
-        slow = g_cpu_fast ? g_cpu_all & ~g_cpu_fast : 0;
+        on = e && *e ? strcmp(e, "0") != 0 : perf_slow_bg_default();
+        slow = perf_slow_cpus();
         if (on && !slow) on = 0;
-        if (on) rt_log("cpu: background threads to the slower cores (mask %#llx; TOTK_SLOW_BG)", (unsigned long long)slow);
+        if (on) rt_log("cpu: background threads to the slower cores (mask %#llx; TOTK_SLOW_BG=0 to keep them)",
+                       (unsigned long long)slow);
     }
     if (!on || frame % 300 != 30) return;
     int n = plat_threads_affinity(slow, bg_pick);

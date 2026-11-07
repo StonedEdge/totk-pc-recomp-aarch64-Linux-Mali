@@ -38,6 +38,8 @@ void perf_replay_thread(void);                  // the calling thread replays fo
 void perf_main_thread(void);                    // the calling thread is the guest main thread (TOTK_PROFILE_MAIN)
 void perf_read(uint64_t ns);                    // romfs.c: a RomFS read took ns on the calling thread (any thread)
 uint64_t perf_frame_no(void);                   // the number of the last presented frame
+uint64_t perf_slow_cpus(void);                  // the slower cores of a CPU with two speeds (0: none), as at start
+int perf_slow_bg_default(void);                 // 1 where TOTK_SLOW_BG is on by default (AArch64 with two speeds)
 // Events per 60-frame window: graphics pipelines finished by the background workers, draws skipped while pending,
 // first texture uploads and re-uploads after CPU writes, draws skipped while a shader translates in the background,
 // draws that waited for their pending pipeline and got it, draws into a target the previous frame did not render that
