@@ -279,6 +279,38 @@ static void cpu_placement(void) {
     plat_process_affinity(m);
 }
 
+// TOTK_SLOW_BG=1 (off by default until measured): background threads to the slower cores, every 300 frames (new
+// threads inherit the fast cores from cpu_placement). On the CM5 the 4 A76 run ~3.3 cores of work while moving and
+// the game's main thread and workers wait 7-13 % of the time for a free core (/proc schedstat, 2026-11-07), while
+// the 4 A55 idle. Moved: the audio renderer, pipeline workers, the Mali driver's purge thread, the Wayland cursor
+// thread, and guest threads below the main thread's priority (guest priority 50 or more; main and its workers run at
+// 44, the render thread at 30).
+static int bg_pick(uint32_t tid, const char *name) {
+    if (!strncmp(name, "audren", 6) || !strncmp(name, "pipe worker", 11) || !strncmp(name, "mali-mem-purge", 14) ||
+        !strncmp(name, "wl_cursor", 9))
+        return 1;
+    return kern_prio_of_tid(tid) >= 50;
+}
+
+static void bg_placement(uint64_t frame) {
+    static int on = -1;
+    static uint64_t slow;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_SLOW_BG");
+        on = e && *e && strcmp(e, "0") != 0;
+        uint64_t all = 0, one = 0;
+        plat_cpu_cores(&all, &one);
+        uint64_t fast = plat_fast_cpus(all);
+        slow = fast ? all & ~fast : 0;
+        if (on && !slow) on = 0;
+        if (on) rt_log("cpu: background threads to the slower cores (mask %#llx; TOTK_SLOW_BG)", (unsigned long long)slow);
+    }
+    if (!on || frame % 300 != 30) return;
+    int n = plat_threads_affinity(slow, bg_pick);
+    static int logged;
+    if (logged++ < 3) rt_log("cpu: %d background threads on the slower cores", n);
+}
+
 void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start, ab_b;
     static int64_t win_prev[PERF_CNT_N];
@@ -292,6 +324,7 @@ void perf_present(uint64_t frame) {
     uint64_t rep = ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
     ab_b += rt_ab();
     cpu_placement();
+    bg_placement(frame);
     if (__atomic_load_n(&overlay, __ATOMIC_RELAXED))   // the overlay's only cost while it is off: this branch
         perfmon_frame(now, d, frame_ns, rep, __atomic_load_n(&counts[PERF_CNT_TEX_UP], __ATOMIC_RELAXED));
     kern_core_diag_frame(frame, d);

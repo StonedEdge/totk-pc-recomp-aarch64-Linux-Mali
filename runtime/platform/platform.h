@@ -41,6 +41,9 @@ int plat_cpu_cores(uint64_t *all, uint64_t *first);
 // (the RK3588's four Cortex-A76 beside four A55); 0 when they all have the same maximum or it is unknown.
 uint64_t plat_fast_cpus(uint64_t all);
 int plat_process_affinity(uint64_t mask);   // every thread of the process to the processors in mask; 1 on success
+// Moves each thread of the process for which pick(tid, name) returns 1 to the processors in mask; returns how many it
+// moved. Linux only (0 elsewhere).
+int plat_threads_affinity(uint64_t mask, int (*pick)(uint32_t tid, const char *name));
 
 // Interrupting a thread (kernel.c's asynchronous preemption). A thread makes its own handle; another thread stops it
 // wherever it runs, reads where it is, may send it elsewhere, and lets it go on. While it is stopped the caller must not

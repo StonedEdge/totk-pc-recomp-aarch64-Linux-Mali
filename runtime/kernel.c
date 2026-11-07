@@ -1571,6 +1571,18 @@ Cpu *kern_cpu(void) { return tcur ? tcur->cur : NULL; }
 
 uint32_t kern_self_handle(void) { return tcur ? tcur->handle : 0; }
 
+int kern_prio_of_tid(uint32_t tid) {
+    int p = -1;
+    lock();
+    for (RtThread *t = g_all; t; t = t->all)
+        if (t->tid == tid) {
+            p = t->prio;
+            break;
+        }
+    unlock();
+    return p;
+}
+
 uint32_t kern_main_thread(Cpu **cpu) {
     if (tcur) {
         if (!tcur->is_main) rt_fatal("kern_main_thread on guest thread %#x, not the main thread", tcur->handle);

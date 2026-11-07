@@ -182,6 +182,31 @@ int plat_process_affinity(uint64_t mask) {
     return ok;
 }
 
+int plat_threads_affinity(uint64_t mask, int (*pick)(uint32_t tid, const char *name)) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int i = 0; i < 64; i++)
+        if (mask >> i & 1) CPU_SET(i, &set);
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return 0;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(d));) {
+        if (e->d_name[0] == '.') continue;
+        char path[64], name[32] = "";
+        snprintf(path, sizeof path, "/proc/self/task/%s/comm", e->d_name);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            if (!fgets(name, sizeof name, f)) name[0] = 0;
+            fclose(f);
+            name[strcspn(name, "\n")] = 0;
+        }
+        uint32_t tid = (uint32_t)atoi(e->d_name);
+        if (pick(tid, name) && !sched_setaffinity((pid_t)tid, sizeof set, &set)) n++;
+    }
+    closedir(d);
+    return n;
+}
+
 // The first field of /proc/self/task/<tid>/schedstat is the time the thread has run, in ns.
 uint64_t plat_thread_cpu_ns(uint32_t tid) {
     char path[64];

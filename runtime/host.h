@@ -216,7 +216,8 @@ extern int kern_host_track;
 static inline int *kern_host_depth(void *thread) { return (int *)thread + 1; }
 void kern_host_left(void *thread);                         // back at depth 0 with a preempt request pending
 int kern_core_diag_on(void);                               // TOTK_CORE_DIAG
-uint32_t kern_self_handle(void);                // the calling guest thread's handle (0x10xx), 0 on a host thread
+uint32_t kern_self_handle(void);
+int kern_prio_of_tid(uint32_t tid);             // guest priority of the guest thread on host thread tid, or -1                // the calling guest thread's handle (0x10xx), 0 on a host thread
 void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns);   // perf_present, every present (also logs the
                                                            // asynchronous preemption counters)
 void kern_sched_report(uint64_t frame);                    // TOTK_TRACE=sched: per-thread time split, on present

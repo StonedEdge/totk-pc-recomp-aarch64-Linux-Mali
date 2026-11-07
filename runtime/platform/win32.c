@@ -574,6 +574,11 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
 
 void *plat_mem_alloc(size_t n) { return VirtualAlloc(NULL, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); }
 
+int plat_threads_affinity(uint64_t mask, int (*pick)(uint32_t tid, const char *name)) {
+    (void)mask, (void)pick;
+    return 0;
+}
+
 void *plat_mem_alloc_huge(size_t n) {
     (void)n;
     return NULL;
