@@ -31,6 +31,13 @@ static int end_mode = -1;              // TOTK_REC_END (rec_end_cb)
 // The replay makes a packet or a few per draw and the recorder is faster: it slept between draws and the replay woke it
 // with a system call almost every draw (a fifth of the render thread's time on the Mali handheld).
 static uint64_t rec_spin_ns, rec_wake_words, woke_h;
+// TOTK_REC_DRAIN_SLEEP (default 1; 0: spin, then sched_yield until the recorder catches up, as before): a producer
+// waiting for the recorder (rec_drain, rec_wait_submitted) spins briefly, then sleeps on drain_ev, which the recorder
+// sets at the end of each batch while drain_wait is set. On the CM5 the yield loop made ~10,000 sched_yield calls a
+// second on the render thread while moving (TOTK_TRACE=sched host yields), on cores the game's threads queue for.
+static PlatEvent drain_ev;
+static volatile int32_t drain_wait;
+static int rec_drain_sleep = 1;
 static int rec_live;                   // producer: rec_begin started the recorder for rec_cb
 static PlatThread *rec_thread;
 static int rec_prio;                   // the submitting thread's priority, which the recorder takes
@@ -92,7 +99,8 @@ static void rec_main(void *arg) {
             t += n;
             if ((k & 63) == 63) __atomic_store_n(&tail, t, __ATOMIC_RELEASE);
         }
-        __atomic_store_n(&tail, t, __ATOMIC_RELEASE);
+        __atomic_store_n(&tail, t, __ATOMIC_SEQ_CST);   // seq_cst with the drain_wait load (wait_tail)
+        if (__atomic_load_n(&drain_wait, __ATOMIC_SEQ_CST)) plat_event_set(&drain_ev);
     }
     return;
 }
@@ -140,14 +148,34 @@ static void pub(void) {
     plat_event_set(&wake_ev);
 }
 
+// Until the recorder's tail reaches target (ge: at least target, else exactly). The wait sleeps at most 200 us at a
+// time, so a missed set costs no more.
+static void wait_tail(uint64_t target, int ge) {
+    for (int i = 0;; i++) {
+        uint64_t t = __atomic_load_n(&tail, __ATOMIC_ACQUIRE);
+        if (ge ? t >= target : t == target) return;
+        if (!rec_drain_sleep) {
+            if (i < 20000) plat_pause();
+            else rt_yield_count(RT_YIELD_DRAIN), plat_yield();
+            continue;
+        }
+        if (i < 2000) {
+            plat_pause();
+            continue;
+        }
+        __atomic_store_n(&drain_wait, 1, __ATOMIC_SEQ_CST);
+        t = __atomic_load_n(&tail, __ATOMIC_SEQ_CST);
+        if (!(ge ? t >= target : t == target)) plat_event_wait_ns(&drain_ev, 200000);
+        __atomic_store_n(&drain_wait, 0, __ATOMIC_RELAXED);
+    }
+}
+
 void rec_drain(void) {
     if (!rec_thread || __atomic_load_n(&tail, __ATOMIC_ACQUIRE) == put_h) return;
     uint64_t t0 = now_ns();
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
     wake();
-    for (int i = 0; __atomic_load_n(&tail, __ATOMIC_ACQUIRE) != put_h; i++)
-        if (i < 20000) plat_pause();
-        else rt_yield_count(RT_YIELD_DRAIN), plat_yield();
+    wait_tail(put_h, 0);
     RS_.drains++, RS_.drain_ns += now_ns() - t0;
 }
 
@@ -166,6 +194,9 @@ void rec_begin(VkCommandBuffer cb, uint64_t fence) {
             rt_log("vk_rec: no recorder thread on AMD GPUs (TOTK_VK_RECORDER=1 turns it on)");
         if (mode) {
             plat_event_init(&wake_ev, 0, 0);
+            plat_event_init(&drain_ev, 0, 0);
+            const char *ds = cfg_get("TOTK_REC_DRAIN_SLEEP");
+            rec_drain_sleep = !(ds && *ds == '0');
             rec_prio = plat_thread_priority_get();
             rec_chk = rt_knob("REC_CHECK", "0");   // debug switches, read before the recorder starts
             const char *d = cfg_get("TOTK_REC_DELAY_US");
@@ -257,9 +288,7 @@ void rec_wait_submitted(void) {
     uint64_t t0 = now_ns();
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
     wake();
-    for (int i = 0; __atomic_load_n(&tail, __ATOMIC_ACQUIRE) < sub_h; i++)
-        if (i < 20000) plat_pause();
-        else rt_yield_count(RT_YIELD_DRAIN), plat_yield();
+    wait_tail(sub_h, 1);
     RS_.sub_waits++, RS_.sub_wait_ns += now_ns() - t0;
 }
 

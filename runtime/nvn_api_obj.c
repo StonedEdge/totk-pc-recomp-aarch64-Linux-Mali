@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -656,13 +657,24 @@ static uint64_t pace(uint64_t *target, uint64_t now, uint64_t period) {
     return 0;
 }
 
+// TOTK_PACE_SPIN_US (default 300; 0: yield for the last 2 ms, as before): sleeps on the high-resolution timer until
+// that long before the deadline, then spins without system calls. The yield loop made 7,000-24,000 sched_yield calls
+// a second on the render thread of the CM5 while moving (TOTK_TRACE=sched host yields), on fast cores the game's
+// threads queue for.
 static void sleep_until(uint64_t deadline) {
+    static int64_t spin_ns = -1;
+    if (spin_ns < 0) {
+        const char *e = cfg_get("TOTK_PACE_SPIN_US");
+        spin_ns = (e && *e ? atoll(e) : 300) * 1000;
+    }
     for (;;) {
         uint64_t now = kern_now_ns();
         if (now >= deadline) return;
         uint64_t d = deadline - now;
         if (d >= 2000000) plat_sleep_ms((uint32_t)(d / 1000000 - 1));
-        else rt_yield_count(RT_YIELD_PACE), plat_yield();
+        else if (!spin_ns) rt_yield_count(RT_YIELD_PACE), plat_yield();
+        else if (d > (uint64_t)spin_ns) plat_wait_ns(d - (uint64_t)spin_ns);
+        else plat_pause();
     }
 }
 
