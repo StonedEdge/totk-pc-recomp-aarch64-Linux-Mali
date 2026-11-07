@@ -6,7 +6,7 @@ Each report is `perf report --no-children --sort sym -g none --percent-limit 0 -
 whose lines read "  0.71%  [.] f_7000981248" (a shared-object column, as --sort dso,sym prints, is allowed;
 other objects than totk are skipped). The shares of a symbol are summed over the reports, so profiles of
 different scenes (standing, moving, towns) all count. Only user-space symbols of the program are kept; names perf
-could not resolve (0x...) are skipped. lld ignores names it does not find, so runtime symbols do no harm.
+could not resolve (0x...) are skipped. Only lifted functions (f_...) are written.
 """
 import argparse
 import re
@@ -31,7 +31,9 @@ def main():
     names = sorted(weight, key=lambda n: -weight[n])
     lifted = [n for n in names if n.startswith('f_')]
     with open(a.out, 'w') as f:
-        f.write(''.join(n + '\n' for n in names))
+        # lifted functions only: runtime symbols would pull whole runtime .text sections in among the lifted code,
+        # and kernel.c ap_init needs the lifted range free of host code (asynchronous preemption)
+        f.write(''.join(n + '\n' for n in lifted))
     total = sum(weight[n] for n in lifted)
     top = sum(weight[n] for n in lifted[:2000])
     print(f'{len(names)} symbols ({len(lifted)} lifted functions) from {len(a.reports)} reports; '

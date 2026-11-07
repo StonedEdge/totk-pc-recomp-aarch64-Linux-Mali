@@ -55,8 +55,12 @@ void plat_intr_free(PlatIntr *t);
 // blocked in the OS); t then runs on untouched.
 int plat_intr_stop(PlatIntr *t, uint64_t *rip, uint64_t *rsp);
 // Lets a stopped t go on: at to when to is nonzero, else where it stopped. 0 when the redirection failed (t then goes
-// on where it stopped).
+// on where it stopped). With PLAT_INTR_CALLS (Linux on AArch64) to is instead a void (*)(void) that t calls in its
+// signal handler before it goes on where it stopped: the signal frame keeps every register, so no stub is needed.
 int plat_intr_resume(PlatIntr *t, uint64_t to);
+#if defined(__linux__) && defined(__aarch64__)
+#define PLAT_INTR_CALLS 1
+#endif
 
 // Fibers: execution contexts with stacks of their own that threads switch between; a fiber may resume on another
 // thread. Each switch keeps the callee-saved registers and the floating-point control state.

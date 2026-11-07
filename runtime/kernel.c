@@ -408,12 +408,19 @@ static int g_ap_log;              // redirects logged so far (AP_LOG_N)
 static uintptr_t g_gen_lo, g_gen_hi;   // host code of the lifted modules: first and last function start
 static uint64_t g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_fail, g_ap_spin_ok;
 void kern_ap_stub(void);
+void kern_ap_yield(void);
 
 static void ap_init(void) {
     if (g_ap >= 0) return;
     const char *e = cfg_value("TOTK_ASYNC_PREEMPT");
     g_ap = strcmp(e, "0") != 0;
-#if !defined(__x86_64__)
+#if defined(PLAT_INTR_CALLS)
+    // AArch64 Linux: the interrupted owner runs kern_ap_yield in its signal handler (platform.h PLAT_INTR_CALLS)
+    // instead of kern_ap_stub. Off unless TOTK_ASYNC_PREEMPT is set (1, or 2 for inheritance and disable only) until
+    // measured there: on the CM5 low-priority threads on the slower cores (TOTK_SLOW_BG) keep a virtual core 40 us on
+    // average after a better thread asked for it, up to 10 ms.
+    if (!cfg_is_set("TOTK_ASYNC_PREEMPT")) g_ap = 0;
+#elif !defined(__x86_64__)
     g_ap = 0;   // the stub above is x86 only
 #endif
     g_ap_int = g_ap && strcmp(e, "2") != 0;
@@ -428,7 +435,7 @@ static void ap_init(void) {
                 if (f > hi) hi = f;
             }
         const uintptr_t host[] = {(uintptr_t)kern_ap_stub, (uintptr_t)kern_checkpoint, (uintptr_t)rt_svc,
-                                  (uintptr_t)rt_dispatch, (uintptr_t)rt_call};
+                                  (uintptr_t)rt_dispatch, (uintptr_t)rt_call, (uintptr_t)kern_ap_yield};
         int bad = !n || lo >= hi;
         for (unsigned i = 0; i < sizeof host / sizeof *host; i++) bad |= host[i] >= lo && host[i] <= hi;
         if (bad) {
@@ -695,7 +702,11 @@ static int ap_try(RtThread *w) {
     } else {
         o->ap_rip = rip;
         o->ap_pending = 1;
+#ifdef PLAT_INTR_CALLS
+        to = (uint64_t)(uintptr_t)kern_ap_yield;
+#else
         to = (uint64_t)(uintptr_t)kern_ap_stub;
+#endif
     }
     if (!plat_intr_resume(o->hthr, to)) {
         o->ap_pending = 0;

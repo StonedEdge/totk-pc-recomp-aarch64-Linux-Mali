@@ -279,8 +279,14 @@ static void intr_handler(int sig, siginfo_t *si, void *uc) {
     int32_t req = INTR_REQ;
     if (!__atomic_compare_exchange_n(&t->state, &req, INTR_STOPPED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
     while (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != INTR_GO) plat_pause();
+#ifdef PLAT_INTR_CALLS
+    uint64_t to = t->to;
+    __atomic_store_n(&t->state, INTR_IDLE, __ATOMIC_RELEASE);
+    if (to) ((void (*)(void))(uintptr_t)to)();   // the registers stay in the signal frame until the handler returns
+#else
     if (t->to) uc_set_pc(u, t->to);
     __atomic_store_n(&t->state, INTR_IDLE, __ATOMIC_RELEASE);
+#endif
 }
 
 PlatIntr *plat_intr_self(void) {
