@@ -20,7 +20,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 URL = 'https://github.com/SciresM/hactool.git'
 COMMIT = '1d64a83450e025622f3468c28fc4164dad2c5ef6'
-PATCHES = [ROOT / 'tools' / 'hactool' / n for n in ('portable.patch', 'unicode.patch', 'mbedtls-asm-clobbers.patch')]
+PATCHES = [ROOT / 'tools' / 'hactool' / n for n in ('portable.patch', 'unicode.patch', 'mbedtls-asm-clobbers.patch',
+                                                          'bktr-step.patch')]
 WIN = os.name == 'nt'
 MSYS_BASH = Path(r'C:\msys64\usr\bin\bash.exe')
 EXE = 'hactool.exe' if WIN else 'hactool'

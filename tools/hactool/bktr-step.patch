@@ -1,0 +1,127 @@
+BKTR fixes for TotK's cumulative updates on aarch64 Linux (TotK Recomp).
+
+nca_process_bktr_section spreads the relocation and subsection buckets apart with memcpy, but each bucket's
+source and destination overlap (it moves up by one entry per bucket before it). x86-64 glibc's memcpy happens to
+copy that correctly; aarch64 glibc's does not, which left relocation entries pointing far outside the section, and
+nca_section_fread then recursed until the stack or the memory ran out (SIGSEGV, or SIGKILL with an unlimited
+stack, with no output). memmove fixes it.
+
+Also: a read that would step zero bytes, or a relocation outside the patch section, exits with a message naming
+the offsets (and the bucket and entry); HACTOOL_BKTR_DEBUG set prints the tables' layout; and a short read inside
+one AES block copies from block_ofs, not the unrelated sector_ofs.
+
+diff --git a/nca.c b/nca.c
+index 2fe877f..52114fc 100644
+--- a/nca.c
++++ b/nca.c
+@@ -58,6 +58,29 @@ void nca_section_fseek(nca_section_ctx_t *ctx, uint64_t offset) {
+         } else { /* Let's do the complicated thing. */
+             bktr_relocation_entry_t *reloc = bktr_get_relocation(ctx->bktr_ctx.relocation_block, offset);
+             uint64_t section_ofs = offset - reloc->virt_offset + reloc->phys_offset;
++            if (reloc->is_patch && section_ofs >= ctx->size) {
++                /* The entry points outside the patch section: say which entry, and what is around it. */
++                bktr_relocation_block_t *rb = ctx->bktr_ctx.relocation_block;
++                uint32_t bn = 0, en = 0;
++                for (uint32_t b = 0; b < rb->num_buckets; b++) {
++                    bktr_relocation_bucket_t *bk = bktr_get_relocation_bucket(rb, b);
++                    if (reloc >= &bk->entries[0] && reloc <= &bk->entries[bk->num_entries]) {
++                        bn = b;
++                        en = (uint32_t)(reloc - &bk->entries[0]);
++                    }
++                }
++                bktr_relocation_bucket_t *bk = bktr_get_relocation_bucket(rb, bn);
++                fprintf(stderr, "BKTR relocation for virtual offset %012"PRIx64" points outside the patch section (size %012"PRIx64"):\n"
++                        "  bucket %"PRIu32" of %"PRIu32" (table offset %012"PRIx64", %"PRIu32" entries), entry %"PRIu32"\n",
++                        offset, ctx->size, bn, rb->num_buckets, rb->bucket_virtual_offsets[bn], bk->num_entries, en);
++                for (int64_t k = (int64_t)en - 2; k <= (int64_t)en + 2; k++) {
++                    if (k < 0 || k > (int64_t)bk->num_entries) continue;
++                    fprintf(stderr, "  entry %"PRId64": virt %012"PRIx64" phys %012"PRIx64" patch %"PRIu32"%s\n", k,
++                            bk->entries[k].virt_offset, bk->entries[k].phys_offset, bk->entries[k].is_patch,
++                            k == (int64_t)bk->num_entries ? " (end marker)" : "");
++                }
++                exit(EXIT_FAILURE);
++            }
+             if (reloc->is_patch) {
+                 /* Seeked within the patch romfs. */
+                 ctx->bktr_ctx.bktr_seek = section_ofs;
+@@ -100,7 +123,7 @@ static size_t nca_bktr_section_physical_fread(nca_section_ctx_t *ctx, void *buff
+             aes_setiv(ctx->aes, ctx->ctr, 0x10);
+             aes_decrypt(ctx->aes, block_buf, block_buf, 0x10);
+             if (count + block_ofs < 0x10) {
+-                memcpy(buffer, block_buf + ctx->sector_ofs, count);
++                memcpy(buffer, block_buf + block_ofs, count);
+                 nca_section_fseek(ctx, ctx->bktr_ctx.virtual_seek + count);
+                 return count;
+             }
+@@ -117,6 +140,13 @@ static size_t nca_bktr_section_physical_fread(nca_section_ctx_t *ctx, void *buff
+         nca_section_fseek(ctx, ctx->bktr_ctx.virtual_seek + count);
+     } else {
+         /* Sad path. */
++        if (next_subsec->offset <= ctx->bktr_ctx.bktr_seek) {
++            /* A zero (or negative) step would repeat this read forever. */
++            fprintf(stderr, "BKTR subsection lookup at physical offset %012"PRIx64" returned the subsection at %012"PRIx64
++                    " ending at %012"PRIx64": cannot read %zu bytes there!\n", ctx->bktr_ctx.bktr_seek, subsec->offset,
++                    next_subsec->offset, count);
++            exit(EXIT_FAILURE);
++        }
+         uint64_t within_subsection = next_subsec->offset - ctx->bktr_ctx.bktr_seek;
+         if ((read = nca_section_fread(ctx, buffer, within_subsection)) != within_subsection) {
+             return 0;
+@@ -252,6 +282,13 @@ size_t nca_section_fread(nca_section_ctx_t *ctx, void *buffer, size_t count) {
+                         }
+                     }
+                 } else {
++                    if (next_reloc->virt_offset <= ctx->bktr_ctx.virtual_seek) {
++                        /* A zero (or negative) step would repeat this read forever. */
++                        fprintf(stderr, "BKTR relocation lookup at virtual offset %012"PRIx64" returned the relocation at %012"PRIx64
++                                " ending at %012"PRIx64": cannot read %zu bytes there!\n", ctx->bktr_ctx.virtual_seek,
++                                reloc->virt_offset, next_reloc->virt_offset, count);
++                        exit(EXIT_FAILURE);
++                    }
+                     uint64_t within_relocation = next_reloc->virt_offset - ctx->bktr_ctx.virtual_seek;
+                     if ((read = nca_section_fread(ctx, buffer, within_relocation)) != within_relocation) {
+                         return 0;
+@@ -1180,6 +1217,21 @@ void nca_process_bktr_section(nca_section_ctx_t *ctx) {
+         /* NOTE: Setting these variables changes the way fseek/fread work! */
+         ctx->bktr_ctx.relocation_block = relocs;
+         ctx->bktr_ctx.subsection_block = subs;
++        if (getenv("HACTOOL_BKTR_DEBUG") != NULL) {
++            fprintf(stderr, "BKTR tables: relocation %012"PRIx64" bytes, %"PRIu32" buckets, total %012"PRIx64"; "
++                    "subsection %012"PRIx64" bytes, %"PRIu32" buckets, total %012"PRIx64"; section %012"PRIx64"\n",
++                    sb->relocation_header.size, ((bktr_relocation_block_t *)relocs)->num_buckets,
++                    ((bktr_relocation_block_t *)relocs)->total_size, sb->subsection_header.size,
++                    ((bktr_subsection_block_t *)subs)->num_buckets, ((bktr_subsection_block_t *)subs)->total_size,
++                    ctx->size);
++            bktr_relocation_block_t *rb = relocs;
++            for (uint32_t b = 0; b < rb->num_buckets && b < 64; b++) {
++                bktr_relocation_bucket_t *bk = (bktr_relocation_bucket_t *)&rb->buckets[b];   /* still packed here */
++                fprintf(stderr, "  relocation bucket %"PRIu32": table offset %012"PRIx64", %"PRIu32" entries, first %012"PRIx64
++                        ", end %012"PRIx64"\n", b, rb->bucket_virtual_offsets[b], bk->num_entries,
++                        bk->entries[0].virt_offset, bk->virtual_offset_end);
++            }
++        }
+ 
+         if (ctx->bktr_ctx.subsection_block->total_size != sb->subsection_header.offset &&
+             (sb->relocation_header.size > sb->subsection_header.offset ||
+@@ -1192,16 +1244,18 @@ void nca_process_bktr_section(nca_section_ctx_t *ctx) {
+             return;
+         }
+ 
+-        /* This simplifies logic greatly... */
++        /* This simplifies logic greatly... Each bucket moves up by one entry per bucket before it, so source and
++         * destination overlap: memmove, not memcpy (aarch64 glibc's memcpy corrupted the start of each moved bucket,
++         * giving relocation entries far outside the section). */
+         for (unsigned int i = ctx->bktr_ctx.relocation_block->num_buckets - 1; i > 0; i--) {
+-            memcpy(bktr_get_relocation_bucket(ctx->bktr_ctx.relocation_block, i), &ctx->bktr_ctx.relocation_block->buckets[i], sizeof(bktr_relocation_bucket_t));
++            memmove(bktr_get_relocation_bucket(ctx->bktr_ctx.relocation_block, i), &ctx->bktr_ctx.relocation_block->buckets[i], sizeof(bktr_relocation_bucket_t));
+         }
+         for (unsigned int i = 0; i + 1 < ctx->bktr_ctx.relocation_block->num_buckets; i++) {
+             bktr_relocation_bucket_t *cur_bucket = bktr_get_relocation_bucket(ctx->bktr_ctx.relocation_block, i);
+             cur_bucket->entries[cur_bucket->num_entries].virt_offset = ctx->bktr_ctx.relocation_block->bucket_virtual_offsets[i + 1];
+         }
+         for (unsigned int i = ctx->bktr_ctx.subsection_block->num_buckets - 1; i > 0; i--) {
+-            memcpy(bktr_get_subsection_bucket(ctx->bktr_ctx.subsection_block, i), &ctx->bktr_ctx.subsection_block->buckets[i], sizeof(bktr_subsection_bucket_t));
++            memmove(bktr_get_subsection_bucket(ctx->bktr_ctx.subsection_block, i), &ctx->bktr_ctx.subsection_block->buckets[i], sizeof(bktr_subsection_bucket_t));
+         }
+         for (unsigned int i = 0; i + 1 < ctx->bktr_ctx.subsection_block->num_buckets; i++) {
+             bktr_subsection_bucket_t *cur_bucket = bktr_get_subsection_bucket(ctx->bktr_ctx.subsection_block, i);

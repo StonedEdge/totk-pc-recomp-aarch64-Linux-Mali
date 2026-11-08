@@ -698,8 +698,18 @@ static uint8_t type_of_handle(uint64_t h) {   // texture lock held
 // The answers of stage st for the slots in mask; the types of other slots stay zero.
 static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, GfxShaderAnswers *a) {
     memset(a, 0, sizeof *a);
-    if (st == NVN_STAGE_VS) vk_pipeline_answers(&ex->pipe, a, NULL);
-    else if (st == NVN_STAGE_FS) vk_pipeline_answers(&ex->pipe, NULL, a);
+    if (st == NVN_STAGE_VS) {
+        vk_pipeline_answers(&ex->pipe, a, NULL);
+        // no depthClipControl: the vertex shader remaps z itself while the game's depth mode is near = -w.
+        // TOTK_DEPTH_REMAP=0 leaves z as the game wrote it (depth then runs -w..w: for testing a black picture).
+        static int remap = -1;
+        if (remap < 0) {
+            const char *e = cfg_get("TOTK_DEPTH_REMAP");
+            remap = !(e && !strcmp(e, "0"));
+            if (!remap && gfx_shader_no_clip_control()) rt_log("vk_exec: TOTK_DEPTH_REMAP=0: vertex shaders keep z as written");
+        }
+        if (gfx_shader_no_clip_control()) a->depth_minus_w = (uint8_t)(remap && nvn_depth_minus_w() != 0);
+    } else if (st == NVN_STAGE_FS) vk_pipeline_answers(&ex->pipe, NULL, a);
     else
         for (int k = 0; k < 3; k++) {
             uint32_t l;
@@ -1044,6 +1054,7 @@ static uint32_t attached_as(const VkExec *ex, const SubRange *r) {
     for (uint32_t i = 0; i < 9; i++) {
         const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
         if ((i < 8 && i >= ex->pass_ncolor) || t->image != r->image) continue;
+        if (i < 8 && ((ex->pass_detached | ex->pass_dup) >> i & 1)) continue;   // not attached (tiler options, vk_exec.c)
         if (t->level < r->l0 || t->level >= r->l1) continue;
         if (!t->is3d && (t->base_layer + t->layers <= r->a0 || t->base_layer >= r->a1)) continue;
         m |= 1u << i;
@@ -1158,6 +1169,47 @@ static void feedback_written(VkExec *ex, const VkPipeState *s) {
 
 static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
                           VkDescriptorImageInfo *out, VkImage *image);
+
+// ---- tiler options (vk_exec.c): what a draw writes and reads, before it is recorded
+// The vertex stage reads textures, images or storage buffers: GPU results a fragment-only pass barrier does not order.
+static int vs_reads_gpu(const GfxShader *vs) {
+    const GfxShaderRes *r;
+    return vs && (gfx_shader_resources(vs, GFX_RES_TEX, &r) || gfx_shader_resources(vs, GFX_RES_IMG, &r) ||
+                  gfx_shader_resources(vs, GFX_RES_SSBO, &r));
+}
+
+// The shader stores to a storage buffer or an image (GfxShaderRes.flags: SSBO 1 written, IMG 4 image store).
+static int stores_mem(const GfxShader *sh) {
+    const GfxShaderRes *r;
+    if (!sh) return 0;
+    int n = gfx_shader_resources(sh, GFX_RES_SSBO, &r);
+    for (int i = 0; i < n; i++)
+        if (r[i].flags & 1) return 1;
+    n = gfx_shader_resources(sh, GFX_RES_IMG, &r);
+    for (int i = 0; i < n; i++)
+        if (r[i].flags & 4) return 1;
+    return 0;
+}
+
+// Before a draw with state s is recorded into the open pass: a colour slot it writes that the pass left out, or a
+// vertex stage reading GPU results behind a fragment-only barrier, restarts the pass (vk_exec_pass_restart).
+static void tiler_draw(VkExec *ex, const VkPipeState *s) {
+    uint8_t want = 0;
+    for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; i++)
+        if (ex->color[i].image && vk_pipeline_target_wmask(s, (int)i)) want |= (uint8_t)(1u << i);
+    int vsr = vs_reads_gpu(s->vs);
+    uint8_t miss = want & ex->pass_detached;
+    if (miss || (vsr && ex->pass_frag_only)) vk_exec_pass_restart(ex, miss, vsr && ex->pass_frag_only);
+    if (want & ex->pass_dup) {
+        static int logged;
+        if (logged++ < 4)
+            rt_log("vk_exec: a draw writes colour slots %#x that repeat an earlier slot's view; attached once, those "
+                   "writes are dropped (TOTK_DUP_ATTACH=0 attaches both)", want & ex->pass_dup);
+    }
+    ex->pass_written |= want;
+    if (vsr) ex->pass_vsread = 1;
+    if (stores_mem(s->vs) || stores_mem(s->fs)) ex->store_hazard = 1;
+}
 
 // Sampled-texture descriptors per (handle, resource type, separate), kept while nothing they derive from changed: the
 // slot's resolution and texture entry (slot_still) and the samplers (vk_sampler_gen); the layout is set again on every
@@ -2177,6 +2229,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     }
     if (pending) return 0;   // a background worker is building it: the draw is skipped until it is ready
     if (!p || !info) return warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;
+    tiler_draw(ex, &s);   // may restart the pass (vk_exec.c tiler options)
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
         vk_pipeline_set_dynamic(ex->cb, &s);
@@ -2316,6 +2369,58 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
 
 // ---- dispatch and uniform buffer updates
 
+// TOTK_CS_SKIP / TOTK_CS_DUMP: comma-separated hex prefixes of compute shader ids, as the lost-device report prints
+// them (the first 8 bytes of the input id). A matching dispatch is skipped, or its SPIR-V is written once to
+// logs/cs-<id>.spv. For a dispatch that hangs the GPU (the Mali-G610: cs 75be3722f62cb67e, 32x18 groups).
+static int cs_listed(const GfxShader *cs, const char *name) {
+    const char *e = cfg_get(name);
+    if (!e || !*e || !cs) return 0;
+    const uint8_t *iid = gfx_shader_input_id(cs);
+    char id[17];
+    for (int i = 0; i < 8; i++) snprintf(id + 2 * i, 3, "%02x", iid[i]);
+    for (const char *p = e; *p;) {
+        size_t n = strcspn(p, ",");
+        size_t k = 0;
+        while (k < n && k < 16 && (p[k] | 0x20) == id[k]) k++;   // id is lower case; | 0x20 lowers A-F
+        if (n && n <= 16 && k == n) return 1;
+        p += n + (p[n] == ',');
+    }
+    return 0;
+}
+
+static int cs_debug(const GfxShader *cs) {   // 1: skip this dispatch
+    static const GfxShader *dumped[16];
+    static int ndumped;
+    if (cs_listed(cs, "TOTK_CS_DUMP")) {
+        int seen = 0;
+        for (int i = 0; i < ndumped; i++) seen |= dumped[i] == cs;
+        if (!seen && ndumped < 16) {
+            dumped[ndumped++] = cs;
+            const uint8_t *iid = gfx_shader_input_id(cs);
+            char path[64];
+            int n = snprintf(path, sizeof path, "logs/cs-");
+            for (int i = 0; i < 8; i++) n += snprintf(path + n, sizeof path - n, "%02x", iid[i]);
+            snprintf(path + n, sizeof path - n, ".spv");
+            uint64_t words = 0;
+            const uint32_t *spv = gfx_shader_spirv(cs, &words);
+            FILE *f = spv ? fopen(path, "wb") : NULL;
+            if (f) {
+                fwrite(spv, 4, (size_t)words, f);
+                fclose(f);
+                rt_log("vk_exec: TOTK_CS_DUMP: wrote %s (%llu words)", path, (unsigned long long)words);
+            } else {
+                rt_log("vk_exec: TOTK_CS_DUMP: could not write %s", path);
+            }
+        }
+    }
+    if (cs_listed(cs, "TOTK_CS_SKIP")) {
+        static int logged;
+        if (logged++ < 4) rt_log("vk_exec: TOTK_CS_SKIP: a dispatch of a listed compute shader is skipped");
+        return 1;
+    }
+    return 0;
+}
+
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
@@ -2325,6 +2430,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);   // synchronous: a skipped dispatch changes results
     if (!cs) return;
+    if (cs_debug(cs)) return;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");

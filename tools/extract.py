@@ -198,9 +198,46 @@ MERGE_PHASES = {'copy': '  copying the base and update Program NCAs', 'merge': '
                 'index': '  hashing and indexing the merged image'}
 
 
+# hactool's -y check of a BKTR section reads each hash table level in one call, and its BKTR read recurses once per
+# relocation entry the read spans: for TotK's cumulative updates that nests far past an 8 MiB stack, and with the
+# stack unlimited it grew until the kernel's OOM killer stopped hactool (SIGKILL) on an 8 GB aarch64 board. The data
+# itself is read in small chunks and does not nest. Off x86-64 the merge therefore runs without -y: the merged image's
+# SHA-256 is compared with the known one for the version afterwards (romfs_verified / check_romfs), which proves the
+# whole image, though a failure no longer says whether the base or the update file is damaged. TOTK_MERGE_VERIFY=1 or
+# 0 forces the check on or off.
+def merge_verifies():
+    import platform
+    forced = os.environ.get('TOTK_MERGE_VERIFY')
+    if forced in ('0', '1'):
+        return forced == '1'
+    return platform.machine().lower() in ('x86_64', 'amd64')
+
+
+def big_stack():
+    """In the child before hactool starts (off Windows): the stack limit raised to the hard limit (unlimited on most
+    systems). hactool reads a BKTR section through nca_section_fread and nca_bktr_section_physical_fread calling each
+    other once per relocation entry; checking a cumulative update's hash tables against a 16 GB base nests them
+    deeper than the default 8 MiB stack holds on aarch64 (SIGSEGV with no output), and deeper than 1 GiB was enough
+    for: the merge on a Mali-G610 board ran only with ulimit -s unlimited."""
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+    if soft != hard:
+        resource.setrlimit(resource.RLIMIT_STACK, (hard, hard))
+
+
+def stack_note():
+    """The stack limit hactool gets, for its log: 'unlimited' or MiB."""
+    if os.name == 'nt':
+        return 'default'
+    import resource
+    hard = resource.getrlimit(resource.RLIMIT_STACK)[1]
+    return 'unlimited' if hard == resource.RLIM_INFINITY else f'{hard >> 20} MiB'
+
+
 def run_hactool(command, environment):
     """(exit code, stdout and stderr with long hex strings removed). hactool prints UTF-8 (its manifest)."""
-    completed = subprocess.run(command, env=environment, capture_output=True, encoding='utf-8', errors='replace')
+    completed = subprocess.run(command, env=environment, capture_output=True, encoding='utf-8', errors='replace',
+                               preexec_fn=None if os.name == 'nt' else big_stack)
     return completed.returncode, LONG_HEX.sub('<hex removed>', completed.stdout + completed.stderr)
 
 
@@ -254,22 +291,28 @@ def merge_update_romfs(base, update, keys_path, hactool, output, logs, phase=lam
         result = tmp / 'result'
         result.mkdir()
         phase('merge')
-        command = [str(hactool), '-x', '-y', '--disablekeywarns', '--suppresskeys', '-k', str(hactool_keys),
-                   f'--basenca={base_nca}', f'--section{sections[0]}={result / "romfs.bin"}', str(update_nca)]
+        verify = merge_verifies()
+        command = [str(hactool), '-x', *(['-y'] if verify else []), '--disablekeywarns', '--suppresskeys', '-k',
+                   str(hactool_keys), f'--basenca={base_nca}', f'--section{sections[0]}={result / "romfs.bin"}',
+                   str(update_nca)]
         environment = dict(os.environ, MNG_TITLE_KEYS=str(title_keys))
         code, log = run_hactool(command, environment)
-        log_path.write_text(log, encoding='utf-8')
+        log_path.write_text(f'(hactool exit code {code}{"" if code >= 0 else " (killed by a signal)"}, stack limit '
+                            f'{stack_note()}, hash check {"on" if verify else "off"})\n{log}', encoding='utf-8')
         checked = '\n'.join(line for line in log.splitlines() if not UNSIGNED.match(line))
         if HACTOOL_HASH_FAIL.search(checked):
             phase('diagnose')
             raise damaged_merge_input(hactool, hactool_keys, environment, base, update, base_nca, log_path)
         require(code == 0 and not HACTOOL_ERROR.search(checked), f'hactool merge failed; see {shown(log_path)}')
-        require(all(re.search(rf'Level {i} \(GOOD\)', log) for i in range(6)), 'hactool did not verify all six IVFC levels')
+        if verify:
+            require(all(re.search(rf'Level {i} \(GOOD\)', log) for i in range(6)),
+                    'hactool did not verify all six IVFC levels')
         image = result / 'romfs.bin'
         phase('index')
         files = index_romfs(image)
         report = dict(status='pass', romfs_size=image.stat().st_size, romfs_sha256=sha256(image), files=files,
-                      integrity='BKTR merge; all six IVFC levels verified')
+                      integrity='BKTR merge; all six IVFC levels verified' if verify else
+                      'BKTR merge without the hash-table check (merge_verifies); the image SHA-256 decides')
         (result / 'index.json').write_text(json.dumps(report, indent=2) + '\n')
         result.rename(output)
 

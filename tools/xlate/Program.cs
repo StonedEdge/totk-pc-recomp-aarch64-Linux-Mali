@@ -87,8 +87,10 @@ static class SwshXlate
             Array32<AttributeType> attr = default; Array8<AttributeType> fout = default;
             if (_job["attr"] is JsonObject a) foreach (var kv in a) attr[int.Parse(kv.Key)] = Attr((string)kv.Value);
             if (_job["fout"] is JsonObject f) foreach (var kv in f) fout[int.Parse(kv.Key)] = Attr((string)kv.Value);
-            // Vulkan: VK_EXT_depth_clip_control handles NEAR_IS_MINUS_W, so the shader is never rewritten ("depth_minus_w" in a job is ignored).
-            const bool depthMinusW = false;
+            // Vulkan: VK_EXT_depth_clip_control handles NEAR_IS_MINUS_W. A host without it (Arm's Mali driver) sends
+            // "depth_minus_w": true for vertex shaders while the game's depth mode is near = -w; Ryujinx then maps z to
+            // (z + w) / 2 before the vertex shader returns (QueryHostSupportsDepthClipControl false below).
+            bool depthMinusW = DepthMinusW;
             // "early_fragment_tests": the fragment shader's NVN control byte +0x718 (the driver's early-Z-force, Ryujinx's
             // EarlyZForce); the SPIR-V then declares EarlyFragmentTests (MacNativeGames ae8f4f4).
             bool earlyZ = _job["early_fragment_tests"] is JsonValue ez && ez.TryGetValue<bool>(out bool eb) && eb;
@@ -96,7 +98,8 @@ static class SwshXlate
                 false, false, false, depthMinusW, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
                 false /* 不做 Y 取反 | no Y flip */, true /* 原点左上 | origin upper-left */, false);
         }
-        public bool QueryHostSupportsDepthClipControl() => true;
+        bool DepthMinusW => _job["depth_minus_w"] is JsonValue dm && dm.TryGetValue<bool>(out bool db) && db;
+        public bool QueryHostSupportsDepthClipControl() => !DepthMinusW;
         // Vulkan: the ConstOffset / ConstOffsets image operands Ryujinx emits must be constants. A TLD4.PTP whose offsets
         // come from registers (agl_technique_pfx compute b940aa86, dfe7662f) otherwise becomes an OpConstantComposite over
         // computed ids, which spirv-val rejects; false makes TexturePass emulate only non-constant offsets.

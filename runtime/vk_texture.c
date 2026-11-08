@@ -222,17 +222,43 @@ static int format_compressed(VkFormat f) {   // vkCmdClearColorImage takes no bl
            (f >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK && f <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK);
 }
 
+// Why the last bind_pool_memory failed (for the "cannot alias" log line).
+static char bind_why[160];
+
 static int bind_pool_memory(VkCtx *c, Tex *e, VkImage img, uint64_t guest_size) {
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(c->device, img, &req);
-    if ((e->f.depth || e->f.stencil) && req.size > guest_size) return 0;
+    if ((e->f.depth || e->f.stencil) && req.size > guest_size) {
+        snprintf(bind_why, sizeof bind_why, "depth image needs %llu bytes, the guest gave %llu",
+                 (unsigned long long)req.size, (unsigned long long)guest_size);
+        return 0;
+    }
     VkMemSpan sp;
-    if (!req.size) return 0;   // an image the device could not lay out (image_size)
-    if (!vk_mem_resolve(e->pub.addr, req.size, &sp) || !sp.alloc || sp.alloc_offset % req.alignment) return 0;
+    if (!req.size) {
+        snprintf(bind_why, sizeof bind_why, "the device cannot lay it out");
+        return 0;   // an image the device could not lay out (image_size)
+    }
+    if (!vk_mem_resolve(e->pub.addr, req.size, &sp) || !sp.alloc) {
+        snprintf(bind_why, sizeof bind_why, "%llu bytes from the address are not in one pool allocation",
+                 (unsigned long long)req.size);
+        return 0;
+    }
+    if (sp.alloc_offset % req.alignment) {
+        snprintf(bind_why, sizeof bind_why, "offset %#llx in the pool is not aligned to the image's %#llx",
+                 (unsigned long long)sp.alloc_offset, (unsigned long long)req.alignment);
+        return 0;
+    }
     VmaAllocationInfo info;
     vmaGetAllocationInfo(c->vma, sp.alloc, &info);
-    if (!(req.memoryTypeBits >> info.memoryType & 1)) return 0;
-    if (vmaBindImageMemory2(c->vma, sp.alloc, sp.alloc_offset, img, NULL) != VK_SUCCESS) return 0;
+    if (!(req.memoryTypeBits >> info.memoryType & 1)) {
+        snprintf(bind_why, sizeof bind_why, "pool memory type %u not in the image's types %#x", info.memoryType,
+                 req.memoryTypeBits);
+        return 0;
+    }
+    if (vmaBindImageMemory2(c->vma, sp.alloc, sp.alloc_offset, img, NULL) != VK_SUCCESS) {
+        snprintf(bind_why, sizeof bind_why, "the bind failed");
+        return 0;
+    }
     e->bound_to = sp.alloc;
     return 1;
 }
@@ -425,8 +451,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS && !bind_pool_memory(c, e, img, L.size)) {
             vkDestroyImage(c->device, img, NULL);
             img = VK_NULL_HANDLE;
-            log_limited(&n_unbound, "texture %#llx (%ux%u fmt %#x) cannot alias its pool memory; own memory instead",
-                        (unsigned long long)k->addr, w, h, d->format);
+            log_limited(&n_unbound, "texture %#llx (%ux%u fmt %#x) cannot alias its pool memory (%s); own memory instead",
+                        (unsigned long long)k->addr, w, h, d->format, bind_why);
         }
     }
     if (!img) {

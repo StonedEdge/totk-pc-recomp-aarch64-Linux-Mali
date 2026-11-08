@@ -289,6 +289,58 @@ static void machine_copy(PerfStats *d, const PerfStats *s) {
     d->gpu_clock_mhz = s->gpu_clock_mhz, d->vram_used_mb = s->vram_used_mb, d->vram_total_mb = s->vram_total_mb;
 }
 
+#ifndef _WIN32
+#include <dirent.h>
+// Arm Mali and other devfreq GPUs (Savage Wind Recomp 9dadb24): on the RK3588's Mali-G610 neither NVML nor amdgpu's
+// sysfs exists, so the overlay showed "-" for the GPU. /sys/class/devfreq/<gpu>/load is "<percent>@<Hz>", cur_freq the
+// clock in Hz, and the thermal zone whose type names the GPU gives the temperature (millidegrees). Unified memory: no
+// VRAM figure.
+static float devfreq_read(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    double v = -1;
+    if (fscanf(f, "%lf", &v) != 1) v = -1;
+    fclose(f);
+    return (float)v;
+}
+
+static void devfreq_sample(PerfStats *s) {
+    static char dev[300], tz[300];
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        DIR *d = opendir("/sys/class/devfreq");
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) && !dev[0])
+                if (strstr(e->d_name, "gpu") || strstr(e->d_name, "mali"))
+                    snprintf(dev, sizeof dev, "/sys/class/devfreq/%s", e->d_name);
+            closedir(d);
+        }
+        for (int i = 0; i < 32 && !tz[0]; i++) {
+            char p[200], t[64] = {0};
+            snprintf(p, sizeof p, "/sys/class/thermal/thermal_zone%d/type", i);
+            FILE *f = fopen(p, "r");
+            if (!f) continue;
+            if (fgets(t, sizeof t, f) && strstr(t, "gpu")) snprintf(tz, sizeof tz, "/sys/class/thermal/thermal_zone%d/temp", i);
+            fclose(f);
+        }
+    }
+    if (!dev[0]) return;
+    char p[400];
+    float v;
+    if (s->gpu_pct < 0) {
+        snprintf(p, sizeof p, "%s/load", dev);
+        if ((v = devfreq_read(p)) >= 0) s->gpu_pct = v;
+    }
+    if (s->gpu_clock_mhz < 0) {
+        snprintf(p, sizeof p, "%s/cur_freq", dev);
+        if ((v = devfreq_read(p)) > 0) s->gpu_clock_mhz = v / 1e6f;
+    }
+    if (s->gpu_temp_c < 0 && tz[0] && (v = devfreq_read(tz)) > 0) s->gpu_temp_c = v / 1000.0f;
+}
+#endif
+
 static void sampler(void *arg) {
     (void)arg;
     PerfStats s;
@@ -315,6 +367,9 @@ static void sampler(void *arg) {
         s.vram_total_mb = vram_total;
         nvml_sample(&s);
         adl_sample(&s);
+#ifndef _WIN32
+        devfreq_sample(&s);   // after NVML and amdgpu: only what they left unset
+#endif
         plat_mutex_lock(&g_lock);
         machine_copy(&g_stats, &s);
         if (g_smp.want) plat_cond_wait_ns(&g_smp.cv, &g_lock, 500000000ull);

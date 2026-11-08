@@ -393,15 +393,24 @@ class Check(Step):
             ctx.reporter.log(r.stdout + r.stderr)
             raise InstallError('check.toolchain_broken', detail=(r.stderr or r.stdout).strip()[-400:])
         r = subprocess.run([str(exe)], capture_output=True, text=True, errors='replace')
-        try:
-            host = json.loads(r.stdout)
-        except ValueError:
-            raise InstallError('check.host_probe_failed', code=r.returncode) from None
+        host = None
+        # The JSON is one line; a driver may print its own lines around it (Arm's Mali driver prints its version)
+        for line in [r.stdout] + r.stdout.splitlines()[::-1]:
+            try:
+                host = json.loads(line)
+                break
+            except ValueError:
+                continue
+        if not isinstance(host, dict):
+            ctx.reporter.log(r.stdout + r.stderr)
+            raise InstallError('check.host_probe_failed', code=r.returncode)
         ctx.reporter.log(f'host: {r.stdout.strip()}')
-        if not host['x86_64_v2']:
+        arm64 = bool(host.get('aarch64'))
+        if not arm64 and not host['x86_64_v2']:
             raise InstallError('check.cpu_too_old')
         # v3 is the faster build; v2 runs on CPUs without AVX2/FMA (runtime/fma.c supplies the fused multiply-add).
-        ctx.cpu = 'v3' if host['x86_64_v3'] else 'v2'
+        # aarch64 has no levels: build_game.py builds armv8.2-a there and ignores --cpu.
+        ctx.cpu = 'v3' if arm64 or host['x86_64_v3'] else 'v2'
         if not host['loader']:
             raise InstallError('check.vulkan_missing')
         devices = host['devices']
@@ -411,7 +420,9 @@ class Check(Step):
             raise InstallError('check.vulkan_too_old',
                                devices=', '.join(f'{d["name"]} ({d["api"][0]}.{d["api"][1]})' for d in devices))
         kernel = linux_kernel()
-        if kernel and kernel < (6, 7):
+        # aarch64 boards ship vendor kernels before 6.7; the software write watch (runtime/platform/linux.c) tracks the
+        # writes there when userfaultfd is missing, as on the AYN Thor and the RK3588 boards it was tried on.
+        if kernel and kernel < (6, 7) and not arm64:
             # Without userfaultfd's asynchronous write protection nothing tracks the CPU's writes: the game copies whole
             # pools to the GPU at each submit and its texture checks see every page as changed (docs/building.md, Linux)
             ctx.reporter.warning('warn.kernel_old', version='.'.join(map(str, kernel)))

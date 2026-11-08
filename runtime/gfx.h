@@ -51,6 +51,10 @@ uint64_t gfx_shader_async_done(void);                      // translations finis
 void gfx_shader_counts(uint64_t *keys, uint64_t *translated);   // distinct keys in memory, translations done (TOTK_TRACE=perf)
 // Translator answers for this device (vk_caps.c): shaderFloat64, storage offset rounding, subgroup size per vs/fs/cs.
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits);
+// The device has no depthClipControl (vk_device.c, before gfx_shader_set_host): vertex shader answers carry the game's
+// depth mode (GfxShaderAnswers.depth_minus_w), and the translator maps z to (z + w) / 2 where it is near = -w.
+void gfx_shader_set_no_clip_control(void);
+int gfx_shader_no_clip_control(void);
 const uint8_t *gfx_shader_key(const GfxShader *s);          // the 32-byte cache key (stable while the translator is)
 const uint8_t *gfx_shader_input_id(const GfxShader *s);     // the 32-byte input id (stable across translators)
 // By input id from memory or disk; xlate 1 also translates it from its stored inputs. NULL if absent.

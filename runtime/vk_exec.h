@@ -112,7 +112,27 @@ typedef struct VkExec {
     const void *fb_fs;                   // feedback_scan's memo: fragment shader, texture bind serial, pass serial
     uint32_t fb_serial, fb_pass, fb_sampled;
     uint32_t tex_serial, pass_serial;    // bumped by every texture or image bind and pass begin
+
+    // Tiler options (vk_exec.c "tiler options"; on by default on Mali GPUs, vk_caps_tiler_opt). A pass's key names its
+    // render targets and the program of its first draw; the pass table remembers per key which colour slots its draws
+    // wrote and whether a draw read textures or memory in its vertex stage.
+    uint64_t pass_key;                   // the open pass's key
+    uint8_t pass_detached;               // colour slots left out of the open pass: it never wrote them (TOTK_DETACH)
+    uint8_t pass_dup;                    // colour slots whose view repeats an earlier slot's: attached once (TOTK_DUP_ATTACH)
+    uint8_t dup_of[8];                   // the earlier slot each of those repeats
+    uint8_t pass_written;                // colour slots the open pass drew into or cleared
+    uint8_t det_force;                   // colour slots the pass about to begin attaches whatever the table says (a clear)
+    int pass_frag_only;                  // the open pass began behind a fragment-only barrier (TOTK_BARRIER_FRAG)
+    int pass_vsread;                     // a draw of the open pass read textures or memory in its vertex stage
+    int store_hazard;                    // a draw since the last full barrier stored to a buffer or an image
+    int force_full;                      // the next pass begins behind a full barrier
+    int pass_end_at;                     // recorded right after the last pass end (-1: none in this command buffer part)
+    int barrier_full;                    // the last barrier recorded was a full one
 } VkExec;
+
+// Ends the open pass and begins it again (tiler options): attach names colour slots a draw or clear is about to write
+// that the pass left out; full makes the new pass begin behind a full barrier (a vertex stage reads GPU results).
+void vk_exec_pass_restart(VkExec *ex, uint8_t attach, int full);
 
 // Begins dynamic rendering with the current targets unless a pass is open (a full memory barrier precedes it). Call
 // before a draw or an attachment clear.

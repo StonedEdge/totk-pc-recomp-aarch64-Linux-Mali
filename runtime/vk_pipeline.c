@@ -269,6 +269,17 @@ static int ensure_init(void) {
         rt_log("vk_pipeline: dynamic vertex input off (%s)", dv && *dv ? "TOTK_VK_DYN_VERTEX=0" : "Intel's older Windows driver draws nothing with it");
     if (c->has_eds3) {
         P.dyn_clamp = e3.extendedDynamicState3DepthClampEnable && P.f_depth_clamp && PROC(set_clamp, "vkCmdSetDepthClampEnableEXT");
+        // TOTK_VK_DYN_CLAMP=0/1 forces dynamic depth clamp off or on; default off on Arm's Mali driver. TotK draws its
+        // HUD and the final full-screen copy at z = -1 with depth clamp on (clipping off); on a Mali-G610 those draws
+        // left no pixel (a black picture with the 3D scene rendered underneath), as if the dynamic clamp were ignored.
+        // Taken out of the dynamic state, the clamp goes into the pipeline key.
+        const char *dc = cfg_get("TOTK_VK_DYN_CLAMP");
+        int dc_on = dc && *dc ? strcmp(dc, "0") != 0 : !vk_caps.mali;
+        if (!dc_on && P.dyn_clamp) {
+            P.dyn_clamp = 0;
+            rt_log("vk_pipeline: dynamic depth clamp off (%s): the clamp is in the pipeline key",
+                   dc && *dc ? "TOTK_VK_DYN_CLAMP=0" : "Arm's Mali driver");
+        }
         P.dyn_poly = e3.extendedDynamicState3PolygonMode && PROC(set_poly, "vkCmdSetPolygonModeEXT");
         P.dyn_blend_en = e3.extendedDynamicState3ColorBlendEnable && PROC(set_blend_en, "vkCmdSetColorBlendEnableEXT");
         P.dyn_blend_eq = e3.extendedDynamicState3ColorBlendEquation && PROC(set_blend_eq, "vkCmdSetColorBlendEquationEXT");
@@ -877,10 +888,120 @@ static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShader
     st->pNext = rq;
 }
 
+// ---- workgroup barrier after an early return (Mali)
+// Maxwell compute code may EXIT some threads and then BAR.SYNC the rest: on NVIDIA an exited thread counts as having
+// arrived. The translation is "if (c) return; barrier();", which Vulkan leaves undefined (the barrier is not in uniform
+// control flow), and on the Mali-G610 it hangs the workgroup: the GPU stops in the dispatch (INSTR_BARRIER_FAULT; seen
+// with cs 75be3722f62cb67e, a reduction where every thread but one returns). This rewrites exactly
+//     OpSelectionMerge %L; OpBranchConditional %c %A %L (or %L %A); %A: OpReturn; %L: OpControlBarrier ...
+// into: %A branches to %L, every thread meets the barrier, and right after it the threads %c sent to %A return:
+//     %L: OpControlBarrier; OpSelectionMerge %M; OpBranchConditional %c %R %M (or %M %R); %R: OpReturn; %M: rest of %L
+// OpPhi parents %L in the rest become %M. The same threads return, after the barrier instead of before it.
+// TOTK_BARRIER_RETURN_FIX=0 off, =1 on everywhere; default on for Mali (vk_caps_tiler_opt).
+static uint32_t *barrier_return_fix(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+    enum { OP_PHI = 245, OP_SELECTION_MERGE = 247, OP_LABEL = 248, OP_BRANCH = 249, OP_BRANCH_COND = 250, OP_RETURN = 253,
+           OP_CONTROL_BARRIER = 224 };
+    static int on = -1;
+    if (on < 0) on = vk_caps_tiler_opt("TOTK_BARRIER_RETURN_FIX");
+    if (!on || n < 5) return NULL;
+    uint32_t *cur = malloc((size_t)n * 4);
+    if (!cur) return NULL;
+    memcpy(cur, w, (size_t)n * 4);
+    uint64_t cn = n;
+    int fixes = 0;
+    for (int pass = 0; pass < 64; pass++) {
+        // the start of the last six instructions, sliding
+        uint64_t at[6] = {0};
+        int have = 0, done = 0;
+        for (uint64_t i = 5; i < cn;) {
+            uint32_t len = cur[i] >> 16, op = cur[i] & 0xffff;
+            if (!len || i + len > cn) {
+                free(cur);
+                return NULL;   // malformed: leave the module as it is
+            }
+            memmove(at, at + 1, sizeof at - sizeof at[0]);
+            at[5] = i;
+            if (have < 6) have++;
+            if (have == 6 && op == OP_CONTROL_BARRIER) {
+                const uint32_t *sm = cur + at[0], *bc = cur + at[1], *la = cur + at[2], *re = cur + at[3],
+                               *ll = cur + at[4];
+                if ((sm[0] & 0xffff) == OP_SELECTION_MERGE && (sm[0] >> 16) >= 3 && (bc[0] & 0xffff) == OP_BRANCH_COND &&
+                    (bc[0] >> 16) >= 4 && (la[0] & 0xffff) == OP_LABEL && (la[0] >> 16) == 2 && re[0] == (1u << 16 | OP_RETURN) &&
+                    (ll[0] & 0xffff) == OP_LABEL && (ll[0] >> 16) == 2) {
+                    uint32_t L = ll[1], A = la[1], c = bc[1], t = bc[2], f = bc[3];
+                    int ret_if_true = t == A && f == L, ret_if_false = f == A && t == L;
+                    if (sm[1] == L && (ret_if_true || ret_if_false)) {
+                        uint32_t M = cur[3], R = cur[3] + 1;
+                        uint64_t blen = cur[i] >> 16, tail = i + blen;   // after the barrier
+                        uint64_t nn = cn + 1 + 3 + 4 + 2 + 1 + 2;
+                        uint32_t *o = malloc((size_t)nn * 4);
+                        if (!o) break;
+                        uint64_t k = 0;
+                        memcpy(o, cur, (size_t)at[3] * 4), k = at[3];               // up to and with %A's label
+                        o[k++] = 2u << 16 | OP_BRANCH, o[k++] = L;                  // %A: to %L, not out
+                        memcpy(o + k, cur + at[4], (size_t)(tail - at[4]) * 4);      // %L and the barrier
+                        k += tail - at[4];
+                        o[k++] = 3u << 16 | OP_SELECTION_MERGE, o[k++] = M, o[k++] = 0;
+                        o[k++] = 4u << 16 | OP_BRANCH_COND, o[k++] = c;
+                        o[k++] = ret_if_true ? R : M, o[k++] = ret_if_true ? M : R;
+                        o[k++] = 2u << 16 | OP_LABEL, o[k++] = R;
+                        o[k++] = 1u << 16 | OP_RETURN;
+                        o[k++] = 2u << 16 | OP_LABEL, o[k++] = M;
+                        uint64_t rest = k;
+                        memcpy(o + k, cur + tail, (size_t)(cn - tail) * 4), k += cn - tail;
+                        for (uint64_t j = rest; j < k;) {   // phis that named %L as the parent now name %M
+                            uint32_t jl = o[j] >> 16;
+                            if (!jl) break;
+                            if ((o[j] & 0xffff) == OP_PHI)
+                                for (uint32_t q = 4; q + 1 <= jl; q += 2)
+                                    if (o[j + q] == L) o[j + q] = M;
+                            j += jl;
+                        }
+                        o[3] = cur[3] + 2;
+                        free(cur);
+                        cur = o, cn = k, fixes++, done = 1;
+                        break;
+                    }
+                }
+            }
+            i += len;
+        }
+        if (!done) break;
+    }
+    if (!fixes) {
+        free(cur);
+        return NULL;
+    }
+    static volatile int logged;
+    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 8)
+        rt_log("vk_pipeline: %d workgroup barrier%s after an early return made uniform (TOTK_BARRIER_RETURN_FIX)", fixes,
+               fixes == 1 ? "" : "s");
+    *out_n = cn;
+    return cur;
+}
+
+// TOTK_FORCE_DEPTH_CLAMP=1: every draw clamps depth instead of clipping it (for testing a picture that is clipped
+// away: the HUD and the final copy put z at -1).
+static int force_clamp(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_FORCE_DEPTH_CLAMP");   // no settings-table row: unset means off
+        on = e && *e && strcmp(e, "0") != 0;
+        if (on) rt_log("vk_pipeline: TOTK_FORCE_DEPTH_CLAMP: every draw clamps depth");
+    }
+    return on;
+}
+
 static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
     uint64_t fixed_n = 0;
     uint32_t *fixed = spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
+    uint64_t bar_n = 0;
+    uint32_t *bar = barrier_return_fix(w, words, &bar_n);
+    if (bar) {
+        free(fixed);
+        fixed = bar, w = bar, words = bar_n;
+    }
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
@@ -1272,7 +1393,7 @@ static void gkey_fill(const VkPipeState *s, GKey *k) {
     k->minus_w = s->depth_minus_w != 0;
     k->dsb = s->fs && P.f_dual_src && uses_src1(s);
     k->fbl = s->fs ? s->feedback : 0;
-    if (!P.dyn_clamp) k->clamp = s->depth_clamp && P.f_depth_clamp;
+    if (!P.dyn_clamp) k->clamp = (s->depth_clamp || force_clamp()) && P.f_depth_clamp;
     if (!P.dyn_poly) k->poly_mode = (uint8_t)polygon_mode(s->poly.mode);
     if (!P.dyn_a2c) k->a2c = s->ms.a2c != 0;
     if (P.f_logic_op && s->color.logic_op != NVN_LOGIC_OP_COPY) k->logic_op = (uint8_t)(s->color.logic_op + 1);
@@ -1399,7 +1520,9 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                                                  .topology = class_base[k->topo_class]};
     VkPipelineViewportDepthClipControlCreateInfoEXT clip = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT,
                                                             .negativeOneToOne = k->minus_w};
-    VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .pNext = &clip};
+    // without depthClipControl the vertex shaders remap z themselves (gfx_shader_set_no_clip_control)
+    VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                                            .pNext = vk_ctx()->has_depth_clip_control ? &clip : NULL};
     // NVN's default is the last vertex (SetProvokingVertexMode, nvn_ext.c); Vulkan's is the first.
     VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pvs = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
@@ -1516,7 +1639,9 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
                                                  .topology = class_base[k->topo_class]};
     VkPipelineViewportDepthClipControlCreateInfoEXT clip = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT,
                                                             .negativeOneToOne = k->minus_w};
-    VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .pNext = &clip};
+    // without depthClipControl the vertex shaders remap z themselves (gfx_shader_set_no_clip_control)
+    VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                                            .pNext = vk_ctx()->has_depth_clip_control ? &clip : NULL};
     VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pvs = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
         .provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT};
@@ -3140,7 +3265,7 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
         vertex_input(s, &v);
         rec_vertex_input(P.set_vi, cb, v.n_bind, v.b, v.n_attr, v.a);
     }
-    if (P.dyn_clamp) rec_bool(P.set_clamp, cb, s->depth_clamp != 0);
+    if (P.dyn_clamp) rec_bool(P.set_clamp, cb, s->depth_clamp != 0 || force_clamp());
     if (P.dyn_poly) rec_polygon_mode(P.set_poly, cb, polygon_mode(pl->mode));
     if (P.dyn_a2c) rec_bool((PFN_vkCmdSetDepthClampEnableEXT)P.set_a2c, cb, s->ms.a2c != 0);   // the same signature
     int n = target_count(s);

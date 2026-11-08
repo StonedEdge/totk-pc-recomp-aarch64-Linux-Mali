@@ -150,7 +150,16 @@ static int view_format(const tex_t *t, const view_t *v, int blocks, VkFormat *ou
 // levels at the logo) go to a stand-in: a 2D array of the blocks of one level in the view's format, one layer per
 // depth plane. It starts with the level's content, so a pass that writes part of a plane keeps the rest, and each pass
 // end copies the planes it drew into the level (a copy between a compressed and a size-compatible uncompressed format).
-typedef struct { VkImage bc, img; VmaAllocation alloc; VkFormat fmt; uint32_t level, w, h, d; } BcStandIn;
+// lw, lh: the BC level's size in texels. buf: a staging buffer for levels smaller than one block (lw or lh below 4),
+// whose draws go back through it (bc_copy_back).
+typedef struct {
+    VkImage bc, img;
+    VmaAllocation alloc;
+    VkFormat fmt;
+    uint32_t level, w, h, d, lw, lh;
+    VkBuffer buf;
+    VmaAllocation buf_alloc;
+} BcStandIn;
 #define BC_STANDINS 64   // one per level drawn: 6 volumes of up to 7 levels at the logo
 static BcStandIn bcs[BC_STANDINS];
 static int nbcs;
@@ -194,7 +203,7 @@ static int bc_standin(const VkTexImage *img, uint32_t level, VkFormat fmt, BcSta
     }
     uint32_t lw = level_extent(img->width, level), lh = level_extent(img->height, level);
     BcStandIn s = {img->image, VK_NULL_HANDLE, NULL, fmt, level, (lw + 3) / 4, (lh + 3) / 4,
-                   level_extent(img->depth, level)};
+                   level_extent(img->depth, level), lw, lh, VK_NULL_HANDLE, NULL};
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
                             .extent = {s.w, s.h, 1}, .mipLevels = 1, .arrayLayers = s.d, .samples = VK_SAMPLE_COUNT_1_BIT,
                             .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -205,6 +214,19 @@ static int bc_standin(const VkTexImage *img, uint32_t level, VkFormat fmt, BcSta
     if (vmaCreateImage(vk_ctx()->vma, &ci, &ai, &s.img, &s.alloc, NULL) != VK_SUCCESS) {
         if (!warned++) rt_log("vk: stand-in for a 3D BC render target could not be created: left out");
         return 0;
+    }
+    if (lw < 4 || lh < 4) {
+        // An image copy from the stand-in would cover a whole 4x4 block of a level smaller than that: invalid
+        // (VUID-vkCmdCopyImage-dstOffset-00150/00151); a driver may write past the level (the Mali-G610's device loss
+        // followed these copies). Through a buffer the copy into the BC level can name the level's own size.
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                 .size = (VkDeviceSize)s.w * s.h * s.d * 16,   // at most 16 bytes per block
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &s.buf, &s.buf_alloc, NULL) != VK_SUCCESS) {
+            vmaDestroyImage(vk_ctx()->vma, s.img, s.alloc);
+            if (!warned++) rt_log("vk: staging buffer for a small 3D BC render target could not be created: left out");
+            return 0;
+        }
     }
     // In the upload batch, which goes to the queue before this part: GENERAL, then the texture's blocks.
     VkCommandBuffer cb = vk_upload_begin();
@@ -233,6 +255,7 @@ void vk_exec_bc_gone(VkImage image) {
     for (int i = 0; i < nbcs; i++)
         if (bcs[i].bc == image) {
             vk_defer_image(bcs[i].img, bcs[i].alloc);
+            if (bcs[i].buf) vk_defer_buffer(bcs[i].buf, bcs[i].buf_alloc);
             bcs[i--] = bcs[--nbcs];
         }
     plat_mutex_unlock(&bcs_lock);
@@ -245,11 +268,24 @@ static void bc_copy_back(VkExec *ex, const VkExecTarget *t) {
         if (bcs[i].img != t->image) continue;
         memory_barrier(ex->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
                        VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
-        VkImageCopy rg = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, t->base_layer, t->layers},
-                          .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, bcs[i].level, 0, 1},
-                          .dstOffset = {0, 0, (int32_t)t->base_layer},
-                          .extent = {bcs[i].w, bcs[i].h, t->layers}};   // texels of the uncompressed source
-        vkCmdCopyImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, bcs[i].bc, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+        if (bcs[i].buf) {   // a level smaller than one block: through the staging buffer (bc_standin)
+            VkBufferImageCopy out = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, t->base_layer, t->layers},
+                                     .imageExtent = {bcs[i].w, bcs[i].h, 1}};
+            vkCmdCopyImageToBuffer(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, bcs[i].buf, 1, &out);
+            memory_barrier(ex->cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            // The buffer holds whole blocks, layer after layer; into the level they are depth slices.
+            VkBufferImageCopy in = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, bcs[i].level, 0, 1},
+                                    .imageOffset = {0, 0, (int32_t)t->base_layer},
+                                    .imageExtent = {bcs[i].lw, bcs[i].lh, t->layers}};
+            vkCmdCopyBufferToImage(ex->cb, bcs[i].buf, bcs[i].bc, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+        } else {
+            VkImageCopy rg = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, t->base_layer, t->layers},
+                              .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, bcs[i].level, 0, 1},
+                              .dstOffset = {0, 0, (int32_t)t->base_layer},
+                              .extent = {bcs[i].w, bcs[i].h, t->layers}};   // texels of the uncompressed source
+            vkCmdCopyImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, bcs[i].bc, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+        }
         memory_barrier(ex->cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
         ex->recorded++;
@@ -525,6 +561,98 @@ void vk_exec_targets_describe(VkExec *ex, char *buf, size_t cap) {
     if (!n) snprintf(buf, cap, "no targets");
 }
 
+// ---- tiler options
+// A tiler (Arm Mali, Qualcomm Adreno) renders a pass tile by tile: at its begin it loads every attachment into tile
+// memory, at its end it stores every one back, and it can run the vertex work of a pass while the previous pass's
+// fragments are still shading. Three options, ported from Savage Wind Recomp's Mali-G610 work (StonedEdge's
+// savagewindrecomp-aarch64-Linux-Mali-, mali-fixes branch: 087f2c5, 8defa9b/3e18b5b, f2a4f64), each on by default on
+// Mali only (vk_caps_tiler_opt: =0 off, =1 on elsewhere too):
+// - TOTK_DETACH: colour targets a pass never draws into are left out of it. Which ones it writes is only known once
+//   its draws ran, so the pass table remembers it per pass key (render targets and the first draw's program); a draw
+//   or clear into a slot left out restarts the pass with it attached and the table learns it, so a wrong guess costs a
+//   pass, not a picture. Targets in the feedback layout and 3D BC stand-ins are always attached.
+// - TOTK_BARRIER_FRAG: the barrier at a pass begin holds back only the new pass's fragment work (fragment tests,
+//   fragment shader, attachment output) when nothing but earlier passes ran since the last full barrier and no draw
+//   since then stored to a buffer or image. A draw whose vertex stage reads textures or memory restarts such a pass
+//   behind a full barrier, and the table makes the pass begin behind one from then on.
+// - TOTK_DUP_ATTACH: a view bound to two colour slots is attached once. Vulkan leaves the same view twice undefined;
+//   on the Mali-G610 each slot's tile copy is stored at the pass end, so the unwritten slot put the loaded contents
+//   back over the drawn ones (specks and 16x16 tiles in Savage Wind). Clears into the repeat go to the first slot.
+static int opt_detach = -1, opt_frag = -1, opt_dup = -1;
+
+static void tiler_opts(void) {
+    if (opt_detach >= 0) return;
+    opt_detach = vk_caps_tiler_opt("TOTK_DETACH");
+    opt_frag = vk_caps_tiler_opt("TOTK_BARRIER_FRAG");
+    opt_dup = vk_caps_tiler_opt("TOTK_DUP_ATTACH");
+    rt_log("vk: tiler options: unwritten colour targets left out %s, fragment-only pass barriers %s, repeated views "
+           "attached once %s (TOTK_DETACH, TOTK_BARRIER_FRAG, TOTK_DUP_ATTACH; unused attachments extension %d)",
+           opt_detach ? "on" : "off", opt_frag ? "on" : "off", opt_dup ? "on" : "off", vk_ctx()->has_unused_attachments);
+}
+
+#define PT_N 8192   // direct-mapped: a slot another key took reads as unknown (everything attached, a full barrier)
+static struct { uint64_t key; uint8_t written, vsread; } PT[PT_N];
+static uint64_t st_passes, st_left_out, st_det_miss, st_frag, st_frag_restarts, st_dups, st_t0;
+
+static uint64_t pass_key_of(const VkExec *ex) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t *p = (const uint8_t *)&ex->rt;
+    for (size_t i = 0; i < sizeof ex->rt; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return (h ^ (ex->prog ? ex->prog->serial : 0)) * 0x9E3779B97F4A7C15ull | 1;
+}
+
+static int pt_find(uint64_t key) {
+    uint32_t i = (uint32_t)(key >> 51);
+    return PT[i].key == key ? (int)i : -1;
+}
+
+static void pt_note(uint64_t key, uint8_t written, int vsread) {
+    if (!key) return;
+    uint32_t i = (uint32_t)(key >> 51);
+    if (PT[i].key != key) PT[i].key = key, PT[i].written = 0, PT[i].vsread = 0;
+    PT[i].written |= written;
+    if (vsread) PT[i].vsread = 1;
+}
+
+// The colour slots a pass with this key leaves out: those with a target its draws never wrote. Never all of them
+// when there is no depth target: a pass keeps at least one attachment.
+static uint8_t det_predict(const VkExec *ex, uint64_t key) {
+    if (!opt_detach) return 0;
+    int k = pt_find(key);
+    if (k < 0) return 0;
+    uint8_t present = 0, keep = 0;
+    for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; i++) {
+        const VkExecTarget *t = &ex->color[i];
+        if (!t->image) continue;
+        present |= (uint8_t)(1u << i);
+        if (!t->img || t->img->fb_learned || t->img->image != t->image) keep |= (uint8_t)(1u << i);
+    }
+    uint8_t out = (uint8_t)(present & ~PT[k].written & ~keep & ~ex->det_force);
+    if (out == present && !ex->depth.image) return 0;
+    return out;
+}
+
+static void tiler_stats(void) {
+    uint64_t now = kern_now_ns();
+    if (!st_t0) st_t0 = now;
+    if (now - st_t0 < 4000000000ull) return;
+    rt_log("vk: tiler: passes %llu, colour targets left out %llu, wrong guesses %llu; fragment-only barriers %llu, "
+           "restarts for vertex reads %llu; repeated views %llu (4 s)",
+           (unsigned long long)st_passes, (unsigned long long)st_left_out, (unsigned long long)st_det_miss,
+           (unsigned long long)st_frag, (unsigned long long)st_frag_restarts, (unsigned long long)st_dups);
+    st_passes = st_left_out = st_det_miss = st_frag = st_frag_restarts = st_dups = 0;
+    st_t0 = now;
+}
+
+void vk_exec_pass_restart(VkExec *ex, uint8_t attach, int full) {
+    if (!ex->in_pass) return;
+    if (attach) pt_note(ex->pass_key, attach, 0), st_det_miss++;
+    if (full) ex->force_full = 1, ex->pass_vsread = 1, st_frag_restarts++;
+    vk_exec_pass_end(ex);   // notes what the pass wrote under its key
+    ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
+    vk_exec_pass_begin(ex);
+}
+
 // ---- passes and barriers
 
 static int has_image(const VkImage *list, int n, VkImage img) {
@@ -545,7 +673,8 @@ static VkImageMemoryBarrier2 layout_barrier(VkImage img, VkImageAspectFlags aspe
 
 // Full barrier. The images in the feedback layout become want[] (pass begin) or none (every other barrier): the others
 // go back to GENERAL and the new ones leave it, in the same command.
-static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags *wasp, int nwant) {
+// frag: the memory barrier holds back only fragment work (TOTK_BARRIER_FRAG, vk_exec_pass_begin).
+static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags *wasp, int nwant, int frag) {
     vk_exec_pass_end(ex);
     VkImageMemoryBarrier2 ib[18];
     uint32_t n = 0;
@@ -558,20 +687,26 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
             ib[n++] = layout_barrier(want[i], wasp[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT);
     for (int i = 0; i < nwant; i++) ex->fbl_img[i] = want[i], ex->fbl_aspect[i] = wasp[i];
     ex->nfbl = nwant;
-    if (ex->barrier_at == ex->recorded && !n) return;
+    // Nothing since the last barrier: it covers this one, unless it held back fragment work only and this one is full
+    if (ex->barrier_at == ex->recorded && !n && (ex->barrier_full || frag)) return;
     vk_exec_frame.fb_layouts += n;
+    VkPipelineStageFlags2 dst = frag ? VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
+                                     : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
-                           .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstStageMask = dst,
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb,
                            .imageMemoryBarrierCount = n, .pImageMemoryBarriers = ib};
     vkCmdPipelineBarrier2(ex->cb, &di);
     ex->barrier_at = ++ex->recorded;
+    ex->barrier_full = !frag;
 }
 
-void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
+void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0, 0); }
 
 void vk_exec_pass_begin(VkExec *ex) {
     if (ex->in_pass) return;
@@ -590,15 +725,49 @@ void vk_exec_pass_begin(VkExec *ex) {
         if (has_image(want, nwant, t->image)) continue;
         want[nwant] = t->image, wasp[nwant++] = i < 8 ? VK_IMAGE_ASPECT_COLOR_BIT : t->img->aspect;
     }
-    barrier_to(ex, want, wasp, nwant);   // passes, clears, copies and dispatches see each other's results
+    // Tiler options: the slots this pass leaves out, and whether its barrier may hold back fragment work only.
+    // Anything recorded since the last pass end (a copy, a dispatch, a clear, a barrier) or a store by a draw since the
+    // last full barrier may feed a vertex stage: then the barrier is full.
+    tiler_opts();
+    uint64_t key = pass_key_of(ex);
+    int k = pt_find(key);
+    int frag = opt_frag && ex->pass_end_at == ex->recorded && !ex->store_hazard && !ex->force_full && k >= 0 &&
+               !PT[k].vsread;
+    ex->pass_key = key;
+    ex->pass_detached = det_predict(ex, key);
+    ex->det_force = 0;
+    ex->pass_written = 0;
+    ex->pass_vsread = 0;
+    ex->force_full = 0;
+    barrier_to(ex, want, wasp, nwant, frag);   // passes, clears, copies and dispatches see each other's results
+    if (!frag) ex->store_hazard = 0;
+    ex->pass_frag_only = frag;
+    st_passes++, st_frag += (uint64_t)frag, st_left_out += (uint64_t)__builtin_popcount(ex->pass_detached);
+    if (opt_detach || opt_frag || opt_dup) tiler_stats();
     ex->fbl_mask = fbl;
     ex->fb_dirty = 0;
     ex->pass_serial++;
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
+    ex->pass_dup = 0;
     for (uint32_t i = 0; i < ex->pass_ncolor; i++) {
         const VkExecTarget *t = &ex->color[i];
         ca[i] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         if (!t->image) continue;
+        if (i < 8 && (ex->pass_detached >> i & 1)) continue;   // left out: the pass never wrote it (TOTK_DETACH)
+        if (opt_dup && i < 8) {   // the same view as an earlier attached slot: attached once (TOTK_DUP_ATTACH)
+            uint32_t j = 0;
+            for (; j < i; j++) {
+                const VkExecTarget *o = &ex->color[j];
+                if (o->image == t->image && o->format == t->format && o->level == t->level &&
+                    o->base_layer == t->base_layer && o->layers == t->layers && !(ex->pass_detached >> j & 1) &&
+                    !(ex->pass_dup >> j & 1))
+                    break;
+            }
+            if (j < i) {
+                ex->pass_dup |= (uint8_t)(1u << i), ex->dup_of[i] = (uint8_t)j, st_dups++;
+                continue;
+            }
+        }
         ca[i].imageView = view_of(ex, t);
         ca[i].imageLayout = fbl >> i & 1 ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT : VK_IMAGE_LAYOUT_GENERAL;
         ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -643,6 +812,10 @@ void vk_exec_pass_end(VkExec *ex) {
     vkCmdEndRendering(ex->cb);
     ex->recorded++;
     ex->in_pass = 0;
+    ex->pass_end_at = ex->recorded;   // what is recorded from here to the next pass begin is outside any pass
+    pt_note(ex->pass_key, ex->pass_written, ex->pass_vsread);
+    ex->pass_key = 0;
+    ex->pass_detached = ex->pass_dup = 0;
     if (ex->mark) {
         // vk_exec_frame_log resets the frame counters at a present (TOTK_TRACE=gfx): then only the draws since it count
         uint64_t d = vk_exec_frame.draws, d0 = ex->mark_draws0;
@@ -720,13 +893,23 @@ static int whole_target(const VkExec *ex, const VkExecTarget *t) {
     return s->x <= 0 && s->y <= 0 && (int64_t)s->x + s->w >= t->width && (int64_t)s->y + s->h >= t->height;
 }
 
-static void clear_attachment(VkExec *ex, const VkClearAttachment *a) {
+static void clear_attachment(VkExec *ex, const VkClearAttachment *ca) {
+    VkClearAttachment c = *ca, *a = &c;
+    if (a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT && a->colorAttachment < 8) {   // tiler options: the slot is attached
+        uint8_t bit = (uint8_t)(1u << a->colorAttachment);
+        if (ex->in_pass && (ex->pass_detached & bit)) vk_exec_pass_restart(ex, bit, 0);
+        else if (!ex->in_pass) ex->det_force |= bit;
+    }
     vk_exec_pass_begin(ex);
+    if (a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT && a->colorAttachment < 8) {
+        ex->pass_written |= (uint8_t)(1u << a->colorAttachment);
+        if (ex->pass_dup >> a->colorAttachment & 1) a->colorAttachment = ex->dup_of[a->colorAttachment];
+    }
     VkClearRect cr = {vk_exec_scissor(ex), 0, ex->pass_layers};
     if (!cr.rect.extent.width || !cr.rect.extent.height) return;
     vkCmdClearAttachments(ex->cb, 1, a, 1, &cr);
     ex->recorded++;
-    ex->fb_dirty |= a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT ? 1u << a->colorAttachment : 0x100u;
+    ex->fb_dirty |= a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT ? 1u << ca->colorAttachment : 0x100u;
 }
 
 static void clear_color(VkExec *ex, const p_clear_color *c) {
@@ -826,6 +1009,7 @@ static void maybe_split(VkExec *ex) {
     split_draws = 0;
     if (ex->recorded == part_start) return;
     ex->cb = vk_sync_split();
+    ex->pass_end_at = -1;   // the new part's prologue may have uploaded vertex data: the next pass barrier is full
     part_start = ex->recorded;
     part_t0 = kern_now_ns();
     ex->dirty = VK_EXEC_DIRTY_ALL;
@@ -930,6 +1114,11 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     ex->nviews = 0;
     ex->barrier_at = -1;
     ex->nfbl = 0;   // the previous command buffer ended with a full barrier: every image is in GENERAL
+    ex->pass_end_at = -1;   // the mirror and uniform uploads precede the replay: the first pass barrier is full
+    ex->barrier_full = 1;
+    ex->force_full = ex->store_hazard = 0;
+    ex->pass_key = 0;
+    ex->pass_detached = ex->pass_dup = ex->det_force = 0;
     vk_exec_frame.submits++;
     split_draws = part_start = 0;
     part_t0 = kern_now_ns();

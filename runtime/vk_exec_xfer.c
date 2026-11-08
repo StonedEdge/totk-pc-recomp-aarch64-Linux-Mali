@@ -38,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_tex.h"
@@ -147,6 +148,14 @@ static int oq_ready(void) {
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12};
     vkGetPhysicalDeviceFeatures2(v->phys, &f2);
     oq_state = -1;
+    // TOTK_OQ=0: no Vulkan occlusion queries at all (a samples-passed counter reports what an unavailable one does).
+    // For drivers whose query handling fails: the Mali-G610's command stream raised INSTR_BARRIER_FAULT in the first
+    // full frame, the first one that counts samples.
+    const char *e = cfg_get("TOTK_OQ");
+    if (e && !strcmp(e, "0")) {
+        rt_log("vk: TOTK_OQ=0: no occlusion queries; samples-passed counters report 0");
+        return 0;
+    }
     if (!f12.hostQueryReset) {
         rt_log("vk: no hostQueryReset: samples-passed counters report 0");
         return 0;

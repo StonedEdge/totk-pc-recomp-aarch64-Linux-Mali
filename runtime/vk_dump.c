@@ -684,6 +684,11 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
     Str b = {0};
     sp(&b, "vs %016llx fs %016llx prog %llu prim %d\n", (unsigned long long)shader_hash(s->vs),
        (unsigned long long)shader_hash(s->fs), (unsigned long long)(ex->prog ? ex->prog->serial : 0), s->prim);
+    sp(&b, "    state: depth test %u write %u func %u, stencil test %u func %u/%u, cull %u front %u, clamp %u, "
+           "depth -w..w %u, raster discard %u, channel mask %#x\n",
+       (unsigned)s->ds.dt, (unsigned)s->ds.dw, (unsigned)s->ds.df, (unsigned)s->ds.st, (unsigned)s->ds.sf_f,
+       (unsigned)s->ds.sf_b, (unsigned)s->poly.cull, (unsigned)s->poly.front, (unsigned)s->depth_clamp,
+       (unsigned)s->depth_minus_w, (unsigned)s->raster_discard, (unsigned)s->chmask.mask);
     describe_bindings(&b, ex, info);
     ents[nents++] = (Ent){p, th, 1, b.s};
 out:

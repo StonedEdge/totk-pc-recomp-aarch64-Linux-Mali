@@ -25,6 +25,15 @@ static volatile uint32_t *words;   // 0, 1: crumbs; 2, 3: pass marks
 // Pass marks (below)
 int vk_pass_marks_on;
 static int pm_amd;                          // marks into words 2 and 3
+// TOTK_PASS_CRUMBS=fill, for GPUs without VK_AMD_buffer_marker (Arm's Mali): vkCmdFillBuffer writes the marks into
+// words 2 and 3. A transfer only runs where a barrier puts it, so an end mark waits for everything before it (a
+// barrier per pass and dispatch: slow, for finding the work a lost device was running, not for play). The start
+// mark follows the pass's own barrier.
+static int pm_fill;
+// Without any GPU-side marks (no VK_AMD_buffer_marker, no NVIDIA checkpoints, no fill): the marks are kept on the CPU
+// only, at no GPU cost, and a lost device lists those of the oldest submission the timeline had not reached
+// (vk_sync_fence_done): the work the GPU was stuck in is among them. TOTK_PASS_CRUMBS=0 turns it off.
+static int pm_cpu;
 static PFN_vkCmdSetCheckpointNV set_checkpoint;
 static void pass_marks_init(VkCtx *c);
 
@@ -46,8 +55,28 @@ static void buffer_init(VkCtx *c) {
     rt_log("vk: GPU breadcrumbs on (VK_AMD_buffer_marker)");
 }
 
+static void fill_buffer_init(VkCtx *c) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 16,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                  .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+    VmaAllocationInfo info;
+    if (vmaCreateBuffer(c->vma, &bi, &ai, &buf, &alloc, &info) != VK_SUCCESS) {
+        rt_log("vk: pass marks through vkCmdFillBuffer unavailable (no host-visible buffer)");
+        return;
+    }
+    words = info.pMappedData;
+    words[0] = words[1] = words[2] = words[3] = 0;
+    pm_fill = 1;
+}
+
 void vk_crumbs_init(VkCtx *c) {
     if (c->has_buffer_marker) buffer_init(c);
+    else {
+        const char *e = cfg_get("TOTK_PASS_CRUMBS");
+        if (e && !strcmp(e, "fill")) fill_buffer_init(c);
+    }
     pass_marks_init(c);
 }
 
@@ -55,7 +84,7 @@ void vk_crumbs_release(void) {
     VkCtx *c = vk_ctx();
     if (buf && c) vmaDestroyBuffer(c->vma, buf, alloc);
     buf = VK_NULL_HANDLE, alloc = NULL, words = NULL, write_marker = NULL;
-    vk_pass_marks_on = pm_amd = 0, set_checkpoint = NULL;
+    vk_pass_marks_on = pm_amd = pm_fill = pm_cpu = 0, set_checkpoint = NULL;
 }
 
 void vk_crumb(VkCommandBuffer cb, int kind, uint64_t n) {
@@ -105,8 +134,14 @@ static void pass_marks_init(VkCtx *c) {
     set_checkpoint = c->has_nv_checkpoints
                          ? (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(c->device, "vkCmdSetCheckpointNV") : NULL;
     pm_amd = !off && write_marker && words;
-    vk_pass_marks_on = pm_amd || set_checkpoint;
-    if (vk_pass_marks_on)
+    pm_cpu = !off && !pm_amd && !pm_fill && !set_checkpoint;
+    vk_pass_marks_on = pm_amd || pm_fill || set_checkpoint || pm_cpu;
+    if (pm_cpu)
+        rt_log("vk: pass marks on the CPU only (no GPU marks on this driver): a lost device lists the passes and "
+               "dispatches of the oldest unfinished submission (TOTK_PASS_CRUMBS=0 turns them off)");
+    else if (pm_fill)
+        rt_log("vk: pass marks on (vkCmdFillBuffer, TOTK_PASS_CRUMBS=fill: a barrier per pass and dispatch, slow)");
+    else if (vk_pass_marks_on)
         rt_log("vk: pass marks on (%s%s%s; TOTK_PASS_CRUMBS=0 turns them off%s)", pm_amd ? "VK_AMD_buffer_marker" : "",
                pm_amd && set_checkpoint ? " and " : "", set_checkpoint ? "VK_NV_device_diagnostic_checkpoints" : "",
                set_checkpoint ? "" : ", =1 adds NVIDIA checkpoints where the driver has them");
@@ -116,6 +151,21 @@ static void pass_marks_init(VkCtx *c) {
 }
 
 void vk_pass_mark_cmd(VkCommandBuffer cb, uint32_t id, int end) {
+    if (pm_cpu) return;   // the ring record is the mark
+    if (pm_fill) {
+        if (end) {   // after everything recorded before it
+            VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                   .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                   .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                   .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                   .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+            VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                   .pMemoryBarriers = &mb};
+            vkCmdPipelineBarrier2(cb, &di);
+        }
+        vkCmdFillBuffer(cb, buf, end ? 12 : 8, 4, id);
+        return;
+    }
     if (pm_amd)
         write_marker(cb, end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, buf,
                      end ? 12 : 8, id);
@@ -137,7 +187,7 @@ void vk_pass_mark_end(VkCommandBuffer cb, const VkPassMark *m) {
 }
 
 int vk_pass_marks_read(uint32_t *started, uint32_t *finished) {
-    if (!pm_amd) return 0;
+    if (!pm_amd && !pm_fill) return 0;
     *started = words[2], *finished = words[3];
     return 1;
 }
@@ -253,12 +303,86 @@ static void nv_report(void) {
     log_lines(t);
 }
 
+// Marks first..last (fence 0: of any submission), runs of alike marks (same kind, size, formats, draw count and
+// shaders) one line each: a stuck submission can hold a thousand small passes of a few kinds, and the odd one out is
+// what to look at.
+static void list_marks(uint32_t first, uint32_t last, uint64_t want) {
+    char t[640];
+    uint32_t lines = 0, run_from = 0, run_n = 0;
+    const VkPassMark *prev = NULL;
+    for (uint32_t id = first; id && id <= last + 1; id++) {
+        const VkPassMark *m = id <= last ? vk_pass_mark_record(id) : NULL;
+        if (m && want && m->fence != want) continue;
+        int alike = m && prev && m->kind == prev->kind && m->w == prev->w && m->h == prev->h && m->d == prev->d &&
+                    m->ncolor == prev->ncolor && m->depth == prev->depth && m->draws == prev->draws &&
+                    m->first[0] == prev->first[0] && m->first[1] == prev->first[1] &&
+                    !memcmp(m->color, prev->color, sizeof m->color);
+        if (alike) {
+            run_n++;
+            continue;
+        }
+        if (prev) {
+            describe_mark(run_from, t, sizeof t);
+            if (run_n > 1)
+                rt_log("vk:   marks %u-%u (%u alike): %s", (unsigned)run_from, (unsigned)(run_from + run_n - 1),
+                       (unsigned)run_n, t);
+            else
+                rt_log("vk:   mark %u: %s", (unsigned)run_from, t);
+            if (++lines >= 200) {
+                rt_log("vk:   ... (200 lines shown)");
+                return;
+            }
+        }
+        if (!m) break;
+        prev = m, run_from = id, run_n = 1;
+    }
+}
+
+static volatile uint32_t part_done;   // TOTK_PART_WAIT: every mark up to this one finished
+
+uint32_t vk_pass_marks_seq(void) { return __atomic_load_n(&seq, __ATOMIC_ACQUIRE); }
+void vk_pass_marks_part_done(uint32_t s) { __atomic_store_n(&part_done, s, __ATOMIC_RELEASE); }
+
+// The marks of the oldest submission the GPU had not finished, in the order they were recorded; with TOTK_PART_WAIT,
+// only those after the last part that finished.
+static void cpu_report(void) {
+    uint64_t done = vk_sync_fence_done(), want = done + 1;
+    uint32_t first = seq > VK_PASS_MARKS - 1 ? seq - (VK_PASS_MARKS - 1) : 1, n = 0, later = 0;
+    uint32_t pd = __atomic_load_n(&part_done, __ATOMIC_ACQUIRE);
+    if (pd) {
+        rt_log("vk: pass marks (TOTK_PART_WAIT): every mark up to %u finished; the GPU stopped in marks %u-%u",
+               (unsigned)pd, (unsigned)pd + 1, (unsigned)seq);
+        if (pd + 1 > first) first = pd + 1;
+    }
+    for (uint32_t id = first; id && id <= seq; id++) {
+        const VkPassMark *m = vk_pass_mark_record(id);
+        if (!m) continue;
+        if (m->fence == want) n++;
+        else if (m->fence > want) later++;
+    }
+    rt_log("vk: pass marks (CPU only): submissions done up to %llu; submission %llu, the oldest unfinished, has %u "
+           "passes and dispatches (%u more in later submissions):", (unsigned long long)done, (unsigned long long)want,
+           n, later);
+    list_marks(first, seq, want);
+}
+
+// TOTK_PART_WAIT (vk_sync.c): a part did not finish in time. Its marks, after the last part that did.
+void vk_pass_marks_part_hung(uint32_t from, uint32_t to, uint64_t fence) {
+    rt_log("vk: pass marks (TOTK_PART_WAIT): a part of submission %llu did not finish; marks up to %u had finished, "
+           "the part holds marks %u-%u:", (unsigned long long)fence, (unsigned)from, (unsigned)from + 1, (unsigned)to);
+    list_marks(from + 1, to, 0);
+}
+
 void vk_pass_marks_report(void) {
     if (!vk_pass_marks_on) return;
+    if (pm_cpu) {
+        cpu_report();
+        return;
+    }
     uint32_t started, finished;
     char t[2048];
     if (vk_pass_marks_read(&started, &finished)) {
-        vk_pass_marks_format("VK_AMD_buffer_marker", started, finished, t, sizeof t);
+        vk_pass_marks_format(pm_fill ? "vkCmdFillBuffer" : "VK_AMD_buffer_marker", started, finished, t, sizeof t);
         log_lines(t);
     }
     nv_report();

@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -363,6 +364,21 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
     return cb;
 }
 
+// TOTK_PART_WAIT=1: each part is submitted with part_fence and waited for, at most 5 s, without the queue lock (a
+// present or an upload batch may need it meanwhile). Slow; for naming the part a lost device hung in.
+static VkFence part_fence;
+static int part_wait_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_PART_WAIT");
+        on = e && *e && strcmp(e, "0");
+        VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (on && vkCreateFence(vk_ctx()->device, &fi, NULL, &part_fence) != VK_SUCCESS) on = 0;
+        if (on) rt_log("vk: TOTK_PART_WAIT: every submitted part is waited for, at most 5 s (slow; for a lost device)");
+    }
+    return on;
+}
+
 VkCommandBuffer vk_sync_split(void) {
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
@@ -376,13 +392,28 @@ VkCommandBuffer vk_sync_split(void) {
                         .pCommandBufferInfos = pro ? cbi : cbi + 1};
     ts_submitted();
     vk_queue_lock();
-    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
+    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, part_wait_on() ? part_fence : VK_NULL_HANDLE);
     vk_queue_unlock();
     if (r != VK_SUCCESS) {
         vk_device_fault_report(r);
         rt_fatal("vk: vkQueueSubmit2 of a part of value %llu failed (%d)", (unsigned long long)cur_fence, (int)r);
     }
     vk_mem_note_submit(cur_fence);   // objects destroyed from here on may be in use by the part just submitted
+    if (part_wait_on()) {   // TOTK_PART_WAIT=1: the part is waited for, so a lost device names it (vk_crumbs.c)
+        static uint32_t last_ok;
+        uint32_t mseq = vk_pass_marks_seq();
+        VkResult w = vkWaitForFences(c->device, 1, &part_fence, VK_TRUE, 5000000000ull);
+        if (w == VK_SUCCESS) {
+            vkResetFences(c->device, 1, &part_fence);
+            vk_pass_marks_part_done(mseq);
+            last_ok = mseq;
+        } else {
+            vk_pass_marks_part_hung(last_ok, mseq, cur_fence);
+            vk_device_fault_report(w);
+            rt_fatal("vk: TOTK_PART_WAIT: a part of submission %llu did not finish in 5 s (%d)",
+                     (unsigned long long)cur_fence, (int)w);
+        }
+    }
     CmdSlot *s = take_slot(c, cur_fence);   // the submitted part keeps its slot until the value is reached
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};

@@ -41,9 +41,15 @@ void vk_caps_driver(VkPhysicalDevice p) {
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
     vkGetPhysicalDeviceProperties2(p, &p2);
     vk_caps.amd = p2.properties.vendorID == 0x1002;
+    vk_caps.mali = p2.properties.vendorID == 0x13B5;
     // AMD split RDNA 1 and 2 off into a driver branch of their own; its driverInfo reads
     // "26.10.1 (AMD proprietary shader compiler)" where the RDNA 3 and 4 driver names LLPC.
     vk_caps.amd_sc = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && strstr(drv.driverInfo, "shader compiler");
+}
+
+int vk_caps_tiler_opt(const char *name) {
+    const char *e = cfg_get(name);
+    return e && *e ? strcmp(e, "0") != 0 : vk_caps.mali;
 }
 
 // TOTK_GPL=0/1 forces graphics pipeline libraries off or on. Default off on AMD's RDNA 1/2 driver branch: every boot
