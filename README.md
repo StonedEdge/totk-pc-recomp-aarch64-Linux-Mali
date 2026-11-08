@@ -2,6 +2,13 @@
 
 **TotK Recomp** is a static recompilation of *The Legend of Zelda: Tears of the Kingdom* (Nintendo Switch, 2023) into a native x86-64 application for Windows and Linux ([docs/architecture.md](docs/architecture.md)).
 
+> [!NOTE]
+> **This fork: aarch64 Linux on Mali-G610 (RK3588).** The `mali` branch adds what TotK Recomp needs on an Arm handheld
+> (tested on a Retro Lite CM5 with Arm's Mali Vulkan driver, game 1.2.1): the setup on aarch64, Vulkan changes for
+> Mali's tile-based GPU, scheduling for CPUs with fast and slow cores, and an optional mod that lowers the game's CPU
+> load. About 30 fps at 720p in light views and 28-29 fps moving through woods. Setup, settings and known issues:
+> [docs/mali.md](docs/mali.md). Based on upstream 0.3.4; nothing here is sent upstream automatically.
+
 > [!IMPORTANT]
 > **No game files are included.** You need your own legally obtained copy of *Tears of the Kingdom*, dumped from your own console: the base game and the 1.1.0, 1.2.1 or 1.4.3 update. Instructions for obtaining those files will not be provided.
 >
