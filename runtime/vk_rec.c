@@ -17,10 +17,17 @@
 
 #define RING_WORDS (1u << 21)   // 16 MiB: a part of a submission is ~1-2 MiB of packets in the town
 static uint64_t ring[RING_WORDS];
-static volatile uint64_t head, tail;   // words published by the producer / consumed by the recorder
-static volatile int32_t sleeping;         // the recorder waits for wake_ev
+// The queue state, a cache line per writer (as upstream TotK Recomp's vk_rec.c Q). The recorder spins on head while it
+// waits for packets, so a line the producer writes on every packet and the recorder reads goes back and forth between
+// their cores each time: with head, tail, sleeping and put_h in one line, handing packets over took 6% of the replay
+// thread in upstream's measurement.
+static struct {
+    _Alignas(64) volatile uint64_t head;      // words published by the producer; the recorder reads it
+    _Alignas(64) volatile uint64_t tail;      // words consumed by the recorder; the producer reads it
+    _Alignas(64) volatile int32_t sleeping;   // the recorder waits for wake_ev
+    _Alignas(64) uint64_t put_h;              // producer only: words written (published up to head)
+} Q;
 static PlatEvent wake_ev;              // auto-reset
-static uint64_t put_h;                 // producer: words written (published up to head)
 static VkCommandBuffer rec_cb;         // producer: the part being recorded
 static VkCommandBuffer exec_cb;        // recorder: the command buffer its calls go into (rec_begin, R_EndSubmit)
 static uint64_t sub_h;                 // producer: put_h after the last R_EndSubmit (rec_wait_submitted)
@@ -73,19 +80,19 @@ static void rec_main(void *arg) {
     plat_thread_priority(rec_prio);
     uint64_t t = 0;
     for (;;) {
-        uint64_t h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+        uint64_t h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
         if (t == h) {
             if (rec_spin_ns) {
                 for (uint64_t t0 = now_ns(); t == h && now_ns() - t0 < rec_spin_ns;)
-                    for (int i = 0; i < 64 && t == h; i++) plat_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+                    for (int i = 0; i < 64 && t == h; i++) plat_pause(), h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
             } else {
-                for (int i = 0; i < 4096 && t == h; i++) plat_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+                for (int i = 0; i < 4096 && t == h; i++) plat_pause(), h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
             }
             if (t == h) {
-                __atomic_store_n(&sleeping, 1, __ATOMIC_SEQ_CST);
-                h = __atomic_load_n(&head, __ATOMIC_SEQ_CST);
+                __atomic_store_n(&Q.sleeping, 1, __ATOMIC_SEQ_CST);
+                h = __atomic_load_n(&Q.head, __ATOMIC_SEQ_CST);
                 if (t == h) plat_event_wait_ns(&wake_ev, 2000000);   // a missed wake costs at most 2 ms
-                __atomic_store_n(&sleeping, 0, __ATOMIC_RELAXED);
+                __atomic_store_n(&Q.sleeping, 0, __ATOMIC_RELAXED);
                 continue;
             }
         }
@@ -97,9 +104,9 @@ static void rec_main(void *arg) {
             uint32_t op = (uint32_t)(w & 0xffff), n = (uint32_t)(w >> 32);
             if (op != R_PAD) exec_packet(op, &ring[t % RING_WORDS + 1]);
             t += n;
-            if ((k & 63) == 63) __atomic_store_n(&tail, t, __ATOMIC_RELEASE);
+            if ((k & 63) == 63) __atomic_store_n(&Q.tail, t, __ATOMIC_RELEASE);
         }
-        __atomic_store_n(&tail, t, __ATOMIC_SEQ_CST);   // seq_cst with the drain_wait load (wait_tail)
+        __atomic_store_n(&Q.tail, t, __ATOMIC_SEQ_CST);   // seq_cst with the drain_wait load (wait_tail)
         if (__atomic_load_n(&drain_wait, __ATOMIC_SEQ_CST)) plat_event_set(&drain_ev);
     }
     return;
@@ -109,42 +116,42 @@ static void rec_main(void *arg) {
 
 static void wake(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) woke_h = put_h, plat_event_set(&wake_ev);
+    if (__atomic_load_n(&Q.sleeping, __ATOMIC_RELAXED)) woke_h = Q.put_h, plat_event_set(&wake_ev);
 }
 
 static void wait_space(uint64_t need) {
-    if (put_h + need - __atomic_load_n(&tail, __ATOMIC_ACQUIRE) <= RING_WORDS) return;
+    if (Q.put_h + need - __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE) <= RING_WORDS) return;
     RS_.full_waits++;
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
+    __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
     wake();
-    while (put_h + need - __atomic_load_n(&tail, __ATOMIC_ACQUIRE) > RING_WORDS) plat_pause();
+    while (Q.put_h + need - __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE) > RING_WORDS) plat_pause();
 }
 
 // Room for a packet of bytes of arguments; the caller fills it and calls pub().
 static void *put(uint32_t op, size_t bytes) {
-    uint64_t n = 1 + (bytes + 7) / 8, pos = put_h % RING_WORDS;
+    uint64_t n = 1 + (bytes + 7) / 8, pos = Q.put_h % RING_WORDS;
     if (n > RING_WORDS / 4) rt_fatal("vk_rec: a packet of %llu bytes", (unsigned long long)bytes);
     if (pos + n > RING_WORDS) {
         uint64_t pad = RING_WORDS - pos;
         wait_space(pad);
         ring[pos] = (uint64_t)R_PAD | pad << 32;
-        put_h += pad, pos = 0;
+        Q.put_h += pad, pos = 0;
     }
     wait_space(n);
     ring[pos] = (uint64_t)op | n << 32;
     // Packers reserve room for optional arrays they may leave unwritten (BeginRendering's depth and stencil); with
     // TOTK_REC_CHECK those words would still hold handles from the ring's previous lap.
     if (rec_chk) memset(&ring[pos + 1], 0, (n - 1) * 8);
-    put_h += n;
+    Q.put_h += n;
     RS_.packets++, RS_.words += n;
     return &ring[pos + 1];
 }
 
 static void pub(void) {
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
-    if (!__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) return;
-    if (rec_wake_words && put_h - woke_h < rec_wake_words) return;   // batched (TOTK_REC_WAKE_WORDS)
-    woke_h = put_h;
+    __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
+    if (!__atomic_load_n(&Q.sleeping, __ATOMIC_RELAXED)) return;
+    if (rec_wake_words && Q.put_h - woke_h < rec_wake_words) return;   // batched (TOTK_REC_WAKE_WORDS)
+    woke_h = Q.put_h;
     plat_event_set(&wake_ev);
 }
 
@@ -152,7 +159,7 @@ static void pub(void) {
 // time, so a missed set costs no more.
 static void wait_tail(uint64_t target, int ge) {
     for (int i = 0;; i++) {
-        uint64_t t = __atomic_load_n(&tail, __ATOMIC_ACQUIRE);
+        uint64_t t = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE);
         if (ge ? t >= target : t == target) return;
         if (!rec_drain_sleep) {
             if (i < 20000) plat_pause();
@@ -164,18 +171,18 @@ static void wait_tail(uint64_t target, int ge) {
             continue;
         }
         __atomic_store_n(&drain_wait, 1, __ATOMIC_SEQ_CST);
-        t = __atomic_load_n(&tail, __ATOMIC_SEQ_CST);
+        t = __atomic_load_n(&Q.tail, __ATOMIC_SEQ_CST);
         if (!(ge ? t >= target : t == target)) plat_event_wait_ns(&drain_ev, 200000);
         __atomic_store_n(&drain_wait, 0, __ATOMIC_RELAXED);
     }
 }
 
 void rec_drain(void) {
-    if (!rec_thread || __atomic_load_n(&tail, __ATOMIC_ACQUIRE) == put_h) return;
+    if (!rec_thread || __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE) == Q.put_h) return;
     uint64_t t0 = now_ns();
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
+    __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
     wake();
-    wait_tail(put_h, 0);
+    wait_tail(Q.put_h, 0);
     RS_.drains++, RS_.drain_ns += now_ns() - t0;
 }
 
@@ -224,7 +231,7 @@ void rec_begin(VkCommandBuffer cb, uint64_t fence) {
     if (!RT_KNOB_ON(mode)) return;
     RS_.parts_on++;
     rec_cb = exec_cb = cb;   // the recorder is idle: rec_end drained it
-    __atomic_store_n(&part_h0, put_h, __ATOMIC_RELEASE);
+    __atomic_store_n(&part_h0, Q.put_h, __ATOMIC_RELEASE);
     __atomic_store_n(&part_fence, fence, __ATOMIC_RELEASE);
     rec_live = 1;
 }
@@ -275,10 +282,10 @@ int rec_split_async(VkCommandBuffer cb, VkCommandBuffer next, uint64_t fence) {
     if (!rec_live || cb != rec_cb || !end_mode) return 0;
     A_EndSubmit *a = put(R_EndSubmit, sizeof *a);
     *a = (A_EndSubmit){next, fence};
-    sub_h = put_h;
+    sub_h = Q.put_h;
     pub();
     rec_cb = next;
-    __atomic_store_n(&part_h0, put_h, __ATOMIC_RELEASE);
+    __atomic_store_n(&part_h0, Q.put_h, __ATOMIC_RELEASE);
     RS_.async_parts++;
     return 1;
 }
@@ -286,9 +293,9 @@ int rec_split_async(VkCommandBuffer cb, VkCommandBuffer next, uint64_t fence) {
 // Waits until the recorder submitted every part rec_split_async handed it (before a submission of uploads that must
 // come after them in queue order).
 void rec_wait_submitted(void) {
-    if (!rec_thread || __atomic_load_n(&tail, __ATOMIC_ACQUIRE) >= sub_h) return;
+    if (!rec_thread || __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE) >= sub_h) return;
     uint64_t t0 = now_ns();
-    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
+    __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
     wake();
     wait_tail(sub_h, 1);
     RS_.sub_waits++, RS_.sub_wait_ns += now_ns() - t0;
@@ -324,7 +331,7 @@ static const char *const kind_name[REC_KINDS] = {"image", "view", "buffer"};
 static volatile int32_t chk_seen[2], chk_named, chk_logged, chk_hz[2][2][REC_KINDS][64];   // [destroy][made][kind][op]
 void rec_check_handle(int kind, uint64_t handle, int destroy, uint64_t tl, uint64_t gpu) {
     if (!rec_chk || !handle || kind < 0 || kind >= REC_KINDS || !__atomic_load_n(&rec_live, __ATOMIC_RELAXED)) return;
-    uint64_t h = __atomic_load_n(&head, __ATOMIC_ACQUIRE), p = __atomic_load_n(&part_h0, __ATOMIC_ACQUIRE);
+    uint64_t h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE), p = __atomic_load_n(&part_h0, __ATOMIC_ACQUIRE);
     uint64_t fence = __atomic_load_n(&part_fence, __ATOMIC_ACQUIRE);
     if (p > h || h - p > RING_WORDS / 2) return;   // a part this large is not searched
     plat_inc32(&chk_seen[destroy != 0]);
@@ -335,7 +342,7 @@ void rec_check_handle(int kind, uint64_t handle, int destroy, uint64_t tl, uint6
         if (op != R_PAD)
             for (uint32_t i = 1; i < n; i++) {
                 if (ring[(p + i) % RING_WORDS] != handle) continue;
-                int made = p < __atomic_load_n(&tail, __ATOMIC_ACQUIRE);
+                int made = p < __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE);
                 if (!destroy && tl >= fence) { plat_inc32(&chk_named); return; }
                 plat_inc32(&chk_hz[destroy][made][kind][op & 63]);
                 if (plat_inc32(&chk_logged) <= 64)
