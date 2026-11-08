@@ -24,7 +24,7 @@ enum {
 
 // One render target of OP_SET_RT, resolved to its vk_texture.c image for the current command buffer.
 typedef struct {
-    const tex_t *tex;                    // payload copy (lives for the run); NULL: no target in this slot
+    const tex_t *tex;                    // texture pin of ex->rt (nvn_pins_sweep keeps it); NULL: no target in this slot
     VkImage image;                       // VK_NULL_HANDLE: no target or not renderable (logged once)
     VkFormat format;                     // view format: the view's when it reinterprets a same-size format
     VkImageViewType view_type;           // 2D, or 2D_ARRAY for more than one layer
@@ -147,6 +147,12 @@ void vk_exec_pass_end(VkExec *ex);
 // Full memory barrier (all commands, all memory); ends the open pass first. Copies and dispatches order themselves with
 // it. Skipped when nothing was recorded since the last one.
 void vk_exec_barrier(VkExec *ex);
+// UpdateUniformBuffer overlays (vk_exec_draw.c): the copies into the real buffers that updates inside a pass left for
+// the next barrier (barrier_to records them first), and a GPU write of another kind into [addr, addr+n) of this
+// submission (a copy, a fill, a storage write), which retires the overlays it touches.
+void vk_exec_ub_flush(VkExec *ex);
+void vk_exec_ub_foreign(VkExec *ex, uint64_t addr, uint64_t n);
+void vk_exec_ub_perf(void);
 // vk_texture.c (TOTK_TEX_ALIAS): commands that must run at the replay's current position. vk_exec_inline_begin returns
 // the command buffer being recorded after a full barrier (an open pass is ended; *reopen says so), or VK_NULL_HANDLE
 // when this thread is not recording a replay. vk_exec_inline_end begins the pass again when it was open.
@@ -167,8 +173,9 @@ void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info);
 // Scissor 0 clipped to the render area of the open pass; extent 0: nothing to draw.
 VkRect2D vk_exec_scissor(const VkExec *ex);
 void vk_exec_noatt_dims(const VkExec *ex, uint32_t *w, uint32_t *h);   // pass size when no attachment is set
-// 1: every target of the current pass (any 1: at least one) was rendered in the previous presented frame (per-frame
-// targets); 0 otherwise, or when the pass has none.
+// 1: every target of the current pass (any 1: at least one, and not only the depth target while a colour target is
+// rendered for the first time) was rendered in the previous presented frame (per-frame targets); 0 otherwise, or when
+// the pass has none.
 int vk_exec_targets_recent(VkExec *ex, int any);
 // The current pass's targets with their formats, extents and the frames they were last rendered in (diagnostics).
 void vk_exec_targets_describe(VkExec *ex, char *buf, size_t cap);
@@ -213,6 +220,10 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
 // vk_exec_xfer.c: OP_COPY_B2B, OP_COPY_B2T, OP_COPY_T2B, OP_COPY_T2T, OP_CLEAR_TEX, OP_SIGNAL_EVENT, OP_REPORT_COUNTER,
 // OP_RESET_COUNTER, OP_RENDER_ENABLE, OP_RENDER_COND, OP_CLEAR_BUF.
 void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload);
+// vk_dlaa.c: once DLSS has scaled the scene this frame, passes larger than the scene's light target vk_dlaa_swap_img
+// sample DLSS's output vk_dlaa_swap_view in its place, so the game's scaling draw scales DLSS's picture.
+extern const VkTexImage *vk_dlaa_swap_img;
+extern VkImageView vk_dlaa_swap_view;
 // vk_contact.c: a pass about to begin (its targets resolved, no pass open), and a dispatch or copy about to be recorded
 void vk_contact_pass_begin(VkExec *ex);
 void vk_contact_flush(VkExec *ex);

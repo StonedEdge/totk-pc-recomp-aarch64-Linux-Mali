@@ -1,7 +1,7 @@
 # TotK Recomp on Mali-G610 (RK3588), aarch64 Linux
 
 The `mali` branch of this fork runs TotK Recomp on an Arm handheld: a Retro Lite CM5 (Rockchip RK3588, Mali-G610 MP4,
-4 Cortex-A76 + 4 Cortex-A55). It is upstream 0.3.4 with the changes below. Everything else in this repository's
+4 Cortex-A76 + 4 Cortex-A55). It is upstream 0.3.13 with the changes below (the `mali` branch has the same work on 0.3.4). Everything else in this repository's
 documentation still applies; this page is only what differs on this hardware.
 
 > [!NOTE]
@@ -57,6 +57,7 @@ compare:
 | two-speed CPUs (aarch64) | `TOTK_SLOW_BG=0` | Background threads moved to the slow cores |
 | two-speed CPUs (aarch64) | `TOTK_REC_SPIN_US` (20) | How long the command recorder spins before it sleeps (200 elsewhere) |
 | all | `TOTK_REC_DRAIN_SLEEP=0`, `TOTK_PACE_SPIN_US=0` | The render thread sleeps instead of yielding while it waits |
+| all | `TOTK_SPLIT_ASYNC=0` | A split submission's parts are handed to the recorder without waiting for it |
 
 Vertex shaders that write storage buffers run as compute shaders where the driver lacks
 `vertexPipelineStoresAndAtomics` (the Mali blob): without it Ultra Hand cannot grab anything.
@@ -75,6 +76,12 @@ python3 tools/make_lod_mod.py --romfs build/extracted/<version>/romfs --out <ins
 It needs Python with `compression.zstd` (3.14) or the `zstandard` package. The mod loads at the next start; switch it
 off in the menu's Mods tab, with `TOTK_MODS_DISABLED=LessActorWork`, or by deleting its folder.
 `tools/find_params.py` lists the game's other distance and detail parameters.
+
+## Profile-guided optimisation (PGO)
+
+Upstream's PGO build mode (`tools/build_game.py --pgo`, `tools/pgo.py`) works here too: an instrumented build is
+played for a while, its profile merged, and the game code compiled again with it, so hot paths are laid out together
+and branches predicted from real play. Every setting of the fork is in [settings.md](settings.md).
 
 ## Diagnostics
 

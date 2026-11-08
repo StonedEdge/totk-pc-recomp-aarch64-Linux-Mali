@@ -1,11 +1,12 @@
-// The recorder thread (vk_rec.c): the Vulkan calls the replay makes into its command buffer are made by a thread of
-// their own. vk_sync.c brackets each part of a submission with rec_begin (after vkBeginCommandBuffer) and rec_end
-// (before vkEndCommandBuffer). In between, every vkCmd* on that command buffer copies its arguments into a packet of a
-// ring, in call order, and the recorder makes the real call in that order; calls into any other command buffer (uploads,
-// the window, probes) are made at once. A call the ring has no packet for (a structure with a pNext chain) waits for
-// the recorder to empty the ring and is then made at once on the calling thread. rec_end returns once the recorder made
-// every call. vk_sync.c ends a part through rec_end_cb: the recorder makes the last calls into a part it recorded,
-// vkEndCommandBuffer included; submitting and the command pool stay on the submitting thread.
+// The recorder thread (vk_rec.c): the Vulkan calls the replay makes into its command buffers are made by a thread of
+// their own. vk_sync.c begins each part of a submission (and the mirror prologue) with rec_begin, ends it with
+// rec_end_cb and submits it with rec_submit. In between, every vkCmd* on that command buffer copies its arguments
+// into a packet of a ring, in call order, and the recorder makes the real call in that order; calls into any other
+// command buffer (uploads, the window, probes) are made at once. A call the ring has no packet for (a structure with a
+// pNext chain) waits for the recorder to empty the ring and is then made at once on the calling thread. With
+// TOTK_REC_END=1 (default) the recorder also begins, ends and submits the parts it records, so a part's command buffer
+// never changes threads; rec_submit returns once the recorder submitted it. The submitting thread allocates from the
+// part pool only while the recorder is idle (vk_sync.c claim_slot).
 //
 // Every vkCmd* the runtime calls through vk.h goes through the rc_* wrappers below (the macros at the end); the
 // extension commands called through function pointers have rec_* wrappers of their own. TOTK_VK_RECORDER=0 makes every
@@ -15,18 +16,21 @@
 // MIT, Copyright (c) 2026 Peiikai): the driver's work behind the commands depends on nothing the replay decides next.
 #pragma once
 
-void rec_begin(VkCommandBuffer cb, uint64_t fence);   // the submitting thread, sub_lock held; fence: the part's value
+// The submitting thread, sub_lock held: vkBeginCommandBuffer (one submission) on cb and the breadcrumb crumb (0: none,
+// vk_crumbs.c) with number n, made by the recorder when it records the part, else at once; fence: the part's value.
+void rec_begin(VkCommandBuffer cb, uint64_t fence, int crumb, uint64_t n);
 void rec_end(void);                   // waits for the recorder; no-op when rec_begin did not start it
-// The end of part cb: the breadcrumb crumb (0: none, vk_crumbs.c), then vkEndCommandBuffer, both made by the recorder
-// when it records cb, and the wait for it (1); otherwise rec_end and the breadcrumb, and the caller ends cb (0).
+// The end of part cb: the breadcrumb crumb, then vkEndCommandBuffer, both queued for the recorder when it records cb
+// (1: rec_submit hands the part over); otherwise rec_end and the breadcrumb, and the caller ends cb (0).
 int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n);
+// vkQueueSubmit2 of si (at most two command buffers, one signal, no wait, no fence) under vk_queue_lock: by the
+// recorder after a part it ended, waited for, else at once.
+VkResult rec_submit(const VkSubmitInfo2 *si);
 void rec_drain(void);                 // waits until the recorder made every call queued so far
-// TOTK_SPLIT_ASYNC (vk_sync.c): the recorder ends cb, submits it (vk_sync_part_submit) and begins next; 0 when it does
-// not record cb. rec_wait_submitted: until it submitted every such part. rec_owns: cb is the part it records.
-int rec_split_async(VkCommandBuffer cb, VkCommandBuffer next, uint64_t fence);
+// TOTK_SPLIT_ASYNC (vk_sync.c vk_sync_split): rec_submit_async hands a part the recorder ended to it without waiting;
+// rec_wait_submitted waits until it submitted every such part.
+void rec_submit_async(const VkSubmitInfo2 *si);
 void rec_wait_submitted(void);
-int rec_owns(VkCommandBuffer cb);
-void vk_sync_part_submit(VkCommandBuffer cb, uint64_t fence);   // vk_sync.c, on the recorder thread
 void rec_stats_log(void);             // TOTK_TRACE=perf: packets, bytes, drains and waits since the last call
 // TOTK_REC_CHECK=1 (debug, recorder on): vk_memory.c reports each object it defers (destroy 0, stamped tl) or destroys
 // (destroy 1) with the value the GPU reached (gpu); a packet of the part being recorded that still names it is logged
@@ -86,6 +90,7 @@ void rec_pass_mark(VkCommandBuffer cb, uint32_t id, int end);
     X(EndRendering, (VkCommandBuffer cb), (cb))                                                                          \
     X(FillBuffer, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkDeviceSize n, uint32_t v), (cb, b, o, n, v))        \
     X(PipelineBarrier2, (VkCommandBuffer cb, const VkDependencyInfo *di), (cb, di))                                      \
+    X(ExecuteCommands, (VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *c), (cb, n, c))                           \
     X(PushConstants, (VkCommandBuffer cb, VkPipelineLayout l, VkShaderStageFlags st, uint32_t o, uint32_t n,             \
                       const void *v), (cb, l, st, o, n, v))                                                              \
     X(ResetQueryPool, (VkCommandBuffer cb, VkQueryPool p, uint32_t f, uint32_t n), (cb, p, f, n))                        \
@@ -125,6 +130,7 @@ REC_CMDS(REC_DECL)
 #define vkCmdBindPipeline rc_vkCmdBindPipeline
 #define vkCmdBindVertexBuffers2 rc_vkCmdBindVertexBuffers2
 #define vkCmdBlitImage rc_vkCmdBlitImage
+#define vkCmdExecuteCommands rc_vkCmdExecuteCommands
 #define vkCmdClearAttachments rc_vkCmdClearAttachments
 #define vkCmdClearColorImage rc_vkCmdClearColorImage
 #define vkCmdClearDepthStencilImage rc_vkCmdClearDepthStencilImage

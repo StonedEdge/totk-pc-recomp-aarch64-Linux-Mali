@@ -686,6 +686,133 @@ __attribute__((noinline)) static void crash_from_runtime(const char *what, uint3
     crash_fn(&c);
 }
 
+// The name a DLL records for itself in its export directory ("amdvlk64.dll"). Read from its mapped headers, not through
+// the loader, whose lock another thread may hold when the process crashes.
+static const char *image_name(const char *base) {
+    const IMAGE_NT_HEADERS64 *nt = (const void *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY *d = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!d->VirtualAddress || !d->Size) return "unnamed module";
+    return base + ((const IMAGE_EXPORT_DIRECTORY *)(base + d->VirtualAddress))->Name;
+}
+
+// The return addresses on the crashed thread's stack, innermost first, with their modules: unwinds the faulting context
+// with the x64 unwind tables; a function without a table entry (a leaf, or address 0 after a call through a null
+// pointer) has its return address on top of the stack. The walk stops at return address 0 (the thread's first frame)
+// and when the stack pointer leaves the thread's stack, so a damaged stack ends it instead of faulting. A driver can
+// nest deeper than the report holds, so frames in other modules stop being kept after the first 12 (counted in
+// frames_left_out) and the frames in this executable, which name the host call that ran into the driver, still fit.
+static void frames_of(const CONTEXT *at, PlatCrash *x) {
+    enum { MAX = sizeof x->frames / sizeof *x->frames, OTHER_MAX = 12 };
+    CONTEXT c = *at;
+    ULONG_PTR low, high;
+    GetCurrentThreadStackLimits(&low, &high);
+    void *exe = GetModuleHandleW(NULL);
+    int other = 0;
+    for (int i = 0; i < 256 && x->nframes < MAX && (c.Rip || !i) && c.Rsp >= low && c.Rsp + 8 <= high; i++) {
+        DWORD64 img;
+        RUNTIME_FUNCTION *fe = RtlLookupFunctionEntry(c.Rip, &img, NULL);
+        if (fe) {
+            void *data;
+            DWORD64 frame;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, img, c.Rip, fe, &c, &data, &frame, NULL);
+        } else {
+            c.Rip = *(const DWORD64 *)c.Rsp;
+            c.Rsp += 8;
+        }
+        if (!c.Rip) break;
+        void *base = NULL;
+        RtlPcToFileHeader((void *)(uintptr_t)c.Rip, &base);
+        if (base != exe && other++ >= OTHER_MAX) {
+            x->frames_left_out++;
+            continue;
+        }
+        int n = x->nframes++;
+        x->frames[n] = (uintptr_t)c.Rip;
+        x->frame_module[n] = base == exe ? NULL : base ? image_name(base) : "";
+        x->frame_offset[n] = (uintptr_t)c.Rip - (uintptr_t)base;
+    }
+}
+
+// MSVC's C++ throw (0xe06d7363) passes the thrown object in ExceptionInformation[1], its ThrowInfo in [2] and the image
+// base the ThrowInfo's 32-bit offsets are relative to in [3] (magic 0x19930520..0x19930522 in [0]). The ThrowInfo lists
+// the types a catch may match, the thrown type first; each type descriptor holds a vtable pointer, a spare pointer and
+// the decorated name. A std::exception keeps its what() text in the pointer right after its vtable pointer (MSVC's
+// __std_exception_data). Every read is checked: the exception may come from a damaged heap.
+typedef struct { uint32_t attributes; int32_t unwind, forward_compat, catchable_types; } CxxThrowInfo;
+typedef struct { uint32_t properties; int32_t type, this_mdisp, this_pdisp, this_vdisp, size, copy; } CxxCatchableType;
+
+// Copies the string at p into buf (cut to n - 1 characters), checking each page before reading it; NULL when the first
+// byte cannot be read.
+static const char *copy_cstr(uintptr_t p, char *buf, size_t n) {
+    size_t i = 0;
+    for (; p && i + 1 < n; i++) {
+        if ((!i || !((p + i) & 4095)) && !plat_mem_readable(p + i, 1)) break;
+        if (!(buf[i] = ((const char *)p)[i])) return buf;
+    }
+    buf[i] = 0;
+    return i ? buf : NULL;
+}
+
+static void cxx_info(const EXCEPTION_RECORD *er, PlatCrash *x) {
+    if (er->NumberParameters < 4 || er->ExceptionInformation[0] - 0x19930520u > 2) return;
+    uintptr_t obj = er->ExceptionInformation[1], info = er->ExceptionInformation[2],
+              base = er->ExceptionInformation[3];
+    if (!info || !plat_mem_readable(info, sizeof(CxxThrowInfo))) return;
+    const CxxThrowInfo *ti = (const void *)info;
+    uintptr_t arr = base + (uintptr_t)(intptr_t)ti->catchable_types;
+    if (!ti->catchable_types || !plat_mem_readable(arr, 4)) return;
+    int32_t n = *(const int32_t *)arr;
+    if (n <= 0 || n > 64 || !plat_mem_readable(arr + 4, 4u * (uint64_t)n)) return;
+    static char type[128], what[256];   // the crash report runs once: crash_fn ends the process
+    int exception = 0;
+    for (int32_t i = 0; i < n; i++) {
+        uintptr_t ct = base + (uintptr_t)(intptr_t)((const int32_t *)(arr + 4))[i];
+        if (!plat_mem_readable(ct, sizeof(CxxCatchableType))) continue;
+        uintptr_t td = base + (uintptr_t)(intptr_t)((const CxxCatchableType *)ct)->type;
+        char name[64];
+        if (!copy_cstr(td + 16, i ? name : type, i ? sizeof name : sizeof type))   // past vtable and spare pointers
+            continue;
+        if (!i) x->cxx_type = type;
+        if (!strcmp(i ? name : type, ".?AVexception@std@@")) exception = 1;
+    }
+    if (exception && obj && plat_mem_readable(obj + 8, 8))
+        x->cxx_what = copy_cstr(*(const uintptr_t *)(obj + 8), what, sizeof what);
+}
+
+// The last-chance filter: an exception no handler took, in any module. crash_veh reports faults in this executable as
+// they happen; this one catches the rest, which used to end the process with no line in the log: a fault in a GPU
+// driver's own thread or in a driver call (vkQueueSubmit, vkAllocateMemory), a C++ exception a library let escape, a
+// call through a null pointer (rip 0, outside every module). Windows calls it only after every handler declined, so
+// the exceptions drivers raise and catch themselves never get here; it costs nothing until a crash.
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    DWORD code = er->ExceptionCode;
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    PlatCrash c = {code == EXCEPTION_ACCESS_VIOLATION        ? "access violation"
+                   : code == EXCEPTION_ILLEGAL_INSTRUCTION   ? "illegal instruction"
+                   : code == EXCEPTION_INT_DIVIDE_BY_ZERO    ? "integer division by zero"
+                   : code == EXCEPTION_PRIV_INSTRUCTION      ? "privileged instruction"
+                   : code == EXCEPTION_STACK_OVERFLOW        ? "stack overflow"
+                   : code == EXCEPTION_IN_PAGE_ERROR         ? "in-page error"
+                   : code == EXCEPTION_BREAKPOINT            ? "breakpoint"
+                   : code == 0xe06d7363u                     ? "C++ exception"
+                   : code == 0xc0000374u                     ? "heap corruption"   // STATUS_HEAP_CORRUPTION
+                                                             : "unhandled exception",
+                   (uint32_t)code, rip, 0, -1, 0};
+    if (code == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+        c.access = (int)er->ExceptionInformation[0], c.addr = er->ExceptionInformation[1];
+    void *base = NULL;
+    RtlPcToFileHeader((void *)rip, &base);
+    uintptr_t exe = (uintptr_t)GetModuleHandleW(NULL);
+    c.offset = rip - (uintptr_t)base;
+    if (!base) c.module = "";
+    else if ((uintptr_t)base != exe) c.module = image_name(base);
+    if (c.module) frames_of(ep->ContextRecord, &c);
+    if (code == 0xe06d7363u) cxx_info(er, &c);
+    crash_fn(&c);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static void abort_signal(int sig) { crash_from_runtime("abort", (uint32_t)sig); }
 
 static void invalid_parameter(const wchar_t *expr, const wchar_t *func, const wchar_t *file, unsigned line,
@@ -697,6 +824,7 @@ static void invalid_parameter(const wchar_t *expr, const wchar_t *func, const wc
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;
     AddVectoredExceptionHandler(0, crash_veh);
+    SetUnhandledExceptionFilter(crash_filter);   // replaces the C runtime's filter; crash_fn never returns
     signal(SIGABRT, abort_signal);
     _set_invalid_parameter_handler(invalid_parameter);
 }
@@ -725,6 +853,14 @@ int plat_mem_read(uint64_t addr, void *out, size_t n) {
     return ReadProcessMemory(GetCurrentProcess(), (const void *)(uintptr_t)addr, out, n, &got) && got == n;
 }
 
+// The display mode's own size: physical pixels whatever the process's DPI awareness and the display scale
+int plat_screen_size(int *w, int *h) {
+    DEVMODEW dm = {.dmSize = sizeof dm};
+    if (!EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) || !dm.dmPelsWidth || !dm.dmPelsHeight) return 0;
+    *w = (int)dm.dmPelsWidth, *h = (int)dm.dmPelsHeight;
+    return 1;
+}
+
 int plat_mem_readable(uint64_t addr, uint64_t n) {
     for (uint64_t a = addr, end = addr + n; a < end || a == addr;) {
         MEMORY_BASIC_INFORMATION mbi;
@@ -741,7 +877,33 @@ void plat_aligned_free(void *p) { _aligned_free(p); }
 
 // ---- process
 
+#ifdef TOTK_PGO_GEN
+// compiler-rt's profile runtime (an instrumented build, tools/build_game.py --pgo gen). It writes its counters from an
+// atexit handler, which ExitProcess skips; __llvm_profile_dump writes them once and makes later writes no-ops.
+int __llvm_profile_dump(void);
+int __llvm_profile_write_file(void);
+void __llvm_profile_reset_counters(void);
+
+// A long played session must not lose its counts to a crash or a reboot: every minute the counters are added to the
+// .profraw (the file merges, -fprofile-generate's %m) and zeroed. Counts taken between the write and the reset are lost.
+static DWORD WINAPI pgo_flush_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        Sleep(60 * 1000);
+        if (__llvm_profile_write_file() == 0) __llvm_profile_reset_counters();
+    }
+}
+
+__attribute__((constructor)) static void pgo_flush_start(void) {
+    HANDLE h = CreateThread(NULL, 0, pgo_flush_thread, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+}
+#endif
+
 void plat_exit(int code) {
+#ifdef TOTK_PGO_GEN
+    __llvm_profile_dump();
+#endif
     fflush(stdout);
     fflush(stderr);
     ExitProcess((UINT)code);
@@ -1305,6 +1467,27 @@ void *plat_lib_open(const char *name) {
 
 void *plat_lib_sym(void *lib, const char *name) { return lib ? (void *)GetProcAddress((HMODULE)lib, name) : NULL; }
 
+void plat_lib_error(char *out, size_t cap) { snprintf(out, cap, "error %lu", GetLastError()); }
+
+int plat_ngx_core_path(char *out, size_t cap) {
+    wchar_t dir[WPATH];
+    DWORD n = sizeof dir;
+    char d[PLAT_PATH_MAX];
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", L"FullPath", RRF_RT_REG_SZ,
+                     NULL, dir, &n) != ERROR_SUCCESS ||
+        !WideCharToMultiByte(CP_UTF8, 0, dir, -1, d, (int)sizeof d, NULL, NULL))
+        return 0;
+    return snprintf(out, cap, "%s\\_nvngx.dll", d) < (int)cap;
+}
+
+int plat_exe_dir_wide(wchar_t *out, size_t cap) {
+    DWORD len = GetModuleFileNameW(NULL, out, (DWORD)cap);
+    if (!len || len >= cap) return 0;
+    while (len && out[len - 1] != L'\\' && out[len - 1] != L'/') len--;
+    out[len] = 0;
+    return len != 0;
+}
+
 // ---- machine load: GetSystemTimes for the CPU, PDH (pdh.dll, loaded on first use) for the thermal zones and the GPU
 // engine and adapter memory counters that Task Manager reads.
 
@@ -1573,6 +1756,56 @@ long plat_child_read(PlatChild *c, void *buf, size_t cap) {
     if (!ReadFile(c->out, buf, (DWORD)cap, &got, NULL)) return -1;
     return (long)got;
 }
+
+// ---- local IPC (platform.h): Discord's Rich Presence named pipe
+struct PlatIpc { HANDLE h; };
+
+PlatIpc *plat_ipc_connect(const char *name) {
+    wchar_t wname[128], path[152];
+    if (!widen(name, wname, 128)) return NULL;
+    swprintf(path, 152, L"\\\\.\\pipe\\%ls", wname);
+    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;   // no listener, or the pipe is busy: the caller retries later
+    PlatIpc *p = malloc(sizeof *p);
+    if (!p) {
+        CloseHandle(h);
+        return NULL;
+    }
+    p->h = h;
+    return p;
+}
+
+int plat_ipc_read(PlatIpc *p, void *buf, size_t n, uint32_t ms) {
+    uint64_t deadline = plat_now_ms() + ms;
+    for (;;) {
+        DWORD have = 0;
+        if (!PeekNamedPipe(p->h, NULL, 0, NULL, &have, NULL)) return -1;   // the writer closed the pipe
+        if (have) {
+            DWORD got = 0;
+            if (!ReadFile(p->h, buf, have < n ? have : (DWORD)n, &got, NULL) || !got) return -1;
+            return (int)got;
+        }
+        if (plat_now_ms() >= deadline) return 0;
+        plat_sleep_ms(5);
+    }
+}
+
+int plat_ipc_write(PlatIpc *p, const void *buf, size_t n) {
+    const uint8_t *at = buf;
+    while (n) {
+        DWORD put = 0;
+        if (!WriteFile(p->h, at, n > (1u << 30) ? 1u << 30 : (DWORD)n, &put, NULL) || !put) return 0;
+        at += put, n -= put;
+    }
+    return 1;
+}
+
+void plat_ipc_close(PlatIpc *p) {
+    if (!p) return;
+    CloseHandle(p->h);
+    free(p);
+}
+
 
 // ---- restart
 // TOTK_RESTART_WAIT names the process that called plat_restart, as its id and creation time: a process that has only

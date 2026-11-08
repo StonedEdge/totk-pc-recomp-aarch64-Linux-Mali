@@ -230,9 +230,23 @@ int probe_cfg(void) {
     dn[KEY_MOUSE_R] = dn[KEY_Z] = 1;
     CHECK(input_map_buttons(dn) == (1ull << B_Y | 1ull << B_ZL), "keys: right mouse button and Z both press ZL");
     memset(dn, 0, sizeof dn);
+    dn[KEY_T] = 1;
+    CHECK(input_map_buttons(dn) == 1ull << B_Y, "keys: T is Y too (the left button is A in the menus)");
+    plat_setenv("TOTK_BIND_X", "key:t");
+    input_map_configure();
+    CHECK(input_map_buttons(dn) == 1ull << B_X, "bind: bind_X = key:t takes T from Y's defaults");
+    dn[KEY_T] = 0, dn[KEY_MOUSE_L] = 1;
+    CHECK(input_map_buttons(dn) == 1ull << B_Y, "bind: Y keeps the left mouse button");
+    plat_setenv("TOTK_BIND_X", NULL);
+    input_map_reset();
+    memset(dn, 0, sizeof dn);
     dn[KEY_X] = dn[KEY_TAB] = dn[KEY_M] = dn[KEY_LCTRL] = dn[KEY_3] = 1;
     CHECK(input_map_buttons(dn) == (1ull << B_ZR | 1ull << B_PLUS | 1ull << B_MINUS | 1ull << B_STICK_L | 1ull << B_RIGHT),
           "keys: X ZR, Tab Plus, M Minus, Left Ctrl stick click, 3 D-pad right");
+    memset(dn, 0, sizeof dn);
+    dn[KEY_G] = 1;
+    CHECK(input_map_buttons(dn) == 0 && input_map_held(dn, B_SHAKE) && !input_map_held(dn, B_A),
+          "keys: G shakes and presses no button");
     memset(dn, 0, sizeof dn);
     dn[KEY_W] = 1;
     input_map_stick(dn, 0, st);
@@ -301,6 +315,11 @@ int probe_cfg(void) {
     CHECK(input_prompts_pick(NULL, "auto") == PROMPTS_NINTENDO && input_prompts_pick("", "xbox") == PROMPTS_NINTENDO &&
               input_prompts_pick("Xbox", "nintendo") == PROMPTS_XBOX && input_prompts_pick("nintendo", "xbox") == PROMPTS_NINTENDO,
           "prompts: the game's own unless set to Xbox");
+    CHECK(input_prompts_pick("PC", "nintendo") == PROMPTS_PC && input_prompts_pick("pc", "xbox_prompts") == PROMPTS_PC &&
+              EQ(input_prompts_folder(PROMPTS_PC, "nintendo"), "romfs-patches-pc") &&
+              EQ(input_prompts_folder(PROMPTS_PC, "xbox"), "romfs-patches-pc") &&
+              EQ(input_prompts_folder(PROMPTS_PC, NULL), "romfs-patches-pc"),
+          "prompts: pc shows the keyboard and mouse whatever the pad layout");
     CHECK(input_prompts_pick(NULL, "xbox_prompts") == PROMPTS_XBOX && input_prompts_pick("nintendo", "xbox_prompts") == PROMPTS_NINTENDO,
           "prompts: 0.1.9's pad_layout = xbox_prompts means Xbox while prompts is unset");
     CHECK(!input_prompts_folder(PROMPTS_NINTENDO, "nintendo") && !input_prompts_folder(PROMPTS_NINTENDO, "xbox"),

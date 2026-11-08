@@ -23,6 +23,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "vk.h"
+#include "vk_dlaa.h"
 #include "platform/platform.h"
 
 #define ALIGN 256u
@@ -39,6 +40,9 @@ typedef struct Arena {
     VmaAllocation alloc;
     uint8_t *map;
     uint8_t *shadow;            // TOTK_UB_INPLACE: the same bytes in cached host memory, for reading old versions
+    uint8_t *cpu;    // with DLSS (vk_dlaa_available), the same bytes in host memory for the CPU's reads (vk_usnap_bytes):
+                     // map is often device memory through the BAR, written fast but read back at about a microsecond a
+                     // cache line. Without DLSS nothing reads them back, and the bytes go into map in one copy.
     uint64_t size;
 } Arena;
 
@@ -147,9 +151,35 @@ static void collect(const op_hdr *h, int depth) {
         if (h->op == OP_BIND_UBO) {
             const p_bind_buf *b = a;
             if (b->addr && b->size) {
-                if (U.ncol == U.ccol) U.col = grow(U.col, &U.ccol, sizeof *U.col);
                 uint64_t n = b->size < MAX_RANGE ? b->size : MAX_RANGE;
-                U.col[U.ncol++] = (Rng){b->addr & ~(uint64_t)(ALIGN - 1), b->addr + n};
+                // the vertex stage's object and bone blocks: also the game's other copy on either side, which still
+                // holds last frame's (vk_mvprev.c)
+                uint64_t step = vk_mvprev_step(b->stage, b->index, b->size);
+                // which neighbours lie in an imported pool, per block and vk_mem_gen: the same blocks are bound by
+                // many draws, and two resolves for each binding were a quarter of the snapshot's time
+                static struct { uint64_t addr, size, gen; int ok; } nc[1024];
+                uint32_t ci = (uint32_t)((b->addr ^ n << 48) * 0x9E3779B97F4A7C15ull >> 54);
+                uint64_t gen = vk_mem_gen();
+                int known = step && nc[ci].addr == b->addr && nc[ci].size == n && nc[ci].gen == gen, ok = 0;
+                for (int k = step ? -1 : 0; k <= (step ? 1 : 0); k++) {
+                    uint64_t at = b->addr + (uint64_t)((int64_t)k * (int64_t)step);
+                    if (k < 0 && b->addr < step) continue;
+                    // a neighbour past its pool would make the whole merged region fail the pool check below, and
+                    // the bindings in it read live memory again
+                    VkMemSpan sp;
+                    uint64_t lo = at & ~(uint64_t)(ALIGN - 1);
+                    if (k && known) {
+                        if (!(nc[ci].ok >> (k + 1) & 1)) continue;
+                    } else if (k) {
+                        if (!vk_mem_resolve(lo, at + n - lo, &sp) || sp.alloc || !sp.pool || sp.avail < at + n - lo ||
+                            (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC))
+                            continue;
+                        ok |= 1 << (k + 1);
+                    }
+                    if (U.ncol == U.ccol) U.col = grow(U.col, &U.ccol, sizeof *U.col);
+                    U.col[U.ncol++] = (Rng){at & ~(uint64_t)(ALIGN - 1), at + n};
+                }
+                if (step && !known) nc[ci].addr = b->addr, nc[ci].size = n, nc[ci].gen = gen, nc[ci].ok = ok;
             }
         }
         // TOTK_UB_INPLACE: an update's range too, so that it lies wholly in one region (an update reaching past the
@@ -334,8 +364,13 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.nreg) return;
     if (!(U.arena = arena_get(total + (U.random ? UPD_SLACK : 0)))) return;
     U.used = total;
+    uint8_t *dst = U.arena->map;
+    if (vk_dlaa_available()) {
+        if (!U.arena->cpu && !(U.arena->cpu = malloc(U.arena->size))) rt_fatal("vk_usnap: out of memory");
+        dst = U.arena->cpu;
+    }
     for (int i = 0; i < U.nreg; i++)
-        memcpy(U.arena->map + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
+        memcpy(dst + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
     if (U.arena->shadow)
         for (int i = 0; i < U.nreg; i++)
             memcpy(U.arena->shadow + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
@@ -344,10 +379,11 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
         const PendUb *p = &U.pub[k];
         for (int i = first_above(p->lo); i < U.nreg && U.reg[i].lo < p->hi; i++) {
             uint64_t a = p->lo > U.reg[i].lo ? p->lo : U.reg[i].lo, b = p->hi < U.reg[i].hi ? p->hi : U.reg[i].hi;
-            memcpy(U.arena->map + U.reg[i].off + (a - U.reg[i].lo), p->data + (a - p->lo), b - a);
+            memcpy(dst + U.reg[i].off + (a - U.reg[i].lo), p->data + (a - p->lo), b - a);
             if (U.arena->shadow) memcpy(U.arena->shadow + U.reg[i].off + (a - U.reg[i].lo), p->data + (a - p->lo), b - a);
         }
     }
+    if (dst != U.arena->map) memcpy(U.arena->map, dst, total);   // one sequential write into the device copy
     vmaFlushAllocation(vk_ctx()->vma, U.arena->alloc, 0, total);   // a no-op on coherent memory
     U.on = 1;
     U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += total, U.copy_ns += kern_now_ns() - t0;
@@ -660,11 +696,21 @@ const uint8_t *vk_usnap_peek(uint64_t addr, uint64_t n) {
 
 uint64_t vk_usnap_gen(void) { return U.gen; }
 
+// the host copy where there is one (DLSS), else the device copy
+static uint8_t *host_copy(void) { return U.arena->cpu ? U.arena->cpu : U.arena->map; }
+
+const uint8_t *vk_usnap_map(void) { return U.arena ? host_copy() : NULL; }
+
+const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n) {
+    VkDescriptorBufferInfo bi;
+    return vk_usnap_find(addr, n, 1, &bi, 0) ? host_copy() + bi.offset : NULL;
+}
+
 // The arenas back on the free list (vk_exec_draw_shutdown: the device is idle, every completion ran).
 void vk_usnap_shutdown(void) {
     plat_mutex_lock(&free_lock);
     for (Arena *a = free_arenas, *next; a; a = next)
-        next = a->next, vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a->shadow), free(a);
+        next = a->next, vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a->shadow), free(a->cpu), free(a);
     free_arenas = NULL;
     plat_mutex_unlock(&free_lock);
 }

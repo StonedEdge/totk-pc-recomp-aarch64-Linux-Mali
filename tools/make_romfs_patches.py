@@ -35,9 +35,15 @@ from the game's own files on the player's machine, nothing added (tools/button_i
     stays right.
   - every other prompt: the glyphs U+E040 A, U+E041 B, U+E042 X, U+E043 Y of the button font trade places.
 - xbox-label, for pad_layout = xbox and auto. Those layouts put Switch A on the button labelled A (auto picks xbox for
-  every pad not labelled the Nintendo way), so the face buttons keep their letters; the action prompt's diamond keeps
-  the Switch positions (A on the right).
+  every pad not labelled the Nintendo way), so the face buttons keep their letters. The action prompt's diamond is
+  laid out as an Xbox pad's (bflyt_xbox_diamond): A at the bottom, B on the right, X on the left, Y at the top, the
+  button the prompt names lit in its place with its bar.
 --xbox-prompts is the older name of --prompts xbox.
+--prompts pc: keyboard and mouse prompts, for prompts = pc (romfs-patches-pc, or romfs-patches-pc-<w>x<h> with
+--aspect): every button of the button font is drawn as the key or mouse button the keyboard defaults put on it
+(button_icons.pc_icons; --binds <totk.ini> takes the first key of its bind_ lines instead), and so are the button
+guide's images (A, B, X, Y, L, ZL and the stick's two). The one-letter panes around the action prompt name the keys
+with one character of the Normal font (E, an arrow for Shift, a bar for Space, L and R for the mouse buttons).
 
 Input: build/extracted/<version>/romfs (romfs.bin and index.json, verified by tools/extract.py). Output:
 build/<version>/romfs-patches/<path> by default (romfs-patches-<style> with --prompts), and <out>/manifest.tsv (path, size, SHA-256 of the overlay, SHA-256 of the original). Run with .venv-py314.
@@ -58,9 +64,11 @@ ap.add_argument('--romfs', type=Path, help='default build/extracted/<version>/ro
 ap.add_argument('--out', type=Path,
                 help='default build/<version>/romfs-patches (romfs-patches-<style> with --prompts)')
 ap.add_argument('--aspect', help='<w>x<h> of a game resolution of another shape than 16:9: also lay the UI out for it')
-ap.add_argument('--prompts', choices=('xbox', 'xbox-label'),
+ap.add_argument('--prompts', choices=('xbox', 'xbox-label', 'pc'),
                 help='Xbox button icons in the prompts: xbox for pad_layout = nintendo (A shown as B, X as Y), '
-                     'xbox-label for pad_layout = xbox or auto (the face buttons keep their letters)')
+                     'xbox-label for pad_layout = xbox or auto (the face buttons keep their letters), '
+                     'pc for the keyboard and mouse')
+ap.add_argument('--binds', type=Path, help='--prompts pc: a totk.ini whose bind_ lines the key icons follow')
 ap.add_argument('--xbox-prompts', dest='prompts', action='store_const', const='xbox', help='the same as --prompts xbox')
 args = ap.parse_args()
 args.romfs = args.romfs or root / 'build/extracted' / args.version / 'romfs'
@@ -163,6 +171,92 @@ def bflyt_letters(data, base, end, swap):
     return changed
 
 
+def bflyt_panes(data, base, end):
+    """name -> absolute offset of each pane section (pan1, pic1, txt1, wnd1, ...) of the BFLYT at data[base:end], and
+    name -> absolute offset of each material of its mat1, and its texture names (txl1)."""
+    assert data[base:base + 4] == b'FLYT'
+    pos, panes, mats, textures = base + struct.unpack_from('<H', data, base + 6)[0], {}, {}, []
+    while pos + 8 <= end:
+        magic, size = data[pos:pos + 4], struct.unpack_from('<I', data, pos + 4)[0]
+        if magic in (b'pan1', b'pic1', b'txt1', b'wnd1', b'bnd1', b'prt1', b'ali1', b'scr1'):
+            panes[data[pos + 12:pos + 36].split(b'\0')[0].decode()] = pos
+        elif magic == b'mat1':
+            for i in range(struct.unpack_from('<H', data, pos + 8)[0]):
+                at = pos + struct.unpack_from('<I', data, pos + 12 + 4 * i)[0]
+                mats[data[at:at + 28].split(b'\0')[0].decode()] = at
+        elif magic == b'txl1':
+            for i in range(struct.unpack_from('<H', data, pos + 8)[0]):
+                at = pos + 12 + struct.unpack_from('<I', data, pos + 12 + 4 * i)[0]
+                textures.append(data[at:data.index(0, at)].decode())
+        if not size:
+            break
+        pos += size
+    return panes, mats, textures
+
+
+# The action prompt's diamond (blyt/DoCommand_00.bflyt) for pad_layout = xbox and auto, where Switch A, B, X and Y are
+# the buttons labelled so on an Xbox pad: A at the bottom, B on the right, X on the left, Y at the top. The layout has
+# one diamond per button the prompt can name (N_A_00, N_B_00, N_X_00, N_Y_00; N_StopA_00 is A's while held), each
+# with its button and bar (N_Btn<K>_00), the three other letters (T_<letter>_<n>) and a base image (P_Base<K>_00)
+# that lights the button's side. A Switch button's place on an Xbox pad is that of its partner on a Switch (A of B,
+# X of Y), so each piece takes the place and look its partner's piece has: the bar of a button on the left reaches
+# left (Y's on a Switch), the others reach right.
+DIAMOND_SLOTS = {'A': (39.0, 1.0), 'B': (2.0, -39.0), 'X': (1.0, 39.0), 'Y': (-38.0, 0.0)}   # the letters' places
+DIAMOND_PARTNER = {'A': 'B', 'B': 'A', 'X': 'Y', 'Y': 'X'}
+# (pane, the pane whose place it takes): the buttons with their bars, and the flashes of a repeated press (Rush)
+DIAMOND_MOVES = [('N_BtnA_00', 'N_BtnB_00'), ('N_BtnA_01', 'N_BtnB_00'), ('N_CompanionBtnA_00', 'N_BtnB_00'),
+                 ('N_BtnB_00', 'N_BtnA_00'), ('N_BtnX_00', 'N_BtnY_00'), ('N_BtnY_00', 'N_BtnX_00')]
+DIAMOND_MOVES += [(f'P_Capture{k}_{n:02}', f'P_Capture{DIAMOND_PARTNER[k]}_{n:02}') for k in 'ABXY' for n in (1, 2, 3)]
+# X and Y trade the side their bar reaches to: the flash, the bar (Y's mirrored) and the text (Y's right-aligned)
+DIAMOND_MIRROR = [('P_CaptureX_00', 'P_CaptureY_00'), ('W_BaseX_00', 'W_BaseY_00'), ('T_GuideX_00', 'T_GuideY_00'),
+                  ('T_GuideX_TW', 'T_GuideY_TW')]
+# the base image: its texture (by its material) and its rotation and scale
+DIAMOND_BASES = [('P_BaseA_00', 'P_BaseB_00'), ('P_BaseA_01', 'P_BaseB_00'), ('P_BaseB_00', 'P_BaseA_00'),
+                 ('P_BaseX_00', 'P_BaseY_00'), ('P_BaseY_00', 'P_BaseX_00')]
+
+
+def bflyt_xbox_diamond(data, base, end):
+    """Lay the action prompt's diamond in the BFLYT at data[base:end] (blyt/DoCommand_00.bflyt) out as an Xbox pad's
+    face buttons (DIAMOND_* above); returns the panes changed. A pane section holds its origin at +0x09, translation
+    (3 floats) at +0x2C, rotation (3) at +0x38 and scale (2) at +0x44; a text pane its text position at +0x5C; a
+    picture pane its material index at +0x64, and a material its first texture's index at +0x2C."""
+    panes, mats, textures = bflyt_panes(data, base, end)
+    old = bytes(data)   # every piece takes its partner's place as the game has it
+    changed = []
+    for name, at in panes.items():
+        m = re.fullmatch(r'T_([ABXY])_\d+', name)
+        if m:   # a letter around a diamond: its partner's place
+            struct.pack_into('<2f', data, at + 0x2C, *DIAMOND_SLOTS[DIAMOND_PARTNER[m[1]]])
+            changed.append(name)
+    for name, like in DIAMOND_MOVES:
+        data[panes[name] + 0x2C:panes[name] + 0x34] = old[panes[like] + 0x2C:panes[like] + 0x34]
+        changed.append(name)
+    # A's hold flashes (N_LoopA_03) sit 129 right of the diamond, as A's repeated-press ones: the same move as those
+    dx, dy = (a - b for a, b in zip(struct.unpack_from('<2f', old, panes['P_CaptureB_01'] + 0x2C),
+                                    struct.unpack_from('<2f', old, panes['P_CaptureA_01'] + 0x2C)))
+    x, y = struct.unpack_from('<2f', old, panes['N_LoopA_03'] + 0x2C)
+    struct.pack_into('<2f', data, panes['N_LoopA_03'] + 0x2C, x + dx, y + dy)
+    changed.append('N_LoopA_03')
+    for a, b in DIAMOND_MIRROR:
+        pa, pb = panes[a], panes[b]
+        for lo, hi in ((0x09, 0x0A), (0x2C, 0x4C)) + (((0x5C, 0x5D),) if old[pa:pa + 4] == b'txt1' else ()):
+            data[pa + lo:pa + hi], data[pb + lo:pb + hi] = old[pb + lo:pb + hi], old[pa + lo:pa + hi]
+        changed += [a, b]
+    in_order = list(mats.values())
+
+    def material(name):   # the offset of a picture pane's material
+        return in_order[struct.unpack_from('<H', old, panes[name] + 0x64)[0]]
+
+    for name, like in DIAMOND_BASES:
+        assert old[panes[name]:panes[name] + 4] == b'pic1', name
+        data[panes[name] + 0x38:panes[name] + 0x4C] = old[panes[like] + 0x38:panes[like] + 0x4C]
+        mine, theirs = material(name), material(like)
+        data[mine + 0x2C:mine + 0x2E] = old[theirs + 0x2C:theirs + 0x2E]
+        assert textures[struct.unpack_from('<H', data, mine + 0x2C)[0]].startswith('Nt_KeyBtnSubBase'), name
+        changed.append(name)
+    return changed
+
+
 def msbt_letters(data, swap):
     """Swap the one-letter messages labelled T_<letter>_<n> (A, B, X or Y) in the UTF-16 MSBT data (a bytearray) by
     swap; the labels changed. The game sets a layout's text panes from the messages of the same name in
@@ -231,9 +325,11 @@ LAYOUT_MSG = 'LayoutMsg/DoCommand_00.msbt'
 RESTBL = max((p for p in files if p.startswith('System/Resource/ResourceSizeTable.') and p.endswith('.rsizetable.zs')),
              key=lambda p: int((re.search(r'\.(\d+)\.', p) or [0, 0])[1]), default=None)
 by_position = args.prompts == 'xbox'   # the face buttons' prompts swapped to the labels (pad_layout = nintendo)
+pc = args.prompts == 'pc'
+letter_panes = by_position or pc      # the one-letter panes around the action prompt change
 if args.prompts:
     assert FONTS, 'no Font/Font*.Nin_NX_NVN.bfarc.zs in the RomFS'
-    assert MALS or not by_position, 'no Mals/<language>.Product.<version>.sarc.zs in the RomFS'
+    assert MALS or not letter_panes, 'no Mals/<language>.Product.<version>.sarc.zs in the RomFS'
     assert RESTBL, 'no System/Resource/ResourceSizeTable.Product.<n>...rsizetable.zs in the RomFS'
     spec = importlib.util.spec_from_file_location('button_icons', Path(__file__).with_name('button_icons.py'))
     icons = importlib.util.module_from_spec(spec)
@@ -252,7 +348,7 @@ with (args.romfs / 'romfs.bin').open('rb') as image:
     for name, (lo, hi) in sarc_members(pack).items():
         d = zstd.ZstdDict(pack[lo:hi])
         dictionaries[d.dict_id] = d
-    prompt_files = (FONTS + (MALS if by_position else []) + [RESTBL]) if args.prompts else []
+    prompt_files = (FONTS + (MALS if letter_panes else []) + [RESTBL]) if args.prompts else []
     originals = {path: read(path) for path in [ARCHIVE] + prompt_files}
 raw = originals[ARCHIVE]
 info = zstd.get_frame_info(raw)
@@ -297,19 +393,30 @@ if args.prompts:
     text = sarc_members(archives[icons.TEXT_ARCHIVE])
     missing = [name for name in icons.TEXT_FONTS if name not in text]
     assert not missing, f'no {", ".join(missing)} in {icons.TEXT_ARCHIVE}'
-    drawn = icons.xbox_icons(icons.text_glyphs(archives[icons.TEXT_ARCHIVE][slice(*text[name])]
-                                               for name in icons.TEXT_FONTS))
+    glyphs = icons.text_glyphs(archives[icons.TEXT_ARCHIVE][slice(*text[name])] for name in icons.TEXT_FONTS)
+    if pc:
+        binds = icons.pc_binds(args.binds.read_text(encoding='utf-8', errors='replace') if args.binds else None)
+        advances = icons.font_advances(archives[icons.TEXT_ARCHIVE][slice(*text[icons.FONT])])
+        drawn = icons.pc_icons(glyphs, advances, binds)
+        pane_letters = {letter: icons.pc_letter(binds[letter]) for letter in 'ABXY'}
+    else:
+        drawn = icons.xbox_icons(glyphs)
+        pane_letters = KEY_LETTERS
     bntx = members['timg/__Combined.bntx'][0]
     letters = {}
     if by_position:
         bntx_swap(blarc, bntx, KEY_TEXTURES)
+    diamond = []
+    if args.prompts == 'xbox-label':
+        diamond = bflyt_xbox_diamond(blarc, *members['blyt/DoCommand_00.bflyt'])
+    if letter_panes:
         for member, (lo, hi) in members.items():
             if member.endswith('.bflyt'):
-                changed = bflyt_letters(blarc, lo, hi, KEY_LETTERS)
+                changed = bflyt_letters(blarc, lo, hi, pane_letters)
                 if changed:
                     letters[member] = changed
         assert 'blyt/DoCommand_00.bflyt' in letters, 'no letter panes in blyt/DoCommand_00.bflyt'
-    hud = icons.bntx_redraw(blarc, bntx, icons.HUD_TEXTURES, drawn)
+    hud = icons.bntx_redraw(blarc, bntx, icons.PC_HUD_TEXTURES if pc else icons.HUD_TEXTURES, drawn)
     outputs[ARCHIVE] = bytes(blarc)
     fonts = {}   # each distinct font is drawn once (1.4.3's four archives hold the same one)
     for path, bfarc in archives.items():
@@ -319,11 +426,11 @@ if args.prompts:
             fonts[otf] = icons.redraw_font(otf, drawn, KEY_GLYPHS if by_position else ())
         outputs[path] = sarc_replace(bfarc, {icons.FONT: icons.bfotf_encode(fonts[otf], key, bfarc[lo:hi])})
     messages = {}
-    for path in MALS if by_position else []:
+    for path in MALS if letter_panes else []:
         mals = bytearray(unpack(path))
         lo, hi = sarc_members(mals)[LAYOUT_MSG]
         msbt = bytearray(mals[lo:hi])
-        changed = msbt_letters(msbt, KEY_LETTERS)
+        changed = msbt_letters(msbt, pane_letters)
         assert len(changed) == sum(len(v) for v in letters.values()), (path, changed)
         mals[lo:hi] = msbt
         outputs[path] = bytes(mals)
@@ -333,7 +440,7 @@ if args.prompts:
     if grown:
         outputs[RESTBL] = icons.grow_restbl(unpack(RESTBL), grown)
     prompts = dict(style=args.prompts, textures=KEY_TEXTURES if by_position else [], letters=letters,
-                   messages=messages, hud=hud, icons=len(drawn), fonts=FONTS, grown=grown)
+                   diamond=len(diamond), messages=messages, hud=hud, icons=len(drawn), fonts=FONTS, grown=grown)
 
 lines = []
 for path, contents in outputs.items():

@@ -100,6 +100,10 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     nfw = 0;
 }
 
+WEAK void vk_exec_ub_flush(VkExec *ex) { (void)ex; }
+WEAK void vk_exec_ub_foreign(VkExec *ex, uint64_t addr, uint64_t n) { (void)ex, (void)addr, (void)n; }
+WEAK void vk_exec_ub_perf(void) {}
+
 WEAK void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     (void)ex, (void)payload;
     rt_fatal("vk: op %s is not replayed yet", nvn_op_name(op));
@@ -202,6 +206,7 @@ static void memory_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAcce
 // be made (logged). Replay thread.
 static int bc_standin(const VkTexImage *img, uint32_t level, VkFormat fmt, BcStandIn *out) {
     static int warned;
+    if (img->gone) return 0;   // dropped since the lookup: a stand-in kept by its handle would outlive it
     plat_mutex_lock(&bcs_lock);
     int full = nbcs == BC_STANDINS;
     for (int i = 0; i < nbcs; i++)
@@ -541,18 +546,28 @@ static int tfr_recent(const VkExecTarget *t, uint64_t stamp) {
     return tfr_match(e, t) && (e->last == stamp ? e->prev : e->last) == stamp - 1;
 }
 
+// No frame before the current one rendered the target (a slot another subresource took reads the same).
+static int tfr_first(const VkExecTarget *t, uint64_t stamp) {
+    const TargetFrames *e = tfr_slot(t);
+    return !tfr_match(e, t) || !(e->last == stamp ? e->prev : e->last);
+}
+
+// With any, a recent depth target alone does not make the pass per-frame when a colour target is rendered for the
+// first time: the game's item icon capture (an inventory or Fuse icon) draws into a new colour target with the
+// per-frame depth buffer, once. Its draws skipped there stay missing from the icon until the item is captured again.
 int vk_exec_targets_recent(VkExec *ex, int any) {
     resolve_rt(ex);
     uint64_t stamp = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    int n = 0, recent = 0;
+    int n = 0, color = 0, depth = 0, color_first = 0;
     for (int i = 0; i < 9; i++) {
         const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
         if (!t->image) continue;
         n++;
-        if (tfr_recent(t, stamp)) recent++;
+        if (tfr_recent(t, stamp)) *(i < 8 ? &color : &depth) = 1;
         else if (!any) return 0;
+        else if (i < 8 && tfr_first(t, stamp)) color_first = 1;
     }
-    return any ? recent > 0 : n > 0;
+    return any ? color || (depth && !color_first) : n > 0;
 }
 
 // One line naming each target of the current pass: format, extent, layer and the two frames it was last rendered in
@@ -758,6 +773,7 @@ static void clears_flush(VkExec *ex, uint32_t keep);
 static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags *wasp, int nwant, int frag) {
     vk_exec_pass_end(ex);
     if (npend && !in_pass_begin && !pend_flushing) clears_flush(ex, 0);
+    vk_exec_ub_flush(ex);   // uniform updates overlaid in the pass reach their buffers before the barrier below
     VkImageMemoryBarrier2 ib[18];
     uint32_t n = 0;
     for (int i = 0; i < ex->nfbl; i++)
@@ -1336,6 +1352,10 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
 int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
     VkExec *ex = &X;
     if (!x_ready) state_reset(ex), vk_dump_init(), x_ready = 1;
+    const tex_t *keep[9];   // the render targets carry over to this submission (set_rt compares them by pointer)
+    memcpy(keep, ex->rt.color, sizeof ex->rt.color);
+    keep[8] = ex->rt.depth;
+    nvn_pins_sweep(nvn_submit_count(), keep, 9);
     ex->cb = cb;
     ex->fence = fence;
     ex->recorded = 0;
@@ -1376,6 +1396,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     }
     ex->cb = VK_NULL_HANDLE;
     if (n) n_subs++;
+    if (n && (rt_trace & RT_TRACE_PERF)) vk_exec_ub_perf();
     if ((rt_trace & RT_TRACE_PERF) && n_subs >= 240) {
         rt_log("perf: replay command buffer parts per submission %.2f", (double)(n_subs + n_parts) / (double)n_subs);
         n_subs = n_parts = 0;
