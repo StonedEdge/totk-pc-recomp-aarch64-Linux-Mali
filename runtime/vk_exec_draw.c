@@ -307,7 +307,7 @@ typedef struct {
     uint64_t frame;                      // gfx_counters.frames at the last draw counted
     uint32_t frames;                     // frames since the last line
     uint64_t draws, cls[4], b_gen, desc, rec[4], always, mv[BI_MV], slots[5];
-    uint64_t sh_keep, sh_memo, fb_n, fb_keep, fb_memo, vb_skip, pg_hit;
+    uint64_t sh_keep, sh_memo, fb_n, fb_keep, fb_memo, vb_skip, pg_hit, sets, set_shared;
     uint64_t mism, mism_total, checked;
     uint32_t mism_frame, frame_lines;
 } BiCensus;
@@ -330,6 +330,23 @@ typedef struct {
     uint8_t plan[MAX_BINDINGS];          // bindings to build again (bi_plan)
 } BiDesc;
 
+// TOTK_BIND_INC on: graphics descriptor sets shared within a submission and allocated in batches (bi_set_find,
+// alloc_set_batched). Adapted from Savage Wind Recomp runtime/nvn/vulkan/exec.c set_finish and vk_alloc_set
+// (https://github.com/Revivedx/SavageWindRecomp @ 740b18025fe11ba03c117dbb56668db304b5043e, MIT, Copyright (c) 2026
+// Revivedx and the Savage Wind Recomp contributors, Copyright (c) 2026 Peiikai).
+#define SETC_TAB 4096
+typedef struct {
+    uint64_t fence, hash, hash2;         // the submission whose pools hold set; two hashes of layout and contents
+    VkDescriptorSetLayout layout;
+    VkDescriptorSet set;
+    uint32_t n;                          // content bytes
+    uint32_t ckcap;                      // check mode: the contents, to compare a hit with
+    uint8_t *ck;
+} SetEnt;
+#define ASET_CACHE 16
+#define ASET_BATCH 16
+typedef struct { VkDescriptorSetLayout layout; uint64_t fence; int n, next; VkDescriptorSet set[ASET_BATCH]; } ASetCache;
+
 // The memos and command buffer state of one recording context (VkExec.draw). Nothing in it is shared: the context's
 // thread reads and writes it without a lock.
 typedef struct VkExecDraw {
@@ -342,6 +359,8 @@ typedef struct VkExecDraw {
     BiLast BL;
     BiCensus BC;
     BiDesc BI;
+    SetEnt *setc;                        // SETC_TAB entries, made on first use
+    ASetCache aset[ASET_CACHE];
     nvn_hmap rs_lists;                   // VkPipeInfo pointer -> RsList, until shutdown
     const VkPipeInfo *rs_last;           // the last lookup
     const RsList *rs_last_l;
@@ -1874,6 +1893,67 @@ static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
     return VK_NULL_HANDLE;
 }
 
+// Sets come from the submission's pools in batches of one layout that grow 1, 2, 4, 8, 16 while the layout repeats,
+// and are handed out one by one: a vkAllocateDescriptorSets per set costs the driver a lock and a free-list walk. A
+// batch belongs to its submission's pools (fence) and dies with their reset; sets it leaves unused stay in the pool.
+static VkDescriptorSet alloc_set_batched(VkExec *ex, VkDescriptorSetLayout layout) {
+    VkExecDraw *D = ex->draw;
+    CbRes *r = cb_res(ex);
+    ASetCache *c = &D->aset[(uint32_t)(((uintptr_t)layout >> 4) * 2654435761u) >> 28];
+    if (c->layout == layout && c->fence == ex->fence && c->n > 0) return c->set[--c->n];
+    if (c->layout != layout) c->layout = layout, c->next = 1;
+    else if (c->next < ASET_BATCH) c->next *= 2;
+    c->n = 0;
+    int want = c->next;
+    if (want > 1 && r->npools) {
+        VkDescriptorSetLayout ls[ASET_BATCH];
+        VkDescriptorSet got[ASET_BATCH];
+        for (int i = 0; i < want; i++) ls[i] = layout;
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                          .descriptorPool = r->pools[r->npools - 1], .descriptorSetCount = (uint32_t)want,
+                                          .pSetLayouts = ls};
+        if (vkAllocateDescriptorSets(vk_ctx()->device, &ai, got) == VK_SUCCESS) {
+            for (int i = 1; i < want; i++) c->set[i - 1] = got[i];
+            c->n = want - 1, c->fence = ex->fence;
+            return got[0];
+        }   // the pool is nearly full: one set, from a new pool when needed
+    }
+    return alloc_set(ex, layout);
+}
+
+// A set of this submission with layout sl and the contents ds (dbytes) written already, VK_NULL_HANDLE when none is
+// known; *e is the table entry a new set goes into (bi_set_put). Entries are told apart by two independent 64-bit
+// hashes of the layout and the packed descriptors. check: a hit is compared with the stored contents and not taken.
+static VkDescriptorSet bi_set_find(VkExec *ex, VkDescriptorSetLayout sl, const VkDescSlot *ds, uint32_t dbytes, SetEnt **e,
+                                   uint64_t hh[2]) {
+    VkExecDraw *D = ex->draw;
+    if (!D->setc && !(D->setc = calloc(SETC_TAB, sizeof *D->setc))) rt_fatal("vk: out of memory");
+    uint64_t h = (uint64_t)(uintptr_t)sl, h2 = h ^ 0x6A09E667F3BCC909ull;
+    const uint64_t *v = (const uint64_t *)ds;
+    for (uint32_t i = 0; i < dbytes / 8; i++) {
+        h = (h ^ v[i]) * 0x9E3779B97F4A7C15ull, h ^= h >> 29;
+        h2 = (h2 ^ v[i]) * 0xC2B2AE3D27D4EB4Full, h2 ^= h2 >> 31;
+    }
+    h ^= h >> 32;
+    SetEnt *x = *e = &D->setc[(h ^ (h >> 31)) & (SETC_TAB - 1)];
+    hh[0] = h, hh[1] = h2;
+    D->BC.sets++;
+    if (x->fence != ex->fence || x->hash != h || x->hash2 != h2 || x->layout != sl || x->n != dbytes) return VK_NULL_HANDLE;
+    D->BC.set_shared++;
+    if (bind_inc_mode() == 1) return x->set;
+    D->BC.checked++;
+    if (!x->ck || memcmp(x->ck, ds, dbytes)) bi_mismatch(ex, BIM_SET, "a shared set's contents differ (%u bytes)", dbytes);
+    return VK_NULL_HANDLE;
+}
+
+static void bi_set_put(VkExec *ex, SetEnt *e, const uint64_t hh[2], VkDescriptorSetLayout sl, VkDescriptorSet set,
+                       const VkDescSlot *ds, uint32_t dbytes) {
+    e->fence = ex->fence, e->hash = hh[0], e->hash2 = hh[1], e->layout = sl, e->set = set, e->n = dbytes;
+    if (bind_inc_mode() != 2) return;
+    if (e->ckcap < dbytes && !(e->ck = realloc(e->ck, e->ckcap = dbytes))) rt_fatal("vk: out of memory");
+    memcpy(e->ck, ds, dbytes);
+}
+
 static void support_in(const VkExec *ex, float in[3]) {   // what support_fill reads: viewport size, point size
     float k = ex->pass_scale > 1 ? (float)ex->pass_scale : 1.0f;
     in[0] = ex->in_pass && ex->has_vp ? ex->vp[0][2] * k : (float)ex->pass_w;
@@ -2480,8 +2560,14 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info, const uint64_t *b
             VkDescriptorSet set = D->B.ds_last[s];
             int kept = inc && bim == 1 && !changed[s] && set && D->B.ds_last_layout[s] == sl && D->DS.n[s] == dbytes;
             if (!kept && (!set || D->B.ds_last_layout[s] != sl || D->DS.n[s] != dbytes || memcmp(D->DS.sig[s], ds, dbytes))) {
-                set = alloc_set(ex, sl);
-                write_set(info, s, set, ds, w, i0, i1);
+                SetEnt *e = NULL;
+                uint64_t hh[2];
+                set = bim && !ex->chunked ? bi_set_find(ex, sl, ds, dbytes, &e, hh) : VK_NULL_HANDLE;
+                if (!set) {
+                    set = bim == 1 && !ex->chunked ? alloc_set_batched(ex, sl) : alloc_set(ex, sl);
+                    write_set(info, s, set, ds, w, i0, i1);
+                    if (e) bi_set_put(ex, e, hh, sl, set, ds, dbytes);
+                }
                 D->B.ds_last[s] = set, D->B.ds_last_layout[s] = sl, D->DS.n[s] = dbytes;
                 memcpy(D->DS.sig[s], ds, dbytes);
                 D->BS.set_new++;
@@ -2825,6 +2911,9 @@ static void bi_log(BiCensus *c) {
            bi_pct(c->sh_keep, c->draws), bi_pct(c->sh_memo, c->draws), bi_pct(c->pg_hit, c->draws),
            bi_pct(c->vb_skip, c->draws), bi_pct(c->fb_keep, c->draws), bi_pct(c->fb_n, c->draws),
            bi_pct(c->fb_memo, c->draws), c->mism / fr, (unsigned long long)c->mism_total, c->checked / fr);
+    if (c->sets)
+        rt_log("bind_inc: allocated graphics sets %.1f a frame, %.1f%% of them shared with an equal one of the submission",
+               c->sets / fr, bi_pct(c->set_shared, c->sets));
     uint64_t total = c->mism_total;
     uint32_t lines = c->frame_lines;
     memset(c, 0, sizeof *c);
