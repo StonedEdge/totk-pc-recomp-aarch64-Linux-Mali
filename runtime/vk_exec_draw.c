@@ -215,6 +215,7 @@ typedef struct {
     uint8_t c0[2], c1[2];                // reads c0 (every storage slot and the base instance), the compiler constants
     uint8_t gfx;                         // every binding is a vertex or fragment one
     uint16_t always, ndesc;
+    uint8_t wr;                          // a storage binding the shaders write: its build has side effects, nothing is kept
 } BiMask;
 typedef struct { uint32_t n, bytes; uint8_t sup, c0, ok, np; RsPtr p[RS_PTRS]; BiMask m; RsRange r[]; } RsList;
 // (program, stage, answers) -> shader, 4-way set-associative, most recently used first. A miss costs a SHA-256 of the
@@ -314,6 +315,21 @@ enum { BIM_PIPE, BIM_DYN, BIM_SHADER, BIM_FB, BIM_VB, BIM_DESC, BIM_SET, BIM_N }
 static int bind_inc_mode(void);
 static void bi_mismatch(struct VkExec *ex, int kind, const char *fmt, ...);
 
+// TOTK_BIND_INC: what building one descriptor counted (count_use; n 0: nothing, more than 1: never kept) and whether it
+// copied guest bytes into transient memory (vol: a rebuild may differ, so it is never kept).
+typedef struct { uint8_t vol, n; int16_t cls; int32_t use; uint64_t bytes; } BiMeta;
+// The packed descriptors of the last graphics build (bind_resources writes them here while TOTK_BIND_INC is set), the
+// pipeline they are for (valid with CbState.bi_valid) and, per descriptor, BiMeta.
+typedef struct {
+    const VkPipeInfo *info;
+    BiMeta *cur;                         // count_use and the transient copies record here while a descriptor is built
+    VkDescSlot d[MAX_DESC];
+    BiMeta meta[MAX_DESC];
+    VkDescSlot old[MAX_DESC];            // check mode: the descriptors before the build
+    BiMeta mold[MAX_DESC];
+    uint8_t plan[MAX_BINDINGS];          // bindings to build again (bi_plan)
+} BiDesc;
+
 // The memos and command buffer state of one recording context (VkExec.draw). Nothing in it is shared: the context's
 // thread reads and writes it without a lock.
 typedef struct VkExecDraw {
@@ -325,6 +341,7 @@ typedef struct VkExecDraw {
     RsState RS;
     BiLast BL;
     BiCensus BC;
+    BiDesc BI;
     nvn_hmap rs_lists;                   // VkPipeInfo pointer -> RsList, until shutdown
     const VkPipeInfo *rs_last;           // the last lookup
     const RsList *rs_last_l;
@@ -1069,6 +1086,11 @@ static VkDescriptorBufferInfo zero_info(uint64_t max) {
 // vk_mem_count, also kept per (class, use) while a graphics build runs (RS).
 static void count_use(VkExecDraw *D, int cls, int use, uint64_t n) {
     vk_mem_count(cls, use, n);
+    if (D->BI.cur) {
+        BiMeta *m = D->BI.cur;
+        if (m->n++) m->vol = 1;   // a second count: not kept (one is all a descriptor build makes)
+        m->cls = (int16_t)cls, m->use = use, m->bytes = n;
+    }
     if (!D->RS.rec) return;
     for (int i = 0; i < D->RS.ncnt; i++)
         if (D->RS.cnt[i].cls == cls && D->RS.cnt[i].use == use) {
@@ -1109,6 +1131,7 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
     VkBuffer b;
     VkDeviceSize o;
     D->RS.volatile_ = 1;
+    if (D->BI.cur) D->BI.cur->vol = 1;
     memcpy(scratch(ex, n, &b, &o), (const void *)(uintptr_t)addr, n);
     vk_mem_count(sp.cls, VK_MUSE_CPU_READ, n);
     vk_mem_count(VK_MCLS_SCRATCH, use, n);
@@ -2036,6 +2059,7 @@ static void bi_mask(const VkPipeInfo *info, BiMask *m) {
             }
         } else if (b->kind == GFX_RES_SSBO) {
             int ubo, slot = ssbo_slot(r, st, &ubo);
+            if (r->flags & 1) m->wr = 1;
             if ((r->flags & 1) || slot < 0 || slot >= 16 || ubo) m->always = (uint16_t)(m->always + cnt);
             else m->ssbo[st] |= 1u << slot;
         } else if ((b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) && b->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER &&
@@ -2206,15 +2230,79 @@ static void write_set(const VkPipeInfo *info, uint32_t s, VkDescriptorSet set, c
 // graphics push equal to the last one at its set number, with no other layout or bind between, is not recorded.
 // The descriptors go into one packed array d, a VkDescSlot per descriptor in binding order, which a set's update
 // template reads directly (VkPipeInfo.tpl); write structs are filled only when a set has no template.
-static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
+static int bind_inc_mode(void);
+static void bi_mismatch(VkExec *ex, int kind, const char *fmt, ...);
+
+// TOTK_BIND_INC: which bindings of a graphics draw with the last prepared draw's pipeline must be built again (BI.plan,
+// 1 each), from the marks since that draw and the generations G_tex and G_buf read right before this build (gt, gb)
+// against those read before its build. 0 when nothing can be kept: no last draw in this command buffer, another
+// pipeline, a chunk, a storage binding the shaders write (its build restarts passes and notes writes).
+// - support: always (its inputs are compared inside, 12 bytes);
+// - uniform slot 0 (c0): a storage slot of the stage or the base instance changed; slot 1 (the compiler constants):
+//   the program or its serial changed, or G_buf moved; slots 3..20: the slot changed or G_buf moved (snapshots,
+//   overlays, pools and mirrors); other slots bind the zero buffer;
+// - storage: as a uniform slot; an address held in a uniform block (ubo_ptr): always, the block changes without an op;
+// - textures and images: a handle changed or G_tex moved (slot resolution, samplers, the storage check once per
+//   submission, the feedback layout, DLSS's swap); buffer textures bind the zero view;
+// - any descriptor whose last build copied guest bytes or counted more than once (BiMeta): always.
+static int bi_plan(VkExec *ex, const VkPipeInfo *info, const uint64_t gt[4], const uint64_t gb[4]) {
+    VkExecDraw *D = ex->draw;
+    const BiLast *L = &D->BL;
+    if (!D->B.bi_valid || ex->chunked || L->info != info || D->BI.info != info) return 0;
+    const BiMask *m = &rs_list(ex, info)->m;
+    if (!m->gfx || m->wr) return 0;
+    const VkExecDirty *dt = &ex->dirt;
+    int tmv = memcmp(gt, L->gt, 4 * sizeof *gt) != 0, bmv = memcmp(gb, L->gb, 4 * sizeof *gb) != 0;
+    int prog = dt->prog || ex->prog != L->prog || ex->prog->serial != L->serial, binst = D->c0_binst != L->binst;
+    uint32_t nd = 0;
+    for (uint32_t i = 0; i < info->n_bindings; i++) {
+        const VkPipeBinding *b = &info->bindings[i];
+        const GfxShaderRes *r = b->res;
+        uint32_t cnt = b->count ? b->count : 1;
+        int st = nvn_stage_of(b->stage), again = 0;
+        for (uint32_t k = 0; k < cnt && !again; k++) again = D->BI.meta[nd + k].vol;
+        if (b->kind == VK_PIPE_SUPPORT) {
+            again = 1;
+        } else if (b->kind == GFX_RES_UBO) {
+            for (uint32_t k = 0; k < cnt && !again; k++) {
+                int slot = r->slot + (int)k;
+                if (slot == 0) again = dt->ssbo[st] || binst;
+                else if (slot == 1) again = prog || bmv;
+                else if (slot >= 3 && slot - 3 < 18) again = bmv || (dt->ubo[st] >> (slot - 3) & 1);
+            }
+        } else if (b->kind == GFX_RES_SSBO) {
+            int ubo, slot = ssbo_slot(r, st, &ubo);
+            again = again || ubo || slot < 0 || slot >= 16 || bmv || (dt->ssbo[st] >> slot & 1);
+        } else if ((b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) && b->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER &&
+                   b->type != VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+            int img = b->kind == GFX_RES_IMG;
+            again = again || tmv;
+            for (uint32_t k = 0; k < cnt && !again; k++) {
+                int slot = r->slot + (int)k;
+                if (img) again = slot >= 0 && slot < 32 && (dt->img[st] >> slot & 1);
+                else again = slot >= 0 && slot < 128 && (dt->tex[st][slot >> 6] >> (slot & 63) & 1);
+            }
+        }
+        D->BI.plan[i] = (uint8_t)again;
+        nd += cnt;
+    }
+    return 1;
+}
+
+static void bind_resources(VkExec *ex, const VkPipeInfo *info, const uint64_t *bgt, const uint64_t *bgb) {
     VkExecDraw *D = ex->draw;
     VkWriteDescriptorSet *w = ex->draw->w;
-    VkDescSlot *d = ex->draw->d;
     VkBufferView *bv = ex->draw->bv;
     if (info->n_bindings > MAX_BINDINGS) rt_fatal("vk: %u descriptor bindings exceed the replay's %d", info->n_bindings, MAX_BINDINGS);
     bind_stats(ex->draw, info);
     int gfx = info->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS;
-    int skip = gfx ? bind_skip_on() : 0, same = 0, was_valid = D->B.res_valid;
+    // TOTK_BIND_INC: a graphics build writes BI's array and per-descriptor census (bgt: a prepared draw's), on builds
+    // only the bindings bi_plan names, check builds everything and compares what on would have kept.
+    int bim = gfx && bgt ? bind_inc_mode() : 0;
+    int inc = bim ? bi_plan(ex, info, bgt, bgb) : 0;
+    VkDescSlot *d = bim ? D->BI.d : ex->draw->d;
+    BiMeta *meta = bim ? D->BI.meta : NULL;
+    int skip = gfx && bim != 1 ? bind_skip_on() : 0, same = 0, was_valid = D->B.res_valid;
     if (skip) {
         same = bind_sig(ex, info);
         if (same && was_valid && skip == 1) {
@@ -2236,6 +2324,13 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         lo[s] = i0, hi[s] = i1, i0 = i1;
         if (i1 > lo[s] && !info->tpl[s]) need_w = 1;
     }
+    if (inc && need_w) inc = 0;   // a set without a template reads the write structs, which only a full build fills
+    int changed[2] = {!inc, !inc};   // inc: a descriptor of the set differs from the last build's
+    if (bim == 2 && inc) {   // check: the descriptors before the build, to compare those on would have kept
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < info->n_bindings; i++) n += info->bindings[i].count ? info->bindings[i].count : 1;
+        memcpy(D->BI.old, d, n * sizeof *d), memcpy(D->BI.mold, meta, n * sizeof *meta);
+    }
     uint32_t nd = 0;
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *b = &info->bindings[i];
@@ -2245,6 +2340,19 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         if (n_sets == 2 && i == lo[1]) d0[1] = nd;
         VkDescSlot *o = &d[nd];
         int st = nvn_stage_of(b->stage), kind = 0;   // kind: 0 buffer, 1 image, 2 texel buffer view
+        uint32_t set_of = n_sets == 2 && i >= lo[1] ? 1 : 0;
+        if (inc && bim == 1 && !D->BI.plan[i]) {   // kept: what it counted is counted again
+            for (uint32_t k = 0; k < cnt; k++)
+                if (meta[nd + k].n) vk_mem_count(meta[nd + k].cls, meta[nd + k].use, meta[nd + k].bytes);
+            nd += cnt;
+            continue;
+        }
+        VkDescSlot prev[4];   // on: the descriptors before the build, to tell whether the set changed
+        int cmp = inc && bim == 1 && cnt <= 4 && !changed[set_of];
+        if (cmp) memcpy(prev, o, cnt * sizeof *o);
+        else if (inc && bim == 1) changed[set_of] = 1;
+        if (meta) memset(&meta[nd], 0, cnt * sizeof *meta);
+#define BI_CUR(k) (D->BI.cur = meta ? &meta[nd + (k)] : NULL)
         if (b->kind == VK_PIPE_SUPPORT) {
             float in[3];
             support_in(ex, in);
@@ -2262,9 +2370,9 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             }
             o->buffer = (VkDescriptorBufferInfo){D->B.sup_buf, D->B.sup_off, SUPPORT_BYTES};
         } else if (b->kind == GFX_RES_UBO) {
-            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k);
+            for (uint32_t k = 0; k < cnt; k++) BI_CUR(k), o[k].buffer = ubo_info(ex, st, r->slot + (int)k);
         } else if (b->kind == GFX_RES_SSBO) {
-            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ssbo_info(ex, st, r, r->flags & 1);
+            for (uint32_t k = 0; k < cnt; k++) BI_CUR(k), o[k].buffer = ssbo_info(ex, st, r, r->flags & 1);
         } else if (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) {
             int img = b->kind == GFX_RES_IMG;
             if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
@@ -2282,6 +2390,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                     uint64_t h = 0;
                     if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                     else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
+                    BI_CUR(k);
                     tex_info(ex, r, h, img, r->separate, &o[k].image, &locked);
                     o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
                 }
@@ -2289,6 +2398,26 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             }
         } else {
             rt_fatal("vk: binding %u has an unknown kind %d", (unsigned)b->binding, (int)b->kind);
+        }
+        D->BI.cur = NULL;
+#undef BI_CUR
+        if (cmp && memcmp(prev, o, cnt * sizeof *o)) changed[set_of] = 1;
+        if (bim == 2 && inc && !D->BI.plan[i]) {   // check: on would have kept these
+            D->BC.checked++;
+            for (uint32_t k = 0; k < cnt; k++) {
+                const BiMeta *mo = &D->BI.mold[nd + k], *mn = &meta[nd + k];
+                if (!memcmp(&D->BI.old[nd + k], &o[k], sizeof *o) && mo->n == mn->n &&
+                    (!mn->n || (mo->cls == mn->cls && mo->use == mn->use && mo->bytes == mn->bytes)))
+                    continue;
+                bi_mismatch(ex, BIM_DESC, "binding %u (stage %d, kind %d, slot %d + %u, set %u): kept %016llx %016llx %016llx, "
+                            "built %016llx %016llx %016llx; census %d/%d/%llu x%u, now %d/%d/%llu x%u", (unsigned)b->binding,
+                            st, (int)b->kind, r ? r->slot : -1, k, set_of, (unsigned long long)D->BI.old[nd + k].w[0],
+                            (unsigned long long)D->BI.old[nd + k].w[1], (unsigned long long)D->BI.old[nd + k].w[2],
+                            (unsigned long long)o[k].w[0], (unsigned long long)o[k].w[1], (unsigned long long)o[k].w[2],
+                            mo->cls, mo->use, (unsigned long long)mo->bytes, mo->n, mn->cls, mn->use,
+                            (unsigned long long)mn->bytes, mn->n);
+                break;
+            }
         }
         if (need_w) {
             w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -2326,6 +2455,10 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         }
         if (s ? info->push1 : info->push) {
             uint32_t n = gfx && push_skip_on() ? dbytes : 0;
+            if (inc && bim == 1 && !changed[s] && n && D->B.ds_pushed[s] && D->DS.pn[s] == n) {   // psig holds ds
+                D->BS.push_skip++;
+                continue;
+            }
             if (n && D->B.ds_pushed[s] && D->DS.pn[s] == n && !memcmp(D->DS.psig[s], ds, n)) {
                 D->BS.push_skip++;
                 continue;
@@ -2345,7 +2478,8 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         } else {
             VkDescriptorSetLayout sl = s ? info->set_layout1 : info->set_layout;
             VkDescriptorSet set = D->B.ds_last[s];
-            if (!set || D->B.ds_last_layout[s] != sl || D->DS.n[s] != dbytes || memcmp(D->DS.sig[s], ds, dbytes)) {
+            int kept = inc && bim == 1 && !changed[s] && set && D->B.ds_last_layout[s] == sl && D->DS.n[s] == dbytes;
+            if (!kept && (!set || D->B.ds_last_layout[s] != sl || D->DS.n[s] != dbytes || memcmp(D->DS.sig[s], ds, dbytes))) {
                 set = alloc_set(ex, sl);
                 write_set(info, s, set, ds, w, i0, i1);
                 D->B.ds_last[s] = set, D->B.ds_last_layout[s] = sl, D->DS.n[s] = dbytes;
@@ -2383,6 +2517,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         }
         D->B.res_valid = valid;
     }
+    if (bim) D->BI.info = info;
     ex->recorded++;
 }
 
@@ -2999,7 +3134,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     repeat_stats(ex, info);
     if (bim) bi_gt(ex, bgt), bi_gb(ex, bgb);
     if (bim == 2) bi_census(ex, info, sp, bgt, bgb, bsg, sm_hit);   // on counts nothing: it is what gets timed
-    bind_resources(ex, info);
+    bind_resources(ex, info, bim ? bgt : NULL, bgb);
     if (fbl & ex->fb_dirty) feedback_barrier(ex);
     feedback_written(ex, sp);
     bind_vertex_buffers(ex);
@@ -3919,7 +4054,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     D->c0_dim[0] = (uint32_t)d->x, D->c0_dim[1] = (uint32_t)d->y, D->c0_dim[2] = (uint32_t)d->z;
     D->twin_dispatch = 1;
-    bind_resources(ex, info);
+    bind_resources(ex, info, NULL, NULL);
     D->twin_dispatch = 0;
     VkPassMark *m = dispatch_mark(ex, cs, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
@@ -3950,7 +4085,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     D->c0_dim[0] = D->c0_dim[1] = D->c0_dim[2] = 0;
     D->B.c0_valid[2] = 0;   // a fresh c0 range: the copy below must not change one an earlier dispatch reads
     D->twin_dispatch = 1;
-    bind_resources(ex, info);
+    bind_resources(ex, info, NULL, NULL);
     D->twin_dispatch = 0;
     if (D->B.c0_valid[2]) {   // the shader binds c0
         VkBufferCopy cp = {ip.offset, D->B.c0_off[2] + 0x200, sizeof(VkDispatchIndirectCommand)};
@@ -4158,6 +4293,7 @@ static int ub_bind(VkExec *ex, uint64_t addr, uint64_t n, uint64_t align, VkDesc
     VkDeviceSize o;
     uint8_t *dst = scratch(ex, n, &b, &o);
     ex->draw->RS.volatile_ = 1;
+    if (ex->draw->BI.cur) ex->draw->BI.cur->vol = 1;
     const uint8_t *base = vk_usnap_bytes(addr, n);
     VkMemSpan sp;
     if (base) memcpy(dst, base, n);
