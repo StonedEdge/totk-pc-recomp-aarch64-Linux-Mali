@@ -299,7 +299,7 @@ typedef struct {
     uint8_t sx[4];                       // the state fields a draw sets: prim, restart, feedback, depth_minus_w
     uint8_t sm_ok;                       // the shader memo (SM) holds this draw's shaders and lookup inputs
     uint8_t fb_ok;                       // VkExec's feedback scan memo (fb_fs ...) holds this draw's scan
-    uint32_t vmask;
+    uint32_t vmask, vused;               // vused: the streams its bind_vertex_buffers resolved
     uint64_t vgen;
 } BiLast;
 typedef struct {
@@ -2461,6 +2461,15 @@ static void bind_vertex_buffers(VkExec *ex) {
     // submission is done.
     uint32_t used = vb_used_on() && D->B.st_valid ? D->B.vmask : VK_PIPE_ALL_BINDINGS;
     uint32_t chg = 0;
+    // TOTK_BIND_INC: the last prepared draw resolved and bound these streams, and since then no op changed one of their
+    // ranges, the pools and mirrors stayed (vk_mem_gen) and, with static vertex input, the strides (pipe_gen): every
+    // stream would resolve to what is bound, so the loop is skipped.
+    int bim = bind_inc_mode(), keep = 0;
+    if (bim && D->B.bi_valid && D->B.vb_valid && !ex->chunked && used == D->BL.vused && !(ex->dirt.vbuf & used) &&
+        D->B.vgen == vk_mem_gen() && (dyn || ex->pipe_gen == D->BL.pipe_gen)) {
+        if (bim == 1) return;
+        keep = 1;
+    }
     if (!D->B.vb_valid) {   // the command buffer's first bind sets all 17 slots, the zero buffer where nothing resolves
         for (int b = 0; b < 17; b++)
             D->B.vb[b] = Z.zbuf, D->B.vo[b] = 0, D->B.vsz[b] = ZERO_BYTES, D->B.vstr[b] = b < 16 ? ex->pipe.vstream[b].stride : 0,
@@ -2495,6 +2504,10 @@ static void bind_vertex_buffers(VkExec *ex) {
         }
         if (nb != D->B.vb[b] || no != D->B.vo[b] || nsz != D->B.vsz[b] || (!dyn && nstr != D->B.vstr[b])) chg |= 1u << b;
         D->B.vb[b] = nb, D->B.vo[b] = no, D->B.vsz[b] = nsz, D->B.vstr[b] = nstr, D->B.vcls[b] = ncls, D->B.vpool[b] = npool;
+    }
+    if (keep) {
+        D->BC.checked++;
+        if (chg) bi_mismatch(ex, BIM_VB, "streams %#x would be bound again (used %#x)", chg, used);
     }
     if (!chg) return;
     // One bind over the changed slots; the slots between them get what they hold again.
@@ -2779,6 +2792,7 @@ static void bi_done(VkExec *ex, const VkPipeInfo *info, const VkPipeState *s, co
     L->vs = s->vs, L->fs = s->fs;
     L->sx[0] = s->prim, L->sx[1] = s->prim_restart, L->sx[2] = s->feedback, L->sx[3] = s->depth_minus_w;
     L->vmask = D->B.vmask, L->vgen = D->B.vgen;
+    L->vused = vb_used_on() && D->B.st_valid ? D->B.vmask : VK_PIPE_ALL_BINDINGS;
     L->sm_ok = (uint8_t)(D->SM.valid && D->SM.vs == s->vs && D->SM.fs == s->fs && D->SM.k.prog == ex->prog);
     L->fb_ok = (uint8_t)(s->fs && ex->fb_fs == s->fs && ex->fb_serial == ex->tex_serial && ex->fb_pass == ex->pass_serial);
     memset(&ex->dirt, 0, sizeof ex->dirt);
