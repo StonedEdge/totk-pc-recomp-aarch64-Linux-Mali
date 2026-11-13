@@ -210,6 +210,7 @@ typedef struct {
     uint32_t ubo[2];                     // uniform slots 3..20 (bit slot - 3: the OP_BIND_UBO index)
     uint32_t ssbo[2];                    // storage slots read through c0's table
     uint64_t tex[2][2];                  // texture handle slots 0..127
+    uint64_t ftex[2];                    // every fragment texture slot, buffer textures too (feedback_scan reads them)
     uint32_t img[2];                     // image handle slots 0..31
     uint8_t c0[2], c1[2];                // reads c0 (every storage slot and the base instance), the compiler constants
     uint8_t gfx;                         // every binding is a vertex or fragment one
@@ -297,6 +298,7 @@ typedef struct {
     const GfxShader *vs, *fs;
     uint8_t sx[4];                       // the state fields a draw sets: prim, restart, feedback, depth_minus_w
     uint8_t sm_ok;                       // the shader memo (SM) holds this draw's shaders and lookup inputs
+    uint8_t fb_ok;                       // VkExec's feedback scan memo (fb_fs ...) holds this draw's scan
     uint32_t vmask;
     uint64_t vgen;
 } BiLast;
@@ -1432,9 +1434,25 @@ static SubRange sampled_sub(uint64_t h) {   // texture lock held
 
 // Attachments of the open pass the fragment shader fs samples; kept while the shader, the texture bindings and the
 // pass stay the same.
+static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info);
+
 static uint32_t feedback_scan(VkExec *ex, const GfxShader *fs) {
     VkExecDraw *D = ex->draw;
     if (ex->fb_fs == fs && ex->fb_serial == ex->tex_serial && ex->fb_pass == ex->pass_serial) return ex->fb_sampled;
+    // TOTK_BIND_INC: the memo holds the last prepared draw's scan (BL.fb_ok) of this shader in this pass, and since then
+    // no op changed a fragment texture slot the shader reads (the pipeline's BiMask.ftex) and no slot was registered:
+    // a texture bind elsewhere (tex_serial) no longer forces the scan.
+    int bim = bind_inc_mode(), keep = 0;
+    if (bim && D->B.bi_valid && D->BL.fb_ok && !ex->chunked && ex->fb_fs == fs && D->BL.fs == fs &&
+        ex->fb_pass == ex->pass_serial && vk_texture_slots_gen() == D->BL.slots_gen) {
+        const BiMask *bm = &rs_list(ex, D->BL.info)->m;
+        keep = !(ex->dirt.tex[NVN_STAGE_FS][0] & bm->ftex[0]) && !(ex->dirt.tex[NVN_STAGE_FS][1] & bm->ftex[1]);
+        if (keep && bim == 1) {
+            ex->fb_serial = ex->tex_serial;
+            return ex->fb_sampled;
+        }
+    }
+    uint32_t kept = ex->fb_sampled;
     const GfxShaderRes *res;
     int n = gfx_shader_resources(fs, GFX_RES_TEX, &res);
     uint32_t m = 0, gen = vk_texture_slots_gen();   // before any lookup
@@ -1463,6 +1481,10 @@ static uint32_t feedback_scan(VkExec *ex, const GfxShader *fs) {
             else f->h = 0;
         }
     if (locked) vk_texture_unlock();
+    if (keep) {
+        D->BC.checked++;
+        if (m != kept) bi_mismatch(ex, BIM_FB, "sampled attachments %#x, kept %#x", m, kept);
+    }
     ex->fb_fs = fs, ex->fb_serial = ex->tex_serial, ex->fb_pass = ex->pass_serial, ex->fb_sampled = m;
     return m;
 }
@@ -2025,6 +2047,11 @@ static void bi_mask(const VkPipeInfo *info, BiMask *m) {
                 else if (!img && slot >= 0 && slot < 128) m->tex[st][slot >> 6] |= 1ull << (slot & 63);
             }
         }
+        if (b->kind == GFX_RES_TEX && st == NVN_STAGE_FS)
+            for (uint32_t k = 0; k < cnt; k++) {
+                int slot = r->slot + (int)k;
+                if (slot >= 0 && slot < 128) m->ftex[slot >> 6] |= 1ull << (slot & 63);
+            }
     }
 }
 
@@ -2753,6 +2780,7 @@ static void bi_done(VkExec *ex, const VkPipeInfo *info, const VkPipeState *s, co
     L->sx[0] = s->prim, L->sx[1] = s->prim_restart, L->sx[2] = s->feedback, L->sx[3] = s->depth_minus_w;
     L->vmask = D->B.vmask, L->vgen = D->B.vgen;
     L->sm_ok = (uint8_t)(D->SM.valid && D->SM.vs == s->vs && D->SM.fs == s->fs && D->SM.k.prog == ex->prog);
+    L->fb_ok = (uint8_t)(s->fs && ex->fb_fs == s->fs && ex->fb_serial == ex->tex_serial && ex->fb_pass == ex->pass_serial);
     memset(&ex->dirt, 0, sizeof ex->dirt);
     D->B.bi_valid = 1;
 }
