@@ -327,7 +327,7 @@ typedef struct {
     BiMeta meta[MAX_DESC];
     VkDescSlot old[MAX_DESC];            // check mode: the descriptors before the build
     BiMeta mold[MAX_DESC];
-    uint8_t plan[MAX_BINDINGS];          // bindings to build again (bi_plan)
+    uint8_t plan[MAX_BINDINGS];          // per binding (bi_plan): BI_AGAIN, or the generations it depends on
 } BiDesc;
 
 // TOTK_BIND_INC on: graphics descriptor sets shared within a submission and allocated in batches (bi_set_find,
@@ -2313,6 +2313,10 @@ static void write_set(const VkPipeInfo *info, uint32_t s, VkDescriptorSet set, c
 static int bind_inc_mode(void);
 static void bi_mismatch(VkExec *ex, int kind, const char *fmt, ...);
 
+static void bi_gt(const VkExec *ex, uint64_t g[4]);
+static void bi_gb(const VkExec *ex, uint64_t g[4]);
+enum { BI_AGAIN = 1, BI_TEX = 2, BI_BUF = 4 };   // BiDesc.plan: build again; kept while G_tex / G_buf stay
+
 // TOTK_BIND_INC: which bindings of a graphics draw with the last prepared draw's pipeline must be built again (BI.plan,
 // 1 each), from the marks since that draw and the generations G_tex and G_buf read right before this build (gt, gb)
 // against those read before its build. 0 when nothing can be kept: no last draw in this command buffer, another
@@ -2363,7 +2367,11 @@ static int bi_plan(VkExec *ex, const VkPipeInfo *info, const uint64_t gt[4], con
                 else again = slot >= 0 && slot < 128 && (dt->tex[st][slot >> 6] >> (slot & 63) & 1);
             }
         }
-        D->BI.plan[i] = (uint8_t)again;
+        // A kept binding also depends on the generations its build reads: a lookup or resolve of a binding built again
+        // in this draw may move them (an entry made, a mirror created), and the bindings after it are then built too.
+        int dep = (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) ? BI_TEX
+                : b->kind == GFX_RES_UBO || b->kind == GFX_RES_SSBO ? BI_BUF : 0;
+        D->BI.plan[i] = (uint8_t)(again ? BI_AGAIN : dep);
         nd += cnt;
     }
     return 1;
@@ -2412,6 +2420,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info, const uint64_t *b
         memcpy(D->BI.old, d, n * sizeof *d), memcpy(D->BI.mold, meta, n * sizeof *meta);
     }
     uint32_t nd = 0;
+    int midmv = 0, built = 0;   // inc: generations a build in this draw moved; a binding was built since the last read
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *b = &info->bindings[i];
         const GfxShaderRes *r = b->res;
@@ -2421,7 +2430,20 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info, const uint64_t *b
         VkDescSlot *o = &d[nd];
         int st = nvn_stage_of(b->stage), kind = 0;   // kind: 0 buffer, 1 image, 2 texel buffer view
         uint32_t set_of = n_sets == 2 && i >= lo[1] ? 1 : 0;
-        if (inc && bim == 1 && !D->BI.plan[i]) {   // kept: what it counted is counted again
+        int keepb = 0;
+        if (inc && !(D->BI.plan[i] & BI_AGAIN)) {
+            if (built && (D->BI.plan[i] & ~midmv)) {
+                uint64_t g[4];
+                bi_gt(ex, g);
+                if (memcmp(g, bgt, sizeof g)) midmv |= BI_TEX;
+                bi_gb(ex, g);
+                if (memcmp(g, bgb, sizeof g)) midmv |= BI_BUF;
+                built = 0;
+            }
+            keepb = !(D->BI.plan[i] & midmv);
+        }
+        if (!keepb) built = 1;
+        if (bim == 1 && keepb) {   // kept: what it counted is counted again
             for (uint32_t k = 0; k < cnt; k++)
                 if (meta[nd + k].n) vk_mem_count(meta[nd + k].cls, meta[nd + k].use, meta[nd + k].bytes);
             nd += cnt;
@@ -2482,7 +2504,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info, const uint64_t *b
         D->BI.cur = NULL;
 #undef BI_CUR
         if (cmp && memcmp(prev, o, cnt * sizeof *o)) changed[set_of] = 1;
-        if (bim == 2 && inc && !D->BI.plan[i]) {   // check: on would have kept these
+        if (bim == 2 && keepb) {   // check: on would have kept these
             D->BC.checked++;
             for (uint32_t k = 0; k < cnt; k++) {
                 const BiMeta *mo = &D->BI.mold[nd + k], *mn = &meta[nd + k];
