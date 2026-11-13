@@ -296,6 +296,7 @@ typedef struct {
     uint32_t binst, slots_gen, pass_serial, tex_serial;
     const GfxShader *vs, *fs;
     uint8_t sx[4];                       // the state fields a draw sets: prim, restart, feedback, depth_minus_w
+    uint8_t sm_ok;                       // the shader memo (SM) holds this draw's shaders and lookup inputs
     uint32_t vmask;
     uint64_t vgen;
 } BiLast;
@@ -2751,6 +2752,7 @@ static void bi_done(VkExec *ex, const VkPipeInfo *info, const VkPipeState *s, co
     L->vs = s->vs, L->fs = s->fs;
     L->sx[0] = s->prim, L->sx[1] = s->prim_restart, L->sx[2] = s->feedback, L->sx[3] = s->depth_minus_w;
     L->vmask = D->B.vmask, L->vgen = D->B.vgen;
+    L->sm_ok = (uint8_t)(D->SM.valid && D->SM.vs == s->vs && D->SM.fs == s->fs && D->SM.k.prog == ex->prog);
     memset(&ex->dirt, 0, sizeof ex->dirt);
     D->B.bi_valid = 1;
 }
@@ -2779,7 +2781,21 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     int bim = bind_inc_mode(), sm_hit = 0;
     uint64_t bgt[4], bgb[4];   // TOTK_BIND_INC: G_tex and G_buf right before the descriptors are built
     uint32_t bsg = bim ? vk_texture_slots_gen() : 0;   // the shaders' slot generation, before shader_for
-    if (memo && D->SM.valid && memo_match(ex, gen, &D->SM.k)) {
+    // TOTK_BIND_INC: the shader memo holds the last prepared draw's shaders (BL.sm_ok), and since then no op changed the
+    // program, its serial, the bound state, the slot generation, or a texture or image slot of either stage whose type
+    // the program's translation reads (slot_mask_of; ~0u while unknown): shader_for would answer the same.
+    int sh_keep = 0;
+    if (bim && memo && D->SM.valid && D->B.bi_valid && D->BL.sm_ok && !ex->chunked && !ex->dirt.prog &&
+        ex->prog == D->BL.prog && ex->prog->serial == D->BL.serial && ex->pipe_gen == D->BL.pipe_gen &&
+        bsg == D->BL.slots_gen) {
+        uint32_t m0 = slot_mask_of(D, ex->prog->serial, NVN_STAGE_VS), m1 = slot_mask_of(D, ex->prog->serial, NVN_STAGE_FS);
+        sh_keep = !((uint32_t)ex->dirt.tex[NVN_STAGE_VS][0] & m0) && !(ex->dirt.img[NVN_STAGE_VS] & m0) &&
+                  !((uint32_t)ex->dirt.tex[NVN_STAGE_FS][0] & m1) && !(ex->dirt.img[NVN_STAGE_FS] & m1);
+    }
+    if (sh_keep && bim == 1) {
+        vs = D->SM.vs, fs = D->SM.fs, has_vs = 1, has_fs = D->SM.has_fs;
+        sm_hit = 1;
+    } else if (memo && D->SM.valid && memo_match(ex, gen, &D->SM.k)) {
         vs = D->SM.vs, fs = D->SM.fs, has_vs = 1, has_fs = D->SM.has_fs;
         sm_hit = 1;
         if (memo == 2) {
@@ -2794,6 +2810,12 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         fs = shader_for(ex, NVN_STAGE_FS, &has_fs, &fs_wait, 0);
         if (memo && vs && !vs_wait && !fs_wait && (!has_fs || fs))
             memo_key(ex, gen, &D->SM.k), D->SM.vs = vs, D->SM.fs = fs, D->SM.has_fs = has_fs, D->SM.valid = 1;
+    }
+    if (sh_keep && bim == 2) {
+        D->BC.checked++;
+        if (vs != D->BL.vs || fs != D->BL.fs || vs_wait || fs_wait)
+            bi_mismatch(ex, BIM_SHADER, "vs %p fs %p (kept %p %p), pending %d %d", (const void *)vs, (const void *)fs,
+                        (const void *)D->BL.vs, (const void *)D->BL.fs, vs_wait, fs_wait);
     }
     if (!has_vs) return warn_once(W_NO_VS, "a draw with a program that has no vertex stage is skipped"), 0;
     // A draw into a target the previous frame did not render (or into none) waits for a pending shader or pipeline:
