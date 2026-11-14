@@ -2863,9 +2863,9 @@ static int pipe_memo_on(void) {
 static int bind_inc_mode(void) {   // 0 off, 1 on, 2 check
     static int mode = -1;
     if (mode < 0) {
-        const char *e = cfg_get("TOTK_BIND_INC");
-        int m = !e || !*e || !strcmp(e, "off") || !strcmp(e, "0") ? 0 : !strcmp(e, "check") ? 2 : 1;
-        if (m) rt_log("vk_exec: incremental draw preparation (TOTK_BIND_INC) %s", m == 2 ? "check" : "on");
+        const char *e = cfg_value("TOTK_BIND_INC");
+        int m = !strcmp(e, "off") || !strcmp(e, "0") ? 0 : !strcmp(e, "check") ? 2 : 1;
+        rt_log("vk_exec: incremental draw preparation (TOTK_BIND_INC) %s", m == 2 ? "check" : m ? "on" : "off");
         mode = m;
     }
     return mode;

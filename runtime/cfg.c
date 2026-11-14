@@ -106,7 +106,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"LIB_PREBUILD", "performance"}, {"LIB_PREBUILD_THREADS", "performance"}, {"PIPE_PREBUILD", "performance"},
     {"PREWARM_XLATE", "performance"}, {"GPL", "performance"}, {"ASTC", "performance"}, {"MEMORY", "performance"},
     {"TEX_ALIAS", "performance"}, {"TEX_VRAM_PRESSURE", "performance"}, {"TEX_RELEASED_MIB", "performance"}, {"TEX_BLOCK_MIB", "performance"}, {"VMA_BLOCK_MIB", "performance"}, {"ASTC_BC", "performance"}, {"LOD_GUARD", "performance"}, {"FIX_C0", "performance"}, {"FIX_ZERO", "performance"},
-    {"BIND_SKIP", "performance"}, {"SHADER_MEMO", "performance"}, {"PIPE_MEMO", "performance"}, {"MEMX", "performance"}, {"TEX_MEMO", "performance"}, {"VB_USED", "performance"}, {"DESC_TEMPLATE", "performance"},
+    {"BIND_SKIP", "performance"}, {"SHADER_MEMO", "performance"}, {"PIPE_MEMO", "performance"}, {"MEMX", "performance"}, {"BIND_INC", "performance"}, {"TEX_MEMO", "performance"}, {"VB_USED", "performance"}, {"DESC_TEMPLATE", "performance"},
     {"SYNC_AHEAD", "performance"}, {"SHADOW_DEFER", "performance"}, {"PUSH_SKIP", "performance"}, {"SPLIT_DRAWS", "performance"}, {"SPLIT_US", "performance"}, {"VK_VALIDATION", "performance"},
     {"VK_DYN_VERTEX", "performance"}, {"VK_DYN_A2C", "performance"}, {"VK_SUBGROUP_PIN", "performance"},
     {"OPTREF_GUARD", "performance"}, {"ABILITY_GUARD", "performance"}, {"REPORT_GUARD", "performance"},
@@ -209,7 +209,7 @@ static const CfgMeta metas[] = {
     {"OPTREF_GUARD", "1", "0|1", RESTART}, {"ABILITY_GUARD", "1", "0|1", RESTART}, {"REPORT_GUARD", "1", "0|1", RESTART},
     // render fixes
     {"LOD_GUARD", "1", "0|1", RESTART}, {"FIX_C0", "1", "0|1", RESTART}, {"FIX_ZERO", "1", "0|1", RESTART},
-    {"BIND_SKIP", "1", "0|1", RESTART}, {"SHADER_MEMO", "1", "0|1", RESTART}, {"PIPE_MEMO", "1", "0|1", RESTART}, {"MEMX", "1", "0|1|check", RESTART}, {"TEX_MEMO", "1", "0|1", RESTART},
+    {"BIND_SKIP", "1", "0|1", RESTART}, {"SHADER_MEMO", "1", "0|1", RESTART}, {"PIPE_MEMO", "1", "0|1", RESTART}, {"MEMX", "1", "0|1|check", RESTART}, {"BIND_INC", "1", "0|1|check", RESTART}, {"TEX_MEMO", "1", "0|1", RESTART},
     {"VB_USED", "1", "0|1", RESTART},
     {"DESC_TEMPLATE", "1", "0|1", RESTART},
     {"PUSH_SKIP", "1", "0|1", RESTART}, {"SPLIT_DRAWS", "64", "0..1000", RESTART},
