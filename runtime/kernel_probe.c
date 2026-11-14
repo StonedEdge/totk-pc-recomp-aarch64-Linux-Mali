@@ -777,7 +777,12 @@ static void crash_child_main(Cpu *c) {
     if (mode && !strcmp(mode, "shape")) crash_shape_fill(c);
     c->x[19] = (uint64_t)(uintptr_t)&crash_guest_words[2];
     c->sp -= 0x100;   // a frame on the guest stack, as a crashing function has
+#if defined(__x86_64__)
     __asm__ volatile("movq %0, %%rbx\n\tmovq 0x10, %%rax" : : "r"(&crash_host_words[2]) : "rax", "rbx", "memory");
+#else
+    // The x86-64 register checks of test_crash_report do not apply here; the child only faults at 0x10.
+    (void)*(volatile uint64_t *)(uintptr_t)0x10;
+#endif
 }
 
 // The report line that holds needle, NULL when none does
@@ -796,6 +801,11 @@ static void test_crash_report(void) {
     int code = plat_run_self(CRASH_CHILD_ENV, "1", out, sizeof out, 30000);
     CHECK(code == 71 && strstr(out, "FATAL: access violation") && strstr(out, "reading address 0x10"),
           "crash child: exit code %d, no access violation at 0x10 reported", code);
+#if !defined(__x86_64__)
+    printf("crash report: exit code %d (host register checks are for x86-64 only)\n", code);
+    (void)line, (void)want;
+    return;
+#endif
     snprintf(want, sizeof want, "rbx %016llx", (unsigned long long)(uintptr_t)&crash_host_words[2]);
     CHECK(strstr(out, want), "crash report: no host register line with %s", want);
     CHECK(report_line(out, "host code at rip-", line, sizeof line) && strstr(line, "| 48 8b 04 25 10 00 00 00"),
