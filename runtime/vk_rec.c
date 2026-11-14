@@ -147,12 +147,17 @@ static void *put(uint32_t op, size_t bytes) {
     return &ring[pos + 1];
 }
 
+// Publishes the packets put so far. The recorder is checked for sleep at most once every TOTK_REC_WAKE_WORDS words
+// (the batch), and the check goes through a full fence: rec_main stores Q.sleeping and then reads Q.head, so without
+// the fence between the head store here and the read of Q.sleeping both sides can miss each other (AArch64 reorders a
+// store before a later load, as x86 can) and the recorder sleeps out its 2 ms timeout with packets waiting. Upstream
+// fixed the same race in its pub_now (issue #1174).
 static void pub(void) {
     __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
-    if (!__atomic_load_n(&Q.sleeping, __ATOMIC_RELAXED)) return;
     if (rec_wake_words && Q.put_h - woke_h < rec_wake_words) return;   // batched (TOTK_REC_WAKE_WORDS)
     woke_h = Q.put_h;
-    plat_event_set(&wake_ev);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&Q.sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
 }
 
 // Until the recorder's tail reaches target (ge: at least target, else exactly). The wait sleeps at most 200 us at a
@@ -283,7 +288,9 @@ int rec_split_async(VkCommandBuffer cb, VkCommandBuffer next, uint64_t fence) {
     A_EndSubmit *a = put(R_EndSubmit, sizeof *a);
     *a = (A_EndSubmit){next, fence};
     sub_h = Q.put_h;
-    pub();
+    // A part's end is woken for at once, not batched: the GPU gets nothing of the part until the recorder submits it.
+    __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
+    wake();
     rec_cb = next;
     __atomic_store_n(&part_h0, Q.put_h, __ATOMIC_RELEASE);
     RS_.async_parts++;
