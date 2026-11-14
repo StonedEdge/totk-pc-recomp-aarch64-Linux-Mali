@@ -13,6 +13,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "memx.h"
 #include "vk.h"
 #include "platform/platform.h"
 
@@ -32,34 +33,30 @@ static struct {
     uint64_t pub_words;                       // TOTK_REC_PUB: publish head once this many words wait (pub)
 } Q;
 static PlatEvent wake_ev;              // auto-reset
-// TOTK_REC_SPIN_US (default 200, 20 on AArch64 with cores of two speeds; 0: 4096 pauses, as before): how long an idle
-// recorder spins before it sleeps. A spinning recorder holds a core: on the CM5 a fast one the game's threads queue for.
-static uint64_t rec_spin_ns;
-// TOTK_REC_DRAIN_SLEEP (default 1; 0: spin, then sched_yield until the recorder catches up, as before): a producer
-// waiting for the recorder (rec_drain) spins briefly, then sleeps on drain_ev, which the recorder sets at the end of
-// each batch while drain_wait is set. On the CM5 the yield loop made ~10,000 sched_yield calls a second on the render
-// thread while moving (TOTK_TRACE=sched host yields), on cores the game's threads queue for.
-static PlatEvent drain_ev;
-static volatile int32_t drain_wait;
-static int rec_drain_sleep = 1;
 static VkCommandBuffer rec_cb;         // producer: the part being recorded, whose vkCmd* become packets
 static VkCommandBuffer r_cb;           // recorder: the command buffer its packets go into (set by a BeginCb packet)
 static int rec_live;                   // producer: rec_begin started the recorder for rec_cb
 static int end_mode = -1;              // TOTK_REC_END (rec_own)
 static int sub_pending;                // producer: the recorder ended a part that rec_submit has not handed over yet
 static volatile VkResult r_sub_res;    // recorder: the result of its last vkQueueSubmit2, read after the drain
+static volatile VkResult r_sub_err;    // recorder: the first vkQueueSubmit2 that failed (rec_submit reports it)
+static volatile uint64_t q_subs;       // producer: submissions queued for the recorder (rec_submit)
+static volatile uint64_t r_subs;       // recorder: submissions it handed to the driver (submit_run)
+static _Thread_local int on_rec;       // the calling thread is the recorder
+static int rec_async = -1;             // TOTK_REC_ASYNC (rec_submit)
+static struct { uint64_t n, ns; } RQ_; // waits in rec_queue_wait, logged by rec_stats_log
 static PlatThread *rec_thread;
 static int rec_prio;                   // the submitting thread's priority, which the recorder takes
 static int rec_chk;                    // TOTK_REC_CHECK (rec_check_handle)
 static uint64_t rec_delay_ns;          // TOTK_REC_DELAY_US (rec_main)
+static uint64_t rec_spin_ns;           // TOTK_REC_SPIN_US (rec_main); 0: 4096 pauses
+static int rec_spin_ab;                // TOTK_REC_SPIN_US=ab: the timed poll in the B blocks of TOTK_AB only
 static volatile uint64_t part_h0;      // Q.put_h at rec_begin: where the packets of the part being recorded start
 static volatile uint64_t part_fence;   // the value of the part being recorded (rec_begin)
+static uint64_t r_sleeps;              // recorder: sleeps on wake_ev, read by rec_stats_log
 
 // Producer statistics, logged by rec_stats_log.
-static struct {
-    _Alignas(64) uint64_t packets, words, drains, fallbacks, drain_ns, full_waits, parts, parts_on, submits;
-    uint64_t async_submits, sub_waits, sub_wait_ns;
-} RS_;
+static struct { _Alignas(64) uint64_t packets, words, drains, fallbacks, drain_ns, full_waits, parts, parts_on, submits, wakes; } RS_;
 
 enum {
     R_PAD, R_BeginQuery, R_BeginRendering, R_BindDescriptorSets, R_BindIndexBuffer, R_BindPipeline, R_BindVertexBuffers2,
@@ -83,20 +80,33 @@ static void exec_packet(uint32_t op, void *p);
 static void rec_main(void *arg) {
     (void)arg;
     plat_thread_priority(rec_prio);
+    on_rec = 1;
+    perf_core_thread(PCORE_RECORDER);
     uint64_t t = 0;
     for (;;) {
         uint64_t h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
         if (t == h) {
-            if (rec_spin_ns) {
-                for (uint64_t t0 = now_ns(); t == h && now_ns() - t0 < rec_spin_ns;)
-                    for (int i = 0; i < 64 && t == h; i++) plat_pause(), h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
+            // Poll for the next packets before sleeping: a sleep costs the producer an event set and the recorder
+            // an OS wake-up. The poll is timed (TOTK_REC_SPIN_US, default 60) because a pause takes 8-150 cycles
+            // depending on the CPU: 4096 of them are ~140 us on a Coffee Lake i7 and a few us on Zen 4. With fewer than
+            // 6 logical processors it stays 4096 pauses. Savage Wind Recomp's recorder polls 60 us the same way.
+            if (rec_spin_ns && (!rec_spin_ab || rt_ab())) {
+                uint64_t t0 = now_ns();
+                for (unsigned i = 1; t == h; i++) {
+                    plat_pause();
+                    h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
+                    if (!(i & 31) && now_ns() - t0 >= rec_spin_ns) break;
+                }
             } else {
                 for (int i = 0; i < 4096 && t == h; i++) plat_pause(), h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
             }
             if (t == h) {
                 __atomic_store_n(&Q.sleeping, 1, __ATOMIC_SEQ_CST);
                 h = __atomic_load_n(&Q.head, __ATOMIC_SEQ_CST);
-                if (t == h) plat_event_wait_ns(&wake_ev, 2000000);   // a missed wake costs at most 2 ms
+                if (t == h) {
+                    __atomic_add_fetch(&r_sleeps, 1, __ATOMIC_RELAXED);
+                    plat_event_wait_ns(&wake_ev, 2000000);   // a missed wake costs at most 2 ms
+                }
                 __atomic_store_n(&Q.sleeping, 0, __ATOMIC_RELAXED);
                 continue;
             }
@@ -111,8 +121,7 @@ static void rec_main(void *arg) {
             t += n;
             if ((k & 63) == 63) __atomic_store_n(&Q.tail, t, __ATOMIC_RELEASE);
         }
-        __atomic_store_n(&Q.tail, t, __ATOMIC_SEQ_CST);   // seq_cst with the drain_wait load (wait_tail)
-        if (__atomic_load_n(&drain_wait, __ATOMIC_SEQ_CST)) plat_event_set(&drain_ev);
+        __atomic_store_n(&Q.tail, t, __ATOMIC_RELEASE);
     }
     return;
 }
@@ -121,7 +130,7 @@ static void rec_main(void *arg) {
 
 static void wake(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&Q.sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
+    if (__atomic_load_n(&Q.sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev), RS_.wakes++;
 }
 
 // Room for need words: the tail read last leaves it in all but about one packet in 16 MiB of them.
@@ -161,36 +170,26 @@ static void *put(uint32_t op, size_t bytes) {
 // rec_drain), and the packets that begin and end a part go out at once (pub_now), so the recorder begins and ends
 // command buffers as early as before; TOTK_REC_CHECK publishes every packet, since rec_check_handle searches the ring
 // up to head.
+// The batch is 64 words (512 bytes) where the recorder polls before it sleeps, 8192 (64 KiB) where it does not (fewer
+// than 6 usable logical processors, rec_spin_ns): there it is mostly asleep when a batch goes out, and each publish
+// cost the producer an event set and the recorder a wake-up. Savage Wind Recomp measured that at 6.7% of its render
+// thread's busy time on 4 cores and moved to 64 KiB there (runtime/nvn/vulkan/record.c rec_init, publish_every).
+// TOTK_REC_PUB=<words> sets the batch; =ab: 64 words in the A blocks of TOTK_AB, 8192 in the B blocks.
+// The wake goes through wake(), whose full fence orders the head store before the read of Q.sleeping. rec_main sets
+// Q.sleeping and then reads head; without the fence x86 may read Q.sleeping before the head store is visible, both
+// sides miss each other and the recorder sleeps out its 2 ms timeout with the packets waiting. Since rec_submit returns
+// without a drain (TOTK_REC_ASYNC=1), its publish is the last one of a submission, and every queue user then waited in
+// rec_queue_wait for that timeout (issue #1174: 1.6 to 3.4 ms a wait on an RX 9070 XT).
+static int pub_ab;
 static void pub_now(void) {
     Q.pub_h = Q.put_h;
     __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
-    if (__atomic_load_n(&Q.sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
+    wake();
 }
 
 static void pub(void) {
-    if (Q.put_h - Q.pub_h >= Q.pub_words) pub_now();
-}
-
-// Until the recorder's tail reaches target (ge: at least target, else exactly). The wait sleeps at most 200 us at a
-// time, so a missed set costs no more.
-static void wait_tail(uint64_t target, int ge) {
-    for (int i = 0;; i++) {
-        uint64_t t = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE);
-        if (ge ? t >= target : t == target) return;
-        if (!rec_drain_sleep) {
-            if (i < 20000) plat_pause();
-            else rt_yield_count(RT_YIELD_DRAIN), plat_yield();
-            continue;
-        }
-        if (i < 2000) {
-            plat_pause();
-            continue;
-        }
-        __atomic_store_n(&drain_wait, 1, __ATOMIC_SEQ_CST);
-        t = __atomic_load_n(&Q.tail, __ATOMIC_SEQ_CST);
-        if (!(ge ? t >= target : t == target)) plat_event_wait_ns(&drain_ev, 200000);
-        __atomic_store_n(&drain_wait, 0, __ATOMIC_RELAXED);
-    }
+    uint64_t w = pub_ab ? (rt_ab() ? 8192 : 64) : Q.pub_words;
+    if (Q.put_h - Q.pub_h >= w) pub_now();
 }
 
 void rec_drain(void) {
@@ -199,7 +198,9 @@ void rec_drain(void) {
     Q.pub_h = Q.put_h;
     __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
     wake();
-    wait_tail(Q.put_h, 0);
+    for (int i = 0; __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE) != Q.put_h; i++)
+        if (i < 20000) plat_pause();
+        else plat_yield();
     RS_.drains++, RS_.drain_ns += now_ns() - t0;
 }
 
@@ -222,41 +223,48 @@ typedef struct { VkCommandBuffer cb; int begin, crumb; uint64_t n; } A_BeginCb;
 void rec_begin(VkCommandBuffer cb, uint64_t fence, int crumb, uint64_t n) {
     static int mode = -1;
     if (mode < 0) {
-        // Default off on AMD GPUs. With the recorder those drivers lost the device or hung the GPU at startup on
-        // RDNA 2, 3 and 4, under AMD's Windows driver and under RADV (issues #5, #40, #277 and #283: a black screen,
-        // or VK_ERROR_DEVICE_LOST with a breadcrumb naming a part of a replay submission, and vk_recorder = 0 gets
-        // past it). Keeping objects until their submission completed and ending a part from the recorder
-        // (rec_end_cb) fixed the white scene on an RX 6700 XT, but not this: 0.2.8 turned the recorder on for every
-        // GPU and the AMD reports came back the same day. TOTK_VK_RECORDER=1 turns it on for an A/B run.
-        const char *set = cfg_get("TOTK_VK_RECORDER");
-        mode = rt_knob("VK_RECORDER", vk_caps.amd ? "0" : "1");
-        if (!mode && vk_caps.amd && !(set && *set))
-            rt_log("vk_rec: no recorder thread on AMD GPUs (TOTK_VK_RECORDER=1 turns it on)");
+        // On by default on every GPU. 0.2.8 turned it on for AMD too, and some RDNA 2, 3 and 4 systems lost the device
+        // or hung the GPU at startup (issues #5, #40, #277 and #283: a black screen, or VK_ERROR_DEVICE_LOST with a
+        // breadcrumb naming a part of a replay submission), so 0.3.x kept it off on AMD. Since then the recorder
+        // begins, ends and submits its own parts (TOTK_REC_END, which ended a GPU hang on AMD at split submissions),
+        // and AMD players who turned it on reported more FPS, so it is on again; TOTK_VK_RECORDER=0 turns it off
+        // where the device is still lost.
+        mode = rt_knob("VK_RECORDER", "1");
         if (mode) {
             plat_event_init(&wake_ev, 0, 0);
-            plat_event_init(&drain_ev, 0, 0);
-            const char *ds = cfg_get("TOTK_REC_DRAIN_SLEEP");
-            rec_drain_sleep = !(ds && *ds == '0');
-            const char *sp = cfg_get("TOTK_REC_SPIN_US");
-            // 20 us where the slower cores take the background threads (perf.c bg_placement)
-            rec_spin_ns = (uint64_t)(sp && *sp ? (atoi(sp) > 0 ? atoi(sp) : 0) : perf_slow_bg_default() ? 20 : 200) * 1000;
             rec_prio = plat_thread_priority_get();
             rec_chk = rt_knob("REC_CHECK", "0");   // debug switches, read before the recorder starts
             const char *d = cfg_get("TOTK_REC_DELAY_US");
             rec_delay_ns = d && *d && atoi(d) > 0 ? (uint64_t)atoi(d) * 1000 : 0;
+            const char *sp = cfg_get("TOTK_REC_SPIN_US");
+            rec_spin_ab = sp && !strcmp(sp, "ab");
+            // On an AArch64 CPU with cores of two speeds (perf_slow_bg_default: the Mali handheld's RK3588, the game
+            // on the four fast cores) the recorder polls 20 us whatever the core count: measured there against 200 us
+            // and 4096 pauses (a few us on an A76), 20 us gave the game's threads the most of the fast cores.
+            int big_little = perf_slow_bg_default();
+            int spin_us = sp && *sp && !rec_spin_ab ? atoi(sp) : big_little ? 20 : 60;
+            rec_spin_ns = spin_us > 0 && (big_little || plat_cpu_usable() >= 6) ? (uint64_t)spin_us * 1000 : 0;
             const char *pw = cfg_get("TOTK_REC_PUB");   // words per publish (pub); 0: every packet
-            Q.pub_words = rec_chk ? 0 : pw && *pw ? (uint64_t)atoi(pw) : 64;
+            pub_ab = !rec_chk && pw && !strcmp(pw, "ab");
+            // 2048 words a publish with the AArch64 two-speed poll: the batch the Mali handheld measured best for its
+            // recorder wakes (0068, TOTK_REC_WAKE_WORDS before this publish batch existed).
+            Q.pub_words = rec_chk ? 0 : pw && *pw && !pub_ab ? (uint64_t)atoi(pw) : big_little ? 2048 : rec_spin_ns ? 64 : 8192;
             if (Q.pub_words > RING_WORDS / 8) Q.pub_words = RING_WORDS / 8;
             rec_thread = plat_thread_new(rec_main, NULL, "vk recorder");
             if (!rec_thread) {
                 rt_log("vk_rec: no recorder thread: the replay makes its Vulkan calls itself");
                 mode = 0;
             } else {
-                rt_log("vk_rec: the replay's Vulkan commands are made by a recorder thread%s; idle it spins %llu us",
-                       mode == 2 ? " in the B blocks (TOTK_AB)" : "", (unsigned long long)(rec_spin_ns / 1000));
+                rt_log("vk_rec: the replay's Vulkan commands are made by a recorder thread%s",
+                       mode == 2 ? " in the B blocks (TOTK_AB)" : "");
                 if (rec_chk) rt_log("vk_rec: TOTK_REC_CHECK: deferred and destroyed objects are searched in the ring");
-                if (Q.pub_words != 64) rt_log("vk_rec: TOTK_REC_PUB: head published every %llu words",
-                                              (unsigned long long)Q.pub_words);
+                if (rec_spin_ns)
+                    rt_log("vk_rec: the recorder polls %llu us before it sleeps%s (TOTK_REC_SPIN_US)",
+                           (unsigned long long)(rec_spin_ns / 1000), rec_spin_ab ? " in the B blocks" : "");
+                else
+                    rt_log("vk_rec: the recorder polls 4096 pauses before it sleeps (TOTK_REC_SPIN_US)");
+                if (pub_ab) rt_log("vk_rec: head published every 64 words, 8192 in the B blocks (TOTK_REC_PUB=ab)");
+                else rt_log("vk_rec: head published every %llu words (TOTK_REC_PUB)", (unsigned long long)Q.pub_words);
                 if (rec_delay_ns) rt_log("vk_rec: TOTK_REC_DELAY_US: the recorder waits %llu us before each batch",
                                          (unsigned long long)(rec_delay_ns / 1000));
             }
@@ -297,7 +305,7 @@ void rec_end(void) {
 // submission was split (vk_sync.c vk_sync_split): the GPU hung or the scene turned green, then white. Moving the end
 // fixed that; begin and submit followed. TOTK_REC_END=0 brings the old split back: the submitting thread begins,
 // ends and submits every part.
-// The line is written only when a part was recorded by the recorder: with the recorder off (the default on AMD) the
+// The line is written only when a part was recorded by the recorder: with the recorder off (TOTK_VK_RECORDER=0) the
 // switch changes nothing, and reports read an unconditional line as proof that the recorder was running (#315).
 typedef struct { int kind; uint64_t n; } A_EndCb;
 int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n) {
@@ -321,10 +329,14 @@ int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n) {
     return 1;
 }
 
-// At most two command buffers and one signal: the shape vk_sync.c submits. async: rec_submit_async's, whose result
-// nobody waits for.
-typedef struct { uint32_t ncb, nsig, async; VkCommandBufferSubmitInfo cbi[2]; VkSemaphoreSubmitInfo sig; } A_Submit;
-static uint64_t sub_h;   // producer: Q.put_h after the last rec_submit_async (rec_wait_submitted)
+// At most two command buffers and one signal: the shape vk_sync.c submits. The only pNext it chains is Reflex's
+// VkLatencySubmissionPresentIdNV (vk_sync_submit), carried as its present ID.
+typedef struct {
+    uint32_t ncb, nsig, has_pid;
+    uint64_t present_id;
+    VkCommandBufferSubmitInfo cbi[2];
+    VkSemaphoreSubmitInfo sig;
+} A_Submit;
 VkResult rec_submit(const VkSubmitInfo2 *si) {
     if (!sub_pending) {
         vk_queue_lock();
@@ -333,74 +345,74 @@ VkResult rec_submit(const VkSubmitInfo2 *si) {
         return r;
     }
     sub_pending = 0;
-    if (si->commandBufferInfoCount > 2 || si->signalSemaphoreInfoCount > 1 || si->waitSemaphoreInfoCount || si->pNext)
+    const VkBaseInStructure *nx = si->pNext;
+    int pid = nx && nx->sType == VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV && !nx->pNext;
+    if (si->commandBufferInfoCount > 2 || si->signalSemaphoreInfoCount > 1 || si->waitSemaphoreInfoCount ||
+        (nx && !pid))
         rt_fatal("vk_rec: a submission of %u command buffers, %u waits and %u signals the recorder cannot carry",
                  si->commandBufferInfoCount, si->waitSemaphoreInfoCount, si->signalSemaphoreInfoCount);
     A_Submit *a = put(R_Submit, sizeof *a);
     memset(a, 0, sizeof *a);
     a->ncb = si->commandBufferInfoCount, a->nsig = si->signalSemaphoreInfoCount;
+    if (pid) a->has_pid = 1, a->present_id = ((const VkLatencySubmissionPresentIdNV *)nx)->presentID;
     for (uint32_t i = 0; i < a->ncb; i++) a->cbi[i] = si->pCommandBufferInfos[i];
     if (a->nsig) a->sig = si->pSignalSemaphoreInfos[0];
-    pub();
-    // Waited for here, so the queue holds every earlier submission when the caller goes on, as with the recorder off:
-    // the present, uploads, readbacks and device waits on other threads rely on that order.
-    rec_drain();
+    __atomic_store_n(&q_subs, q_subs + 1, __ATOMIC_RELEASE);
     RS_.submits++;
+    // TOTK_REC_ASYNC=1 (default): the submitting thread goes on while the recorder catches up with the part and submits
+    // it; it waited here for 0.29 ms a frame in the town on a Ryzen 7900X, 0.34 ms limited to 4 cores. The queue order
+    // the present, uploads, readbacks and device waits rely on holds through vk_queue_lock (rec_queue_wait). The values
+    // the part signals are counted as issued at once (vk_sync.c): waiting for one on the host before its submission is
+    // legal for a timeline semaphore. =0: waits here for the submission, as before; =ab with the A/B blocks.
+    if (rec_async < 0) rec_async = rt_knob("REC_ASYNC", "1");
+    if (RT_KNOB_ON(rec_async)) {
+        pub_now();
+        return __atomic_load_n(&r_sub_err, __ATOMIC_ACQUIRE);
+    }
+    pub();
+    rec_drain();
     return r_sub_res;
 }
 
-// TOTK_SPLIT_ASYNC (vk_sync.c vk_sync_split): a part of a submission handed to the recorder without waiting for it,
-// so the submitting thread goes on replaying the next part instead of draining the ring at every split (~1.9 ms a frame
-// on the Mali handheld). Before anything that must follow the part in queue order, the caller waits with
-// rec_wait_submitted; every other submission (rec_submit) drains the ring, which covers it too.
-void rec_submit_async(const VkSubmitInfo2 *si) {
-    if (!sub_pending) rt_fatal("vk_rec: rec_submit_async of a part the recorder did not end");
-    sub_pending = 0;
-    if (si->commandBufferInfoCount > 2 || si->signalSemaphoreInfoCount || si->waitSemaphoreInfoCount || si->pNext)
-        rt_fatal("vk_rec: an asynchronous submission of %u command buffers, %u waits and %u signals",
-                 si->commandBufferInfoCount, si->waitSemaphoreInfoCount, si->signalSemaphoreInfoCount);
-    A_Submit *a = put(R_Submit, sizeof *a);
-    memset(a, 0, sizeof *a);
-    a->ncb = si->commandBufferInfoCount, a->async = 1;
-    for (uint32_t i = 0; i < a->ncb; i++) a->cbi[i] = si->pCommandBufferInfos[i];
-    pub_now();
-    sub_h = Q.put_h;
-    RS_.submits++, RS_.async_submits++;
-}
-
-void rec_wait_submitted(void) {
-    if (!rec_thread || __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE) >= sub_h) return;
-    uint64_t t0 = now_ns();
-    Q.pub_h = Q.put_h;
-    __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
-    wake();
-    wait_tail(sub_h, 1);
-    RS_.sub_waits++, RS_.sub_wait_ns += now_ns() - t0;
-}
-
 static void submit_run(const A_Submit *a) {
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = a->ncb,
+    VkLatencySubmissionPresentIdNV lsid = {.sType = VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV,
+                                           .presentID = a->present_id};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .pNext = a->has_pid ? &lsid : NULL,
+                        .commandBufferInfoCount = a->ncb,
                         .pCommandBufferInfos = a->cbi, .signalSemaphoreInfoCount = a->nsig,
                         .pSignalSemaphoreInfos = a->nsig ? &a->sig : NULL};
     vk_queue_lock();
-    r_sub_res = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, &si, VK_NULL_HANDLE);
+    VkResult r = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, &si, VK_NULL_HANDLE);
     vk_queue_unlock();
-    if (a->async && r_sub_res != VK_SUCCESS) {   // nobody reads r_sub_res for it
-        vk_device_fault_report(r_sub_res);
-        rt_fatal("vk_rec: vkQueueSubmit2 of a part failed (%d)", (int)r_sub_res);
-    }
+    r_sub_res = r;
+    if (r != VK_SUCCESS && __atomic_load_n(&r_sub_err, __ATOMIC_RELAXED) == VK_SUCCESS)
+        __atomic_store_n(&r_sub_err, r, __ATOMIC_RELEASE);
+    __atomic_store_n(&r_subs, r_subs + 1, __ATOMIC_RELEASE);
+}
+
+void rec_queue_wait(void) {
+    if (!rec_thread || on_rec) return;
+    uint64_t want = __atomic_load_n(&q_subs, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&r_subs, __ATOMIC_ACQUIRE) >= want) return;
+    uint64_t t0 = now_ns();
+    for (int i = 0; __atomic_load_n(&r_subs, __ATOMIC_ACQUIRE) < want; i++)
+        if (i < 20000) plat_pause();
+        else plat_yield();
+    __atomic_add_fetch(&RQ_.n, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&RQ_.ns, now_ns() - t0, __ATOMIC_RELAXED);
 }
 
 void rec_stats_log(void) {
     if (!(rt_trace & RT_TRACE_PERF) || !RS_.parts) return;
     rt_log("vk_rec: %llu of %llu parts recorded by the recorder: %llu packets (%.1f MiB), %llu drains (%llu for a call "
-           "without a packet) waited %.2f ms in all, ring full %llu times, %llu submissions made by the recorder",
+           "without a packet) waited %.2f ms in all, ring full %llu times, %llu submissions made by the recorder, "
+           "recorder slept %llu times and was woken %llu times, queue users waited for its submissions %llu times (%.2f ms)",
            (unsigned long long)RS_.parts_on, (unsigned long long)RS_.parts, (unsigned long long)RS_.packets,
            RS_.words * 8 / 1048576.0, (unsigned long long)RS_.drains, (unsigned long long)RS_.fallbacks,
-           RS_.drain_ns / 1e6, (unsigned long long)RS_.full_waits, (unsigned long long)RS_.submits);
-    if (RS_.async_submits)
-        rt_log("vk_rec: %llu parts submitted without a wait (TOTK_SPLIT_ASYNC); %llu waits for them, %.2f ms in all",
-               (unsigned long long)RS_.async_submits, (unsigned long long)RS_.sub_waits, RS_.sub_wait_ns / 1e6);
+           RS_.drain_ns / 1e6, (unsigned long long)RS_.full_waits, (unsigned long long)RS_.submits,
+           (unsigned long long)__atomic_exchange_n(&r_sleeps, 0, __ATOMIC_RELAXED), (unsigned long long)RS_.wakes,
+           (unsigned long long)__atomic_exchange_n(&RQ_.n, 0, __ATOMIC_RELAXED),
+           __atomic_exchange_n(&RQ_.ns, 0, __ATOMIC_RELAXED) / 1e6);
     memset(&RS_, 0, sizeof RS_);
 }
 
@@ -463,6 +475,8 @@ void rec_check_log(void) {
 }
 
 #define OWNED(cb) (rec_live && (cb) == rec_cb)
+
+int rec_owns(VkCommandBuffer cb) { return OWNED(cb); }
 // A call the ring takes no packet for: everything queued first, then the call here.
 #define FALLBACK() (rec_drain(), RS_.fallbacks++)
 
@@ -470,7 +484,7 @@ void rec_check_log(void) {
 static void *tail_copy(uint8_t **at, const void *arr, size_t bytes) {
     if (!arr || !bytes) return NULL;
     void *d = *at;
-    memcpy(d, arr, bytes);
+    MX_CPY(d, arr, bytes);
     *at += (bytes + 7) & ~(size_t)7;
     return d;
 }

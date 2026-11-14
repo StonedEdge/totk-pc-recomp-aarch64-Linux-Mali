@@ -49,6 +49,7 @@
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
+#include "memx.h"
 #include "nvn_hmap.h"
 #include "platform/platform.h"
 #include "tex.h"
@@ -266,13 +267,19 @@ static int ensure_init(void) {
     }
     // TOTK_VK_DYN_VERTEX=0/1 forces dynamic vertex input off or on. Default off on Intel's frozen Windows driver for its
     // older integrated GPUs (UHD 630, Ice Lake: Vulkan 1.3.215 and older), which draws nothing with it; LAS Recomp
-    // turns it off there for the same reason.
+    // turns it off there for the same reason. Also off on Intel's current Windows driver for its integrated GPUs
+    // (vk_caps.intel_igpu_win): on UHD Graphics (i3-1215U, 101.6129; i3-1305U, 101.7088) and Iris Xe (101.7092) it
+    // drew black rectangles over walls, trees and floating islands, and vk_dyn_vertex = 0 removed them (issues #970,
+    // #992, #81). Mesa's ANV on the same GPUs keeps it: a report there (#989) had both switches off and its glitch stayed.
     const char *dv = cfg_get("TOTK_VK_DYN_VERTEX");   // no fixed default: it depends on the GPU, see above
     int intel_legacy = c->props.vendorID == 0x8086 && c->props.apiVersion <= VK_MAKE_API_VERSION(0, 1, 3, 215);
-    int dv_on = dv && *dv ? strcmp(dv, "0") != 0 : !intel_legacy;
+    int dv_on = dv && *dv ? strcmp(dv, "0") != 0 : !intel_legacy && !vk_caps.intel_igpu_win;
     P.dyn_vi = dv_on && c->has_vertex_input_dynamic_state && PROC(set_vi, "vkCmdSetVertexInputEXT");
     if (!dv_on && c->has_vertex_input_dynamic_state)
-        rt_log("vk_pipeline: dynamic vertex input off (%s)", dv && *dv ? "TOTK_VK_DYN_VERTEX=0" : "Intel's older Windows driver draws nothing with it");
+        rt_log("vk_pipeline: dynamic vertex input off (%s)",
+               dv && *dv      ? "TOTK_VK_DYN_VERTEX=0"
+               : intel_legacy ? "Intel's older Windows driver draws nothing with it"
+                              : "Intel's Windows driver for integrated GPUs draws black patches with it");
     if (c->has_eds3) {
         P.dyn_clamp = e3.extendedDynamicState3DepthClampEnable && P.f_depth_clamp && PROC(set_clamp, "vkCmdSetDepthClampEnableEXT");
         // TOTK_VK_DYN_CLAMP=0/1 forces dynamic depth clamp off or on; default off on Arm's Mali driver. TotK draws its
@@ -296,12 +303,17 @@ static int ensure_init(void) {
     // RDNA 2 and older (vk_caps.amd_sc), which applies alpha to coverage while the dynamic state says off: on an RX 590
     // (24.9.1) TotK, which never turns it on, drew Link and the NPCs with depth but no colour (black silhouettes) and
     // dithered other surfaces into checkerboards (issue #67, RX 470/570/580). Taken out of the dynamic state, it goes
-    // into the pipeline key and the characters draw.
+    // into the pipeline key and the characters draw. Also off on Intel's Windows driver for its integrated GPUs
+    // (vk_caps.intel_igpu_win): UHD Graphics and Iris Xe drew coloured noise on branches, foliage and wood with it, and
+    // vk_dyn_a2c = 0 removed it (issues #970, #992, #419).
     const char *da = cfg_get("TOTK_VK_DYN_A2C");   // no fixed default: it depends on the driver, see above
-    int da_on = da && *da ? strcmp(da, "0") != 0 : !vk_caps.amd_sc;
+    int da_on = da && *da ? strcmp(da, "0") != 0 : !vk_caps.amd_sc && !vk_caps.intel_igpu_win;
     if (!da_on && P.dyn_a2c) {
         P.dyn_a2c = 0;
-        rt_log("vk_pipeline: dynamic alpha to coverage off (%s)", da && *da ? "TOTK_VK_DYN_A2C=0" : "AMD's driver for RDNA 2 and older");
+        rt_log("vk_pipeline: dynamic alpha to coverage off (%s)",
+               da && *da        ? "TOTK_VK_DYN_A2C=0"
+               : vk_caps.amd_sc ? "AMD's driver for RDNA 2 and older"
+                                : "Intel's Windows driver for integrated GPUs draws coloured noise with it");
     }
 #undef PROC
     static const VkDynamicState core[] = {
@@ -1302,7 +1314,7 @@ static uint32_t vs_outs(const GfxShader *vs, const GfxShader *fs, GfxShaderIo io
 
 static Pipe *pipe_find(const void *key, size_t size, uint64_t h) {
     for (Pipe *p = pipes[h % PIPE_BUCKETS]; p; p = p->next)
-        if (p->hash == h && p->key_size == size && !memcmp(p->key, key, size)) return p;
+        if (p->hash == h && p->key_size == size && MX_EQ(p->key, key, size)) return p;
     return NULL;
 }
 
@@ -3398,10 +3410,11 @@ static void dyn_vals(const VkPipeState *s, DynVals *o) {
     }
 }
 
-// What the replay's command buffer holds, as vk_pipeline_set_dynamic_delta last recorded it (the replay thread only):
-// the values, the inputs of the vertex input and the vertex bindings it reads. Invariant while the caller passes
-// valid 1: cb holds DC.v for every dynamic state of P.dyn, colour attachments [0, DC.v.n) included.
-static struct {
+// What the replay's command buffer holds, as vk_pipeline_set_dynamic_delta last recorded it: the values, the inputs of
+// the vertex input and the vertex bindings it reads. Invariant while the caller passes valid 1: cb holds DC.v for every
+// dynamic state of P.dyn, colour attachments [0, DC.v.n) included. Per thread: the threads of a chunked replay
+// (vk_exec.c) each record their own command buffers, and a new one starts with valid 0.
+static _Thread_local struct {
     DynVals v;
     const GfxShader *vs;
     uint32_t vattr[16];
@@ -3441,7 +3454,7 @@ uint32_t vk_pipeline_set_dynamic_delta(VkCommandBuffer cb, const VkPipeState *s,
     if (v.restart != o->restart) vkCmdSetPrimitiveRestartEnable(cb, v.restart), k++;
     // The vertex input is made from the vertex shader's inputs and the attribute and stream states alone
     // (vertex_input): a draw that keeps all three keeps it, and the bindings it reads.
-    if (s->vs != DC.vs || memcmp(s->vattr, DC.vattr, sizeof DC.vattr) || memcmp(s->vstream, DC.vstream, sizeof DC.vstream)) {
+    if (s->vs != DC.vs || MX_NE(s->vattr, DC.vattr, sizeof DC.vattr) || MX_NE(s->vstream, DC.vstream, sizeof DC.vstream)) {
         uint32_t streams = VK_PIPE_ALL_BINDINGS;
         if (s->vs) {
             VtxInput vi;
@@ -3451,7 +3464,7 @@ uint32_t vk_pipeline_set_dynamic_delta(VkCommandBuffer cb, const VkPipeState *s,
             for (uint32_t i = 0; i < vi.n_bind; i++) streams |= 1u << vi.b[i].binding;
         }
         DC.vs = s->vs, DC.streams = streams;
-        memcpy(DC.vattr, s->vattr, sizeof DC.vattr), memcpy(DC.vstream, s->vstream, sizeof DC.vstream);
+        MX_CPY(DC.vattr, s->vattr, sizeof DC.vattr), MX_CPY(DC.vstream, s->vstream, sizeof DC.vstream);
     }
     if (P.dyn_clamp && v.clamp != o->clamp) rec_bool(P.set_clamp, cb, v.clamp), k++;
     if (P.dyn_poly && v.poly != o->poly) rec_polygon_mode(P.set_poly, cb, v.poly), k++;
@@ -3460,10 +3473,10 @@ uint32_t vk_pipeline_set_dynamic_delta(VkCommandBuffer cb, const VkPipeState *s,
     // One with fewer leaves the ones past its count as they were, which no draw of it reads.
     uint32_t n = (uint32_t)v.n;
     int all = v.n > o->n;
-    if (n && P.dyn_blend_en && (all || memcmp(v.en, o->en, n * sizeof *v.en))) rec_blend_enable(P.set_blend_en, cb, 0, n, v.en), k++;
-    if (n && P.dyn_blend_eq && (all || memcmp(v.eq, o->eq, n * sizeof *v.eq))) rec_blend_equation(P.set_blend_eq, cb, 0, n, v.eq), k++;
-    if (n && P.dyn_wmask && (all || memcmp(v.wm, o->wm, n * sizeof *v.wm))) rec_write_mask(P.set_wmask, cb, 0, n, v.wm), k++;
-    DC.v = v;   // the invariant now covers [0, v.n) only
+    if (n && P.dyn_blend_en && (all || MX_NE(v.en, o->en, n * sizeof *v.en))) rec_blend_enable(P.set_blend_en, cb, 0, n, v.en), k++;
+    if (n && P.dyn_blend_eq && (all || MX_NE(v.eq, o->eq, n * sizeof *v.eq))) rec_blend_equation(P.set_blend_eq, cb, 0, n, v.eq), k++;
+    if (n && P.dyn_wmask && (all || MX_NE(v.wm, o->wm, n * sizeof *v.wm))) rec_write_mask(P.set_wmask, cb, 0, n, v.wm), k++;
+    MX_CPY(&DC.v, &v, sizeof v);   // the invariant now covers [0, v.n) only
     *cmds = k;
     return DC.streams;
 }

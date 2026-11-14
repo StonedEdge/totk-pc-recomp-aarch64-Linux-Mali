@@ -11,11 +11,13 @@
 //   that submission's write-back, the mirror holds them until then.
 // - A GPU write within the submission (UpdateUniformBuffer, a storage buffer a shader writes, a buffer copy or fill,
 //   an image-to-buffer copy: vk_usnap_drop) drops the copies it touches from then on, so later draws read the result.
+//   A chunked replay (vk_exec.c) records the ops out of order: its scan drops at the position of the op
+//   (vk_usnap_drop_at, scan_writes for the shaders' stores), and a chunk finds a copy only at a position before that.
 // - The arena goes back to a free list once the submission's fence is done (completion thread).
 // The design follows MacNativeGames' TOTK_UBO_SNAPSHOT (games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m usnap_take,
 // usnap_drop; MIT, Copyright (c) 2026 jhaizhou); the code is ours.
 // The copy is taken where vk_exec_record starts: at the submit call when the replay runs on the submitting thread, later
-// with TOTK_REPLAY_ASYNC. TOTK_UBO_SNAPSHOT=0 binds live memory as before; =ab alternates (TOTK_AB).
+// with TOTK_REPLAY_ASYNC; a chunked replay takes it on a recording thread while its scan runs. TOTK_UBO_SNAPSHOT=0 binds live memory as before; =ab alternates (TOTK_AB).
 #include <stdlib.h>
 #include <string.h>
 
@@ -49,10 +51,12 @@ typedef struct Arena {
 typedef struct { uint64_t lo, hi; } Rng;
 typedef struct {
     uint64_t lo, hi, off;
-    int dropped, found;          // found: bound since its last version
+    uint64_t drop_at;            // dropped by a GPU write from this op position on (chunked replay); UINT64_MAX: not
+    int found;                   // found: bound since its last version
     int split;                   // a part of a region split at an update: its copy as the submission began is
     uint64_t blo, bhi, boff;     // [blo, bhi) at boff (the base a block with a window twin binds)
 } Reg;
+#define DROPPED(r) (__atomic_load_n(&(r)->drop_at, __ATOMIC_RELAXED) != UINT64_MAX)
 typedef struct { uint64_t lo, hi, fence; int ub; } Wrote;   // ub: an UpdateUniformBuffer copy
 typedef struct { uint64_t lo, hi, fence; uint8_t *data; } PendUb;   // an update copy on the GPU timeline, its bytes
 
@@ -85,6 +89,7 @@ static struct {
 
 static Arena *free_arenas;
 static PlatMutex free_lock = PLAT_MUTEX_INIT;
+static PlatMutex drop_lock = PLAT_MUTEX_INIT;   // threads recording chunks of one submission drop concurrently
 
 static void *grow(void *p, int *cap, size_t elem) {
     int n = *cap ? *cap * 2 : 1024;
@@ -358,7 +363,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
             continue;
         }
         if (U.nreg == U.creg) U.reg = grow(U.reg, &U.creg, sizeof *U.reg);
-        U.reg[U.nreg++] = (Reg){lo, hi, total, 0, 0, 0, 0, 0, 0};
+        U.reg[U.nreg++] = (Reg){lo, hi, total, UINT64_MAX, 0, 0, 0, 0, 0};
         total += (hi - lo + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     }
     if (!U.nreg) return;
@@ -427,7 +432,7 @@ static int join(int i, uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBu
     uint64_t need = (n + ALIGN - 1) & ~(uint64_t)(ALIGN - 1), at = U.used, pos = addr;
     if (at % align || at + need > U.arena->size) { U.join_fail++; return 0; }
     for (int j = i; pos < addr + n; j++) {
-        if (j >= U.nreg || U.reg[j].dropped || U.reg[j].lo > pos) { U.join_fail++; return 0; }
+        if (j >= U.nreg || DROPPED(&U.reg[j]) || U.reg[j].lo > pos) { U.join_fail++; return 0; }
         uint64_t b = U.reg[j].hi < addr + n ? U.reg[j].hi : addr + n;
         memcpy(U.arena->shadow + at + (pos - addr), U.arena->shadow + U.reg[j].off + (pos - U.reg[j].lo), b - pos);
         pos = b;
@@ -447,7 +452,7 @@ static void big_note(const char *what, const Reg *r, uint64_t addr, uint64_t n) 
     if (big_logged >= 120) return;
     big_logged++;
     rt_log("vk_usnap: big region %#llx+%#llx (%s): %s at +%#llx, %#llx bytes", (unsigned long long)r->lo,
-           (unsigned long long)(r->hi - r->lo), r->dropped ? "dropped" : "live copy", what,
+           (unsigned long long)(r->hi - r->lo), DROPPED(r) ? "dropped" : "live copy", what,
            (unsigned long long)(addr - r->lo), (unsigned long long)n);
 }
 
@@ -457,16 +462,21 @@ static void big_note(const char *what, const Reg *r, uint64_t addr, uint64_t n) 
 #define TWIN_BYTES 4096
 static int base_ok_at(int i, uint64_t addr, uint64_t n, uint64_t align) {
     const Reg *h = &U.reg[i];
-    if (!h->split || h->dropped || addr != h->blo || h->lo != h->blo || h->hi - h->lo > TWIN_BYTES) return 0;
+    if (!h->split || DROPPED(h) || addr != h->blo || h->lo != h->blo || h->hi - h->lo > TWIN_BYTES) return 0;
     if (addr + n > h->bhi || addr + n <= h->hi || h->boff % align) return 0;
     if (i + 1 >= U.nreg) return 0;
     const Reg *t = &U.reg[i + 1];
-    return !t->dropped && t->lo == h->hi && t->hi == h->bhi && t->off == h->boff + (t->lo - h->blo);
+    return !DROPPED(t) && t->lo == h->hi && t->hi == h->bhi && t->off == h->boff + (t->lo - h->blo);
 }
 
 static const char *find_kind;   // TOTK_UB_CHECK: how vk_usnap_find answered last
 static const Reg *find_reg;
-int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out, int base_ok) {
+int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t at, uint64_t align, VkDescriptorBufferInfo *out) {
+    return vk_usnap_find_base(addr, n, at, align, out, 0);
+}
+// base_ok: the binding's shader reads the block at computed offsets and its window from a twin (vk_exec_draw.c), so the
+// block's base may stand for it. at: as in vk_usnap_find (the chunked replay's op position; UINT32_MAX outside one).
+int vk_usnap_find_base(uint64_t addr, uint64_t n, uint64_t at, uint64_t align, VkDescriptorBufferInfo *out, int base_ok) {
     if (!U.on || !n) return 0;
     find_kind = "version", find_reg = NULL;
     int i = first_above(addr);
@@ -481,7 +491,7 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
         find_kind = "base", find_reg = r;
         return 1;
     }
-    if (!r->dropped && addr >= r->lo && addr + n > r->hi && U.arena && U.arena->shadow) {
+    if (!DROPPED(r) && addr >= r->lo && addr + n > r->hi && U.arena && U.arena->shadow) {
         find_kind = "join", find_reg = r;
         if (join(i, addr, n, align, out)) return 1;
         // no room for the join: the base when it is still right (0049's flicker came from live memory)
@@ -493,7 +503,7 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
         }
         return 0;
     }
-    if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
+    if (__atomic_load_n(&r->drop_at, __ATOMIC_RELAXED) <= at || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
     r->found = 1;
@@ -541,7 +551,7 @@ static void ubc_compare(int kind, uint64_t addr, const uint8_t *a, uint64_t n, u
            "%#llx+%#llx)", ubc_name[kind], stage, slot, (unsigned long long)addr, (unsigned long long)n,
            (unsigned long long)diff, (unsigned long long)first, (unsigned long long)last,
            r ? (unsigned long long)r->lo : 0ull, r ? (unsigned long long)(r->hi - r->lo) : 0ull,
-           r && r->split ? " split" : "", r && r->dropped ? " dropped" : "", r ? (unsigned long long)r->blo : 0ull,
+           r && r->split ? " split" : "", r && DROPPED(r) ? " dropped" : "", r ? (unsigned long long)r->blo : 0ull,
            r ? (unsigned long long)(r->bhi - r->blo) : 0ull);
 }
 void vk_usnap_check(uint64_t addr, const VkDescriptorBufferInfo *bi, int stage, int slot) {
@@ -568,16 +578,21 @@ static void ubc_summary(void) {
     memset(ubc_bad, 0, sizeof ubc_bad), memset(ubc_checked, 0, sizeof ubc_checked);
 }
 
-void vk_usnap_drop_ub(uint64_t addr, uint64_t n, int ub) {
+static void drop(uint64_t addr, uint64_t n, uint64_t at, int ub) {   // ub: an UpdateUniformBuffer copy
     if (!U.mode || !n) return;
+    plat_mutex_lock(&drop_lock);
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
     U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence, ub != 0};
-    if (!U.on) return;
-    for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
-        if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, U.gen++;
+    if (U.on)
+        for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
+            if (at < U.reg[i].drop_at) {
+                if (U.reg[i].drop_at == UINT64_MAX) U.drops++;
+                __atomic_store_n(&U.reg[i].drop_at, at, __ATOMIC_RELAXED);
+                __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELAXED);
+            }
+    plat_mutex_unlock(&drop_lock);
 }
 
-void vk_usnap_drop(uint64_t addr, uint64_t n) { vk_usnap_drop_ub(addr, n, 0); }
 
 // TOTK_UB_INPLACE (vk_exec_draw.c op_update_ub): nvnCommandBufferUpdateUniformBuffer of [dst, dst+n) as a new version
 // of the snapshot region holding it: the region's bytes as the earlier draws read them, with the update applied, at a
@@ -608,7 +623,7 @@ int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
         return 2;
     }
     if (U.random && r->hi - r->lo > upd_max && dst >= r->lo && dst < r->hi) big_note("update", r, dst, n);
-    if (r->dropped) { U.upd_dropped++; return 0; }
+    if (DROPPED(r)) { U.upd_dropped++; return 0; }
     if (dst < r->lo || dst + n > r->hi) { U.upd_none++; return 0; }
     uint64_t rn = r->hi - r->lo, need = (rn + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     if (rn > upd_max && dst + n - r->lo <= upd_max && split_on()) {
@@ -620,7 +635,7 @@ int vk_usnap_update(uint64_t dst, uint64_t n, const void *data) {
         memmove(&U.reg[i + 2], &U.reg[i + 1], (size_t)(U.nreg - i - 1) * sizeof *U.reg);
         U.nreg++;
         if (!r->split) r->split = 1, r->blo = r->lo, r->bhi = r->hi, r->boff = r->off;
-        U.reg[i + 1] = (Reg){r->lo + head, r->hi, r->off + head, r->dropped, r->found, 1, r->blo, r->bhi, r->boff};
+        U.reg[i + 1] = (Reg){r->lo + head, r->hi, r->off + head, r->drop_at, r->found, 1, r->blo, r->bhi, r->boff};
         r->hi = r->lo + head;
         rn = head, need = head;
         U.splits++;
@@ -688,13 +703,17 @@ const uint8_t *vk_usnap_peek(uint64_t addr, uint64_t n) {
     int i = first_above(addr);
     if (i >= U.nreg) return NULL;
     Reg *r = &U.reg[i];
-    if (r->dropped || addr < r->lo || addr + n > r->hi) return NULL;
+    if (DROPPED(r) || addr < r->lo || addr + n > r->hi) return NULL;
     r->found = 1;
     U.peeks++;
     return U.arena->shadow + r->off + (addr - r->lo);
 }
 
-uint64_t vk_usnap_gen(void) { return U.gen; }
+void vk_usnap_drop(uint64_t addr, uint64_t n) { drop(addr, n, 0, 0); }
+void vk_usnap_drop_ub(uint64_t addr, uint64_t n, int ub) { drop(addr, n, 0, ub); }
+void vk_usnap_drop_at(uint64_t addr, uint64_t n, uint32_t at) { drop(addr, n, at, 0); }
+
+uint64_t vk_usnap_gen(void) { return __atomic_load_n(&U.gen, __ATOMIC_RELAXED); }
 
 // the host copy where there is one (DLSS), else the device copy
 static uint8_t *host_copy(void) { return U.arena->cpu ? U.arena->cpu : U.arena->map; }
@@ -703,7 +722,7 @@ const uint8_t *vk_usnap_map(void) { return U.arena ? host_copy() : NULL; }
 
 const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n) {
     VkDescriptorBufferInfo bi;
-    return vk_usnap_find(addr, n, 1, &bi, 0) ? host_copy() + bi.offset : NULL;
+    return vk_usnap_find(addr, n, UINT32_MAX, 1, &bi) ? host_copy() + bi.offset : NULL;
 }
 
 // The arenas back on the free list (vk_exec_draw_shutdown: the device is idle, every completion ran).

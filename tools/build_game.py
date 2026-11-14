@@ -46,8 +46,9 @@ of its processes (Windows job object accounting: committed private bytes).
 --ninja PATH names the Ninja to run; without MSYS2 the bin/ninja.exe of the release folder (tools/make_release.py) is used.
 --toolchain DIR builds with an llvm-mingw tree (DIR/bin/clang.exe) instead of MSYS2 UCRT64 clang. Ninja still comes
 from MSYS2. The libraries and headers MSYS2 supplies (Vulkan, SDL3, Opus, libvpx, VMA) then come from --deps DIR
-(default toolchain/deps-mingw: include/, lib/ with the import libraries and libvpx.a, bin/ with the DLLs), and the C++
-runtime is libc++ from llvm-mingw. Such a build never reuses another build's generated objects.
+(default toolchain/deps-mingw: include/, lib/ with the import libraries and libvpx.a, bin/ with the DLLs copied next to
+totk.exe: SDL3.dll, libopus-0.dll and, when SDL3.dll comes from MSYS2, the libiconv-2.dll it imports, without which
+the exe stops at start with 0xc000007b or a missing-DLL error), and the C++ runtime is libc++ from llvm-mingw. Such a build never reuses another build's generated objects.
 
 Split build. --make-runtime-lib compiles only runtime/ into <out>/libtotkrt.a (what CI prebuilds). --runtime-lib PATH
 then compiles only the generated C and the install-time files (modules.c and INSTALL_SIDE, which bake the player's
@@ -170,6 +171,7 @@ else:
     LINK_FLAGS = ['-fuse-ld=lld', '-no-pie', '-Wl,-z,noexecstack', "'-Wl,-rpath,$$ORIGIN'",
                   '"-Wl,-Map=$builddir/totk.map"']
     LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-lzstd', '-l:libstdc++.a', '-lm', '-lpthread', '-ldl']
+    VMA_INCLUDE = Path('/usr/include')   # vk_mem_alloc.h; Arch (AUR) vulkan-memory-allocator, Debian libvulkan-memory-allocator-dev
 # TOTK_ORDER_FILE=<file>: lifted functions in a section each (-ffunction-sections), and lld lays them out in the
 # file's order (one symbol a line, hottest first; tools/hot_order.py makes it from perf profiles). On the CM5 the
 # game's threads run below one instruction a cycle and miss the instruction cache 11-35 times per 1000 instructions
@@ -179,7 +181,6 @@ ORDER_FILE = os.environ.get('TOTK_ORDER_FILE', '')
 if ORDER_FILE:
     GEN_FLAGS.append('-ffunction-sections')
     LINK_FLAGS += [f'-Wl,--symbol-ordering-file={Path(ORDER_FILE).resolve()}', '-Wl,--no-warn-symbol-ordering']
-    VMA_INCLUDE = Path('/usr/include')   # vk_mem_alloc.h; Arch (AUR) vulkan-memory-allocator, Debian libvulkan-memory-allocator-dev
 # Without a system vk_mem_alloc.h, the header the Windows release pins (tools/make_release.py, VMA 3.4.0) is fetched once
 # into toolchain/vma: one MIT header (THIRD_PARTY_NOTICES.md), checked against its hash.
 VMA_FETCH = ('https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.4.0/include/vk_mem_alloc.h',
@@ -212,8 +213,10 @@ LLVM_LINK_LIBS = ['-lpsapi', '-lbcrypt', '-luser32', '-lgdi32', '-ldwmapi', '-li
 DEFAULT_DEPS = ROOT / 'toolchain' / 'deps-mingw'
 # Runtime sources compiled per install, not in the library: romfs.c includes romfs_config.h, patches.c and ov_zstd.c
 # the patches.h of the player's game version (its patch page is the page after that version's main; ov_zstd.c's host
-# functions sit on it). mouse_direct.c also registers host callbacks relative to that version's patch page.
-INSTALL_SIDE = {'romfs.c', 'patches.c', 'ov_zstd.c', 'mouse_direct.c'}
+# functions sit on it). mouse_direct.c and ov_ability.c also register host callbacks relative to that version's patch
+# page. A library source that includes one of PER_VERSION_HEADERS stops the library build (library_sources).
+INSTALL_SIDE = {'romfs.c', 'patches.c', 'ov_zstd.c', 'mouse_direct.c', 'ov_ability.c'}
+PER_VERSION_HEADERS = ('"patches.h"', '"romfs_config.h"')
 LIB_NAME = 'libtotkrt.a'
 AR = UCRT / 'llvm-ar.exe' if WIN else on_path('llvm-ar')
 WINDRES = UCRT / 'windres.exe'   # runtime/totk.rc: the manifest of totk.exe
@@ -302,8 +305,8 @@ def copy_romfs_patches(version, out):
     menus' captured background turned black). Copies every romfs-patches* folder of build/<version> that has a
     manifest, the same way when it differs: romfs-patches, romfs-patches-xbox, romfs-patches-xbox-label and
     romfs-patches-pc (the same with Xbox or keyboard and mouse button prompts, make_romfs_patches.py --prompts) and
-    the ones of another shape, romfs-patches-<w>x<h> and romfs-patches-pc-<w>x<h> (make_romfs_patches.py --aspect),
-    which runtime/romfs.c overlay_init needs for a game resolution that is not 16:9."""
+    the ones of another shape, romfs-patches-<w>x<h> and romfs-patches-<style>-<w>x<h> (make_romfs_patches.py
+    --aspect), which runtime/romfs.c overlay_init needs for a game resolution that is not 16:9."""
     names = sorted(p.name for p in (ROOT / 'build' / version).glob('romfs-patches*') if p.is_dir())
     for name in names:
         src = ROOT / 'build' / version / name
@@ -349,6 +352,19 @@ def runtime_sources(skip=()):
     pats = ('*.c', '*.cpp', 'platform/*.c', '*.rc', 'ui/*.cpp', 'third_party/imgui/*.cpp',
             'third_party/imgui/backends/*.cpp')
     return sorted(p for pat in pats for p in RUNTIME.glob(pat) if p.name not in skip and not other_os(p.name))
+
+
+def library_sources(sources):
+    """The runtime sources of libtotkrt.a: all but INSTALL_SIDE. The library is built once per release from one game
+    version's generated headers, so a source that includes a per-version header there bakes that version's addresses
+    into every install: a host function on the 1.2.1 patch page lies inside 1.4.3's sdk and the game stops at start."""
+    lib = [p for p in sources if p.name not in INSTALL_SIDE]
+    baked = [p.name for p in lib if p.suffix in ('.c', '.cpp')
+             and any(h in p.read_text(encoding='utf-8', errors='replace') for h in PER_VERSION_HEADERS)]
+    if baked:
+        sys.exit(f'build_game: library sources with a per-version header ({", ".join(PER_VERSION_HEADERS)}): {", ".join(baked)}; '
+                 'add them to INSTALL_SIDE')
+    return lib
 
 
 def install_stamp(out, runtime_lib):
@@ -478,7 +494,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     rt = []
     sources = runtime_sources(skip)
     if make_lib:
-        sources = [p for p in sources if p.name not in INSTALL_SIDE]
+        sources = library_sources(sources)
     elif runtime_lib:
         sources = [p for p in sources if p.name in INSTALL_SIDE] + [out / 'modules.c']
     else:
@@ -857,6 +873,8 @@ def main():
                     help='profile-guided optimisation, generated code at -O2: gen builds an instrumented totk.exe '
                          '(needs --toolchain on Windows: MSYS2 clang ships no profile runtime); FILE builds with that '
                          '.profdata (tools/pgo.py merge)')
+    ap.add_argument('--gen-o2', action='store_true',
+                    help='compile the generated code at -O2 without a profile (the --pgo level), for A/B builds')
     ap.add_argument('--expected', type=Path,
                     help='expected hashes (default tools/data/expected-<display version>.json)')
     args = ap.parse_args()
@@ -869,6 +887,8 @@ def main():
             sys.exit('--pgo gen: MSYS2 UCRT64 clang ships no profile runtime (clang_rt.profile); pass --toolchain with '
                      'an llvm-mingw directory')
         set_pgo(args.pgo, out)
+    elif args.gen_o2:
+        GEN_FLAGS[GEN_FLAGS.index('-O1')] = '-O2'
     extracted = None if args.exefs and args.romfs else work_dir() / 'extracted' / args.version
     paths = {'exefs': (args.exefs or extracted / 'exefs').resolve(),
              'romfs': (args.romfs or extracted / 'romfs').resolve(),
@@ -1009,7 +1029,8 @@ def main():
     code, dt, peak_one, _ = run_measured(base + [flag_path(exe)], env)
     print(f'link: {dt:.1f} s, peak {mib(peak_one)}')
     if code:
-        print(f'build_game: link failed, {flag_path(exe)} is the old one (a running totk.exe from this dir locks it)',
+        print(f'build_game: link failed, {flag_path(exe)} is the old one (a running totk.exe from this dir, or an '
+              f'antivirus that holds the file, locks it)',
               file=sys.stderr)
         sys.exit(code)
     if args.make_runtime_lib:
