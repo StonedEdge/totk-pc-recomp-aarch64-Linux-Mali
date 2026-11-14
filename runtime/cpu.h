@@ -62,6 +62,12 @@ static inline void rt_fpcr_sync(const Cpu *c) {
     if (cur != want) __builtin_ia32_ldmxcsr(want);
 }
 #endif
+// MSR FPCR (recomp/lifter.py): the first guest write of a directed rounding mode (FPCR.RMode, bits 22-23) is logged
+// once with the caller (main.c rt_fpcr_rmode), to learn whether the game ever leaves round-to-nearest. A test of the
+// value just stored, at the MSR sites only.
+void rt_fpcr_rmode(uint64_t fpcr, uint64_t lr);
+#define RT_FPCR_NOTE(c, lr) \
+    do { if (__builtin_expect((c)->fpcr & (3ull << 22), 0)) rt_fpcr_rmode((c)->fpcr, lr); } while (0)
 
 // ---- memory: guest addresses are host addresses
 typedef uint16_t __attribute__((aligned(1), may_alias)) u16u;
