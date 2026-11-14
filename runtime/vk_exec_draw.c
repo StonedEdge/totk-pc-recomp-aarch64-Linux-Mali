@@ -217,7 +217,11 @@ typedef struct {
     uint16_t always, ndesc;
     uint8_t wr;                          // a storage binding the shaders write: its build has side effects, nothing is kept
 } BiMask;
-typedef struct { uint32_t n, bytes; uint8_t sup, c0, ok, np; RsPtr p[RS_PTRS]; BiMask m; RsRange r[]; } RsList;
+// TOTK_BIND_INC: per binding of a graphics pipeline, the marks and generations whose change makes bind_resources build
+// it again (bi_tests). f: BT_* flags; st: the stage the masks are of; the masks: the slots of that stage it reads.
+enum { BT_ALWAYS = 1, BT_C0 = 2, BT_C1 = 4, BT_BUF = 8, BT_TEX = 16 };
+typedef struct { uint8_t f, st, dep; uint32_t ubo, ssbo, img; uint64_t tex[2]; } BiTest;
+typedef struct { uint32_t n, bytes; uint8_t sup, c0, ok, np; RsPtr p[RS_PTRS]; BiMask m; BiTest *t; RsRange r[]; } RsList;
 // (program, stage, answers) -> shader, 4-way set-associative, most recently used first. A miss costs a SHA-256 of the
 // whole shader code (gfx_shader.c req_init), slow on CPUs without SHA instructions: a field frame looks up ~3000 and
 // the 2048-slot direct-mapped table this replaced missed 3% of them on conflicts.
@@ -307,11 +311,11 @@ typedef struct {
     uint64_t frame;                      // gfx_counters.frames at the last draw counted
     uint32_t frames;                     // frames since the last line
     uint64_t draws, cls[4], b_gen, desc, rec[4], always, mv[BI_MV], slots[5];
-    uint64_t sh_keep, sh_memo, fb_n, fb_keep, fb_memo, vb_skip, pg_hit, sets, set_shared;
+    uint64_t sh_keep, sh_memo, fb_n, fb_keep, fb_memo, vb_skip, pg_hit;
     uint64_t mism, mism_total, checked;
     uint32_t mism_frame, frame_lines;
 } BiCensus;
-enum { BIM_PIPE, BIM_DYN, BIM_SHADER, BIM_FB, BIM_VB, BIM_DESC, BIM_SET, BIM_N };   // check mode's kinds of difference
+enum { BIM_PIPE, BIM_DYN, BIM_SHADER, BIM_FB, BIM_VB, BIM_DESC, BIM_N };   // check mode's kinds of difference
 static int bind_inc_mode(void);
 static void bi_mismatch(struct VkExec *ex, int kind, const char *fmt, ...);
 
@@ -327,22 +331,13 @@ typedef struct {
     BiMeta meta[MAX_DESC];
     VkDescSlot old[MAX_DESC];            // check mode: the descriptors before the build
     BiMeta mold[MAX_DESC];
-    uint8_t plan[MAX_BINDINGS];          // per binding (bi_plan): BI_AGAIN, or the generations it depends on
+    uint8_t vol[MAX_BINDINGS];           // per binding: a descriptor of its last build has BiMeta.vol
 } BiDesc;
 
-// TOTK_BIND_INC on: graphics descriptor sets shared within a submission and allocated in batches (bi_set_find,
-// alloc_set_batched). Adapted from Savage Wind Recomp runtime/nvn/vulkan/exec.c set_finish and vk_alloc_set
-// (https://github.com/Revivedx/SavageWindRecomp @ 740b18025fe11ba03c117dbb56668db304b5043e, MIT, Copyright (c) 2026
-// Revivedx and the Savage Wind Recomp contributors, Copyright (c) 2026 Peiikai).
-#define SETC_TAB 4096
-typedef struct {
-    uint64_t fence, hash, hash2;         // the submission whose pools hold set; two hashes of layout and contents
-    VkDescriptorSetLayout layout;
-    VkDescriptorSet set;
-    uint32_t n;                          // content bytes
-    uint32_t ckcap;                      // check mode: the contents, to compare a hit with
-    uint8_t *ck;
-} SetEnt;
+// TOTK_BIND_INC on: graphics descriptor sets allocated in batches (alloc_set_batched). Adapted from Savage Wind Recomp
+// runtime/nvn/vulkan/exec.c vk_alloc_set (https://github.com/Revivedx/SavageWindRecomp @
+// 740b18025fe11ba03c117dbb56668db304b5043e, MIT, Copyright (c) 2026 Revivedx and the Savage Wind Recomp contributors,
+// Copyright (c) 2026 Peiikai).
 #define ASET_CACHE 16
 #define ASET_BATCH 16
 typedef struct { VkDescriptorSetLayout layout; uint64_t fence; int n, next; VkDescriptorSet set[ASET_BATCH]; } ASetCache;
@@ -359,7 +354,6 @@ typedef struct VkExecDraw {
     BiLast BL;
     BiCensus BC;
     BiDesc BI;
-    SetEnt *setc;                        // SETC_TAB entries, made on first use
     ASetCache aset[ASET_CACHE];
     nvn_hmap rs_lists;                   // VkPipeInfo pointer -> RsList, until shutdown
     const VkPipeInfo *rs_last;           // the last lookup
@@ -1921,39 +1915,6 @@ static VkDescriptorSet alloc_set_batched(VkExec *ex, VkDescriptorSetLayout layou
     return alloc_set(ex, layout);
 }
 
-// A set of this submission with layout sl and the contents ds (dbytes) written already, VK_NULL_HANDLE when none is
-// known; *e is the table entry a new set goes into (bi_set_put). Entries are told apart by two independent 64-bit
-// hashes of the layout and the packed descriptors. check: a hit is compared with the stored contents and not taken.
-static VkDescriptorSet bi_set_find(VkExec *ex, VkDescriptorSetLayout sl, const VkDescSlot *ds, uint32_t dbytes, SetEnt **e,
-                                   uint64_t hh[2]) {
-    VkExecDraw *D = ex->draw;
-    if (!D->setc && !(D->setc = calloc(SETC_TAB, sizeof *D->setc))) rt_fatal("vk: out of memory");
-    uint64_t h = (uint64_t)(uintptr_t)sl, h2 = h ^ 0x6A09E667F3BCC909ull;
-    const uint64_t *v = (const uint64_t *)ds;
-    for (uint32_t i = 0; i < dbytes / 8; i++) {
-        h = (h ^ v[i]) * 0x9E3779B97F4A7C15ull, h ^= h >> 29;
-        h2 = (h2 ^ v[i]) * 0xC2B2AE3D27D4EB4Full, h2 ^= h2 >> 31;
-    }
-    h ^= h >> 32;
-    SetEnt *x = *e = &D->setc[(h ^ (h >> 31)) & (SETC_TAB - 1)];
-    hh[0] = h, hh[1] = h2;
-    D->BC.sets++;
-    if (x->fence != ex->fence || x->hash != h || x->hash2 != h2 || x->layout != sl || x->n != dbytes) return VK_NULL_HANDLE;
-    D->BC.set_shared++;
-    if (bind_inc_mode() == 1) return x->set;
-    D->BC.checked++;
-    if (!x->ck || memcmp(x->ck, ds, dbytes)) bi_mismatch(ex, BIM_SET, "a shared set's contents differ (%u bytes)", dbytes);
-    return VK_NULL_HANDLE;
-}
-
-static void bi_set_put(VkExec *ex, SetEnt *e, const uint64_t hh[2], VkDescriptorSetLayout sl, VkDescriptorSet set,
-                       const VkDescSlot *ds, uint32_t dbytes) {
-    e->fence = ex->fence, e->hash = hh[0], e->hash2 = hh[1], e->layout = sl, e->set = set, e->n = dbytes;
-    if (bind_inc_mode() != 2) return;
-    if (e->ckcap < dbytes && !(e->ck = realloc(e->ck, e->ckcap = dbytes))) rt_fatal("vk: out of memory");
-    memcpy(e->ck, ds, dbytes);
-}
-
 static void support_in(const VkExec *ex, float in[3]) {   // what support_fill reads: viewport size, point size
     float k = ex->pass_scale > 1 ? (float)ex->pass_scale : 1.0f;
     in[0] = ex->in_pass && ex->has_vp ? ex->vp[0][2] * k : (float)ex->pass_w;
@@ -2159,6 +2120,57 @@ static void bi_mask(const VkPipeInfo *info, BiMask *m) {
     }
 }
 
+enum { BI_TEX = 1, BI_BUF = 2 };   // BiTest.dep: a kept binding stays valid while G_tex / G_buf stay
+
+// The rules of bi_plan per binding, made once per pipeline info:
+// - support: always (its inputs are compared inside, 12 bytes);
+// - uniform slot 0 (c0): a storage slot of the stage or the base instance changed; slot 1 (the compiler constants):
+//   the program or its serial changed, or G_buf moved; slots 3..20: the slot changed or G_buf moved (snapshots,
+//   overlays, pools and mirrors); other slots bind the zero buffer;
+// - storage: as a uniform slot; an address held in a uniform block (ubo_ptr): always, the block changes without an op;
+// - textures and images: a handle changed or G_tex moved (slot resolution, samplers, the storage check once per
+//   submission, the feedback layout, DLSS's swap); buffer textures bind the zero view.
+// dep: the generations the binding's build reads, which a build of an earlier binding in the same draw may move.
+static BiTest *bi_tests(const VkPipeInfo *info) {
+    BiTest *t = calloc(info->n_bindings ? info->n_bindings : 1, sizeof *t);
+    if (!t) rt_fatal("vk: out of memory");
+    for (uint32_t i = 0; i < info->n_bindings; i++) {
+        const VkPipeBinding *b = &info->bindings[i];
+        const GfxShaderRes *r = b->res;
+        uint32_t cnt = b->count ? b->count : 1;
+        int st = nvn_stage_of(b->stage);
+        BiTest *x = &t[i];
+        x->st = (uint8_t)(st >= 0 && st < 6 ? st : 0);
+        if (b->kind == VK_PIPE_SUPPORT) {
+            x->f = BT_ALWAYS;
+        } else if (b->kind == GFX_RES_UBO) {
+            x->dep = BI_BUF;
+            for (uint32_t k = 0; k < cnt; k++) {
+                int slot = r->slot + (int)k;
+                if (slot == 0) x->f |= BT_C0;
+                else if (slot == 1) x->f |= BT_C1 | BT_BUF;
+                else if (slot >= 3 && slot - 3 < 18) x->f |= BT_BUF, x->ubo |= 1u << (slot - 3);
+            }
+        } else if (b->kind == GFX_RES_SSBO) {
+            x->dep = BI_BUF;
+            int ubo, slot = ssbo_slot(r, st, &ubo);
+            if (ubo || slot < 0 || slot >= 16) x->f = BT_ALWAYS;
+            else x->f = BT_BUF, x->ssbo = 1u << slot;
+        } else if (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) {
+            x->dep = BI_TEX;
+            if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) continue;
+            int img = b->kind == GFX_RES_IMG;
+            x->f = BT_TEX;
+            for (uint32_t k = 0; k < cnt; k++) {
+                int slot = r->slot + (int)k;
+                if (img && slot >= 0 && slot < 32) x->img |= 1u << slot;
+                else if (!img && slot >= 0 && slot < 128) x->tex[slot >> 6] |= 1ull << (slot & 63);
+            }
+        }
+    }
+    return t;
+}
+
 static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
     VkExecDraw *D = ex->draw;
     if (info == D->rs_last) return D->rs_last_l;
@@ -2211,6 +2223,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
         l->n = n, l->bytes = (uint32_t)bytes, l->sup = (uint8_t)sup, l->c0 = (uint8_t)c0, l->ok = (uint8_t)ok;
         l->np = (uint8_t)np;
         l->m = m;
+        l->t = bi_tests(info);
         memcpy(l->p, ptr, sizeof *ptr * np);
         memcpy(l->r, tmp, sizeof *tmp * n);
         nvn_hm_put(&D->rs_lists, &info, l);
@@ -2315,66 +2328,34 @@ static void bi_mismatch(VkExec *ex, int kind, const char *fmt, ...);
 
 static void bi_gt(const VkExec *ex, uint64_t g[4]);
 static void bi_gb(const VkExec *ex, uint64_t g[4]);
-enum { BI_AGAIN = 1, BI_TEX = 2, BI_BUF = 4 };   // BiDesc.plan: build again; kept while G_tex / G_buf stay
 
-// TOTK_BIND_INC: which bindings of a graphics draw with the last prepared draw's pipeline must be built again (BI.plan,
-// 1 each), from the marks since that draw and the generations G_tex and G_buf read right before this build (gt, gb)
-// against those read before its build. 0 when nothing can be kept: no last draw in this command buffer, another
-// pipeline, a chunk, a storage binding the shaders write (its build restarts passes and notes writes).
-// - support: always (its inputs are compared inside, 12 bytes);
-// - uniform slot 0 (c0): a storage slot of the stage or the base instance changed; slot 1 (the compiler constants):
-//   the program or its serial changed, or G_buf moved; slots 3..20: the slot changed or G_buf moved (snapshots,
-//   overlays, pools and mirrors); other slots bind the zero buffer;
-// - storage: as a uniform slot; an address held in a uniform block (ubo_ptr): always, the block changes without an op;
-// - textures and images: a handle changed or G_tex moved (slot resolution, samplers, the storage check once per
-//   submission, the feedback layout, DLSS's swap); buffer textures bind the zero view;
-// - any descriptor whose last build copied guest bytes or counted more than once (BiMeta): always.
-static int bi_plan(VkExec *ex, const VkPipeInfo *info, const uint64_t gt[4], const uint64_t gb[4]) {
+// TOTK_BIND_INC: whether a graphics draw with the last prepared draw's pipeline may keep descriptors of its last build,
+// and the BiTest flags that hold for every binding of this draw (*fl), from the marks since that draw and the
+// generations G_tex and G_buf read right before this build (gt, gb) against those read before its build. The tests
+// (bi_tests, per binding) are evaluated in bind_resources' loop. NULL when nothing can be kept: no last draw in this
+// command buffer, another pipeline, a chunk, a storage binding the shaders write (its build restarts passes and notes
+// writes). A descriptor whose last build copied guest bytes or counted more than once (BiMeta, BiDesc.vol) is always
+// built again.
+static const BiTest *bi_plan(VkExec *ex, const VkPipeInfo *info, const uint64_t gt[4], const uint64_t gb[4], int *fl) {
     VkExecDraw *D = ex->draw;
     const BiLast *L = &D->BL;
-    if (!D->B.bi_valid || ex->chunked || L->info != info || D->BI.info != info) return 0;
-    const BiMask *m = &rs_list(ex, info)->m;
-    if (!m->gfx || m->wr) return 0;
-    const VkExecDirty *dt = &ex->dirt;
-    int tmv = memcmp(gt, L->gt, 4 * sizeof *gt) != 0, bmv = memcmp(gb, L->gb, 4 * sizeof *gb) != 0;
-    int prog = dt->prog || ex->prog != L->prog || ex->prog->serial != L->serial, binst = D->c0_binst != L->binst;
-    uint32_t nd = 0;
-    for (uint32_t i = 0; i < info->n_bindings; i++) {
-        const VkPipeBinding *b = &info->bindings[i];
-        const GfxShaderRes *r = b->res;
-        uint32_t cnt = b->count ? b->count : 1;
-        int st = nvn_stage_of(b->stage), again = 0;
-        for (uint32_t k = 0; k < cnt && !again; k++) again = D->BI.meta[nd + k].vol;
-        if (b->kind == VK_PIPE_SUPPORT) {
-            again = 1;
-        } else if (b->kind == GFX_RES_UBO) {
-            for (uint32_t k = 0; k < cnt && !again; k++) {
-                int slot = r->slot + (int)k;
-                if (slot == 0) again = dt->ssbo[st] || binst;
-                else if (slot == 1) again = prog || bmv;
-                else if (slot >= 3 && slot - 3 < 18) again = bmv || (dt->ubo[st] >> (slot - 3) & 1);
-            }
-        } else if (b->kind == GFX_RES_SSBO) {
-            int ubo, slot = ssbo_slot(r, st, &ubo);
-            again = again || ubo || slot < 0 || slot >= 16 || bmv || (dt->ssbo[st] >> slot & 1);
-        } else if ((b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) && b->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER &&
-                   b->type != VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
-            int img = b->kind == GFX_RES_IMG;
-            again = again || tmv;
-            for (uint32_t k = 0; k < cnt && !again; k++) {
-                int slot = r->slot + (int)k;
-                if (img) again = slot >= 0 && slot < 32 && (dt->img[st] >> slot & 1);
-                else again = slot >= 0 && slot < 128 && (dt->tex[st][slot >> 6] >> (slot & 63) & 1);
-            }
-        }
-        // A kept binding also depends on the generations its build reads: a lookup or resolve of a binding built again
-        // in this draw may move them (an entry made, a mirror created), and the bindings after it are then built too.
-        int dep = (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) ? BI_TEX
-                : b->kind == GFX_RES_UBO || b->kind == GFX_RES_SSBO ? BI_BUF : 0;
-        D->BI.plan[i] = (uint8_t)(again ? BI_AGAIN : dep);
-        nd += cnt;
-    }
-    return 1;
+    if (!D->B.bi_valid || ex->chunked || L->info != info || D->BI.info != info) return NULL;
+    const RsList *l = rs_list(ex, info);
+    if (!l->m.gfx || l->m.wr) return NULL;
+    int f = BT_ALWAYS;
+    if (memcmp(gt, L->gt, 4 * sizeof *gt)) f |= BT_TEX;
+    if (memcmp(gb, L->gb, 4 * sizeof *gb)) f |= BT_BUF;
+    if (ex->dirt.prog || ex->prog != L->prog || ex->prog->serial != L->serial) f |= BT_C1;
+    if (D->c0_binst != L->binst) f |= BT_C0;
+    *fl = f;
+    return l->t;
+}
+
+static inline int bi_again(const BiTest *t, const VkExecDirty *dt, int fl, uint8_t vol) {
+    int st = t->st;
+    return vol | ((t->f & fl) != 0) | ((t->f & BT_C0) && dt->ssbo[st]) | ((t->ubo & dt->ubo[st]) != 0) |
+           ((t->ssbo & dt->ssbo[st]) != 0) | ((t->img & dt->img[st]) != 0) |
+           (((t->tex[0] & dt->tex[st][0]) | (t->tex[1] & dt->tex[st][1])) != 0);
 }
 
 static void bind_resources(VkExec *ex, const VkPipeInfo *info, const uint64_t *bgt, const uint64_t *bgb) {
@@ -2387,7 +2368,9 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info, const uint64_t *b
     // TOTK_BIND_INC: a graphics build writes BI's array and per-descriptor census (bgt: a prepared draw's), on builds
     // only the bindings bi_plan names, check builds everything and compares what on would have kept.
     int bim = gfx && bgt ? bind_inc_mode() : 0;
-    int inc = bim ? bi_plan(ex, info, bgt, bgb) : 0;
+    int fl = 0;
+    const BiTest *bt = bim ? bi_plan(ex, info, bgt, bgb, &fl) : NULL;
+    int inc = bt != NULL;
     VkDescSlot *d = bim ? D->BI.d : ex->draw->d;
     BiMeta *meta = bim ? D->BI.meta : NULL;
     int skip = gfx && bim != 1 ? bind_skip_on() : 0, same = 0, was_valid = D->B.res_valid;
@@ -2420,7 +2403,11 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info, const uint64_t *b
         memcpy(D->BI.old, d, n * sizeof *d), memcpy(D->BI.mold, meta, n * sizeof *meta);
     }
     uint32_t nd = 0;
-    int midmv = 0, built = 0;   // inc: generations a build in this draw moved; a binding was built since the last read
+    // inc: the generations a build in this draw moved (BI_TEX, BI_BUF); per group, a binding was built since it was
+    // last read. A kept binding also depends on the generations its build reads: a lookup or resolve of a binding built
+    // again in this draw may move them (an entry made, a mirror created), and the bindings after it are then built too.
+    int midmv = 0, built = 0;
+    const VkExecDirty *dt = &ex->dirt;
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *b = &info->bindings[i];
         const GfxShaderRes *r = b->res;
@@ -2431,18 +2418,17 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info, const uint64_t *b
         int st = nvn_stage_of(b->stage), kind = 0;   // kind: 0 buffer, 1 image, 2 texel buffer view
         uint32_t set_of = n_sets == 2 && i >= lo[1] ? 1 : 0;
         int keepb = 0;
-        if (inc && !(D->BI.plan[i] & BI_AGAIN)) {
-            if (built && (D->BI.plan[i] & ~midmv)) {
+        if (inc && !bi_again(&bt[i], dt, fl, D->BI.vol[i])) {
+            int dep = bt[i].dep, rd = dep & built & ~midmv;
+            if (rd) {
                 uint64_t g[4];
-                bi_gt(ex, g);
-                if (memcmp(g, bgt, sizeof g)) midmv |= BI_TEX;
-                bi_gb(ex, g);
-                if (memcmp(g, bgb, sizeof g)) midmv |= BI_BUF;
-                built = 0;
+                if (rd & BI_TEX) bi_gt(ex, g), midmv |= memcmp(g, bgt, sizeof g) ? BI_TEX : 0;
+                else bi_gb(ex, g), midmv |= memcmp(g, bgb, sizeof g) ? BI_BUF : 0;
+                built &= ~rd;
             }
-            keepb = !(D->BI.plan[i] & midmv);
+            keepb = !(dep & midmv);
         }
-        if (!keepb) built = 1;
+        if (!keepb) built = BI_TEX | BI_BUF;
         if (bim == 1 && keepb) {   // kept: what it counted is counted again
             for (uint32_t k = 0; k < cnt; k++)
                 if (meta[nd + k].n) vk_mem_count(meta[nd + k].cls, meta[nd + k].use, meta[nd + k].bytes);
@@ -2503,6 +2489,11 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info, const uint64_t *b
         }
         D->BI.cur = NULL;
 #undef BI_CUR
+        if (meta) {
+            uint8_t v = 0;
+            for (uint32_t k = 0; k < cnt; k++) v |= meta[nd + k].vol;
+            D->BI.vol[i] = v;
+        }
         if (cmp && memcmp(prev, o, cnt * sizeof *o)) changed[set_of] = 1;
         if (bim == 2 && keepb) {   // check: on would have kept these
             D->BC.checked++;
@@ -2582,14 +2573,8 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info, const uint64_t *b
             VkDescriptorSet set = D->B.ds_last[s];
             int kept = inc && bim == 1 && !changed[s] && set && D->B.ds_last_layout[s] == sl && D->DS.n[s] == dbytes;
             if (!kept && (!set || D->B.ds_last_layout[s] != sl || D->DS.n[s] != dbytes || memcmp(D->DS.sig[s], ds, dbytes))) {
-                SetEnt *e = NULL;
-                uint64_t hh[2];
-                set = bim && !ex->chunked ? bi_set_find(ex, sl, ds, dbytes, &e, hh) : VK_NULL_HANDLE;
-                if (!set) {
-                    set = bim == 1 && !ex->chunked ? alloc_set_batched(ex, sl) : alloc_set(ex, sl);
-                    write_set(info, s, set, ds, w, i0, i1);
-                    if (e) bi_set_put(ex, e, hh, sl, set, ds, dbytes);
-                }
+                set = bim == 1 && !ex->chunked ? alloc_set_batched(ex, sl) : alloc_set(ex, sl);
+                write_set(info, s, set, ds, w, i0, i1);
                 D->B.ds_last[s] = set, D->B.ds_last_layout[s] = sl, D->DS.n[s] = dbytes;
                 memcpy(D->DS.sig[s], ds, dbytes);
                 D->BS.set_new++;
@@ -2880,7 +2865,7 @@ static void bi_gb(const VkExec *ex, uint64_t g[4]) {
 // kind is logged with the marks, generations and counters it was taken under.
 static void bi_mismatch(VkExec *ex, int kind, const char *fmt, ...) {
     static const char *const name[BIM_N] = {"pipeline state", "recorded dynamic state", "shaders", "feedback scan",
-                                            "vertex buffers", "descriptor", "descriptor set"};
+                                            "vertex buffers", "descriptor"};
     static volatile int32_t seen[BIM_N];
     VkExecDraw *D = ex->draw;
     D->BC.mism++, D->BC.mism_total++, D->BC.mism_frame++;
@@ -2933,9 +2918,6 @@ static void bi_log(BiCensus *c) {
            bi_pct(c->sh_keep, c->draws), bi_pct(c->sh_memo, c->draws), bi_pct(c->pg_hit, c->draws),
            bi_pct(c->vb_skip, c->draws), bi_pct(c->fb_keep, c->draws), bi_pct(c->fb_n, c->draws),
            bi_pct(c->fb_memo, c->draws), c->mism / fr, (unsigned long long)c->mism_total, c->checked / fr);
-    if (c->sets)
-        rt_log("bind_inc: allocated graphics sets %.1f a frame, %.1f%% of them shared with an equal one of the submission",
-               c->sets / fr, bi_pct(c->set_shared, c->sets));
     uint64_t total = c->mism_total;
     uint32_t lines = c->frame_lines;
     memset(c, 0, sizeof *c);
