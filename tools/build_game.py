@@ -140,6 +140,7 @@ else:
     LINK_FLAGS = ['-fuse-ld=lld', '-no-pie', '-Wl,-z,noexecstack', "'-Wl,-rpath,$$ORIGIN'",
                   '"-Wl,-Map=$builddir/totk.map"']
     LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-lzstd', '-l:libstdc++.a', '-lm', '-lpthread', '-ldl']
+    VMA_INCLUDE = Path('/usr/include')   # vk_mem_alloc.h; Arch (AUR) vulkan-memory-allocator, Debian libvulkan-memory-allocator-dev
 # TOTK_ORDER_FILE=<file>: lifted functions in a section each (-ffunction-sections), and lld lays them out in the
 # file's order (one symbol a line, hottest first; tools/hot_order.py makes it from perf profiles). On the CM5 the
 # game's threads run below one instruction a cycle and miss the instruction cache 11-35 times per 1000 instructions
@@ -149,7 +150,6 @@ ORDER_FILE = os.environ.get('TOTK_ORDER_FILE', '')
 if ORDER_FILE:
     GEN_FLAGS.append('-ffunction-sections')
     LINK_FLAGS += [f'-Wl,--symbol-ordering-file={Path(ORDER_FILE).resolve()}', '-Wl,--no-warn-symbol-ordering']
-    VMA_INCLUDE = Path('/usr/include')   # vk_mem_alloc.h; Arch (AUR) vulkan-memory-allocator, Debian libvulkan-memory-allocator-dev
 # Without a system vk_mem_alloc.h, the header the Windows release pins (tools/make_release.py, VMA 3.4.0) is fetched once
 # into toolchain/vma: one MIT header (THIRD_PARTY_NOTICES.md), checked against its hash.
 VMA_FETCH = ('https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.4.0/include/vk_mem_alloc.h',
