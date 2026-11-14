@@ -1155,3 +1155,8 @@ site ability main 1bd01c8 b4000155 aa0903f5 b4000155   # cbz x21 -> mov x21, x9;
 set report   TOTK_REPORT_GUARD   1
 site report  main a22d8 2a010571 2a010571 37f80341            # orr w17, w11, w1, lsl #1; tbnz w1, #31, 0xa2340
 site report  main a2310 531f7821 530f7c24 531f7821 35000184   # lsr w4, w1, #15; lsl w1, w1, #1; cbnz w4, 0xa2340
+
+# Function-entry hooks (FN_ENTER, runtime/cpu.h): only these functions check g_fnprof on entry, the others carry no
+# hook. main+0x585bd0 sets the render size (runtime/resolution.c SET_RENDER_SIZE): res_fn_hit takes the renderer from
+# the game's own call at start, so a DLSS mode can change while the game runs.
+hook main 585bd0
