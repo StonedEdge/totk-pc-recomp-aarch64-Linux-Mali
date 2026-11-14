@@ -3,7 +3,7 @@
 
 Usage: gen.py --exefs build/extracted/v121/exefs --out generated/v121 [--modules main,subsdk0,sdk] [--jobs N]
               [--limit N] [--chunk-fns N] [--chunk-bytes B] [--big-fn B] [--patches FILE] [--v-locals K [--v-trust]]
-              [--no-cache]
+              [--no-cache] [--fn-enter-all]
 
 Output, under --out:
   layout.h, layout.json        module bases (recomp/layout.py)
@@ -29,9 +29,9 @@ the input; a chunk whose text did not change is not rewritten and keeps its mtim
 
 A chunk is not lifted again when its inputs did not change. Its text depends only on the generator (recomp/*.py,
 GENERATED_MARKER, the Emitter options), the module (its file, its base, and the function starts discovered from it),
-the chunk's number and functions, and the patch sites and spin waits inside the chunk's address range: the per-module
-caches of recomp/jumptables.py are derived from the module's bytes and base, and its per-function state is reset for
-each function. The SHA-256 of all of these is the chunk's key. <mod>/lift_cache.json records the key of each chunk
+the chunk's number and functions, and the patch sites, spin waits and function hooks inside the chunk's address
+range (and whether the patch table has hooks at all): the per-module caches of recomp/jumptables.py are derived from
+the module's bytes and base, and its per-function state is reset for each function. The SHA-256 of all of these is the chunk's key. <mod>/lift_cache.json records the key of each chunk
 with the SHA-256, size and mtime of the file it wrote and the results the manifest and folded.txt need, under a
 digest of the entry. A chunk whose entry is intact, whose key matches and whose file still has that size, mtime and
 hash is reused as it is; any other chunk is lifted. So a rebuild after a change to one cheat lifts only the chunks
@@ -77,7 +77,7 @@ MUSTTAIL = '__attribute__((musttail)) return'
 EST_INT = 62
 EST_SIMD = 75
 EST_SIMD_LDST = 48
-EST_FN = 38          # per function: signature, FN_ENTER, closing brace
+EST_FN = 38          # per function: signature, FN_ENTER (recomp/patches.py `hook`), closing brace
 EST_BR_LABELS = 10   # per instruction of a function with a `br`: switch cases, or labels if it falls back
 
 
@@ -229,7 +229,7 @@ class Emitter:
     the C (an argument here, or anything else it reads) must go into the lift cache's key: chunk_key."""
 
     def __init__(self, mod, starts, patched=None, reg_locals=regs.LOCALS, callee_saved=True, spins=None,
-                 v_locals=vlocals.LOCALS, v_trust=False):
+                 v_locals=vlocals.LOCALS, v_trust=False, hooks=None, fn_enter_all=False):
         self.mod = mod
         self.starts = starts
         self.patched = patched or {}   # {address: [(set index, [replacement words])]} (recomp/patches.py)
@@ -238,6 +238,8 @@ class Emitter:
         self.kept = regs.CALLEE_SAVED if callee_saved else frozenset()   # not reloaded after a call
         self.v_locals = v_locals   # recomp/vlocals.py: V registers per function in C locals (0: all in c->v)
         self.v_trust = v_trust     # with v_locals: V8-V15 are not reloaded after a call
+        # Functions that start with FN_ENTER (recomp/patches.py `hook`): None is every function
+        self.hooks = None if fn_enter_all else hooks
         self.uses_patches = False
         self.stats = Counter()
         self.unsupported = Counter()
@@ -407,6 +409,7 @@ class Emitter:
             self.stats['external_branches'] += 1
             return f'{publish(i)}{spill}c->pc = {hx(t)}; {MUSTTAIL} rt_dispatch(c);'
 
+        enter = [f'    FN_ENTER({hx(entry)});'] if self.hooks is None or entry in self.hooks else []
         if all_labels:
             # An unresolved computed br re-enters the function through fb_<entry>, which switches on c->pc to any
             # instruction. A goto to a shared dispatch block inside the body instead turns every instruction into
@@ -415,13 +418,13 @@ class Emitter:
             cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))
             redispatch = f'{MUSTTAIL} {fb}(c);'
             out = [f'static void {fb}(Cpu *c);',
-                   f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});', f'    c->pc = {hx(entry)};',
+                   f'void {fname(entry)}(Cpu *c) {{', *enter, f'    c->pc = {hx(entry)};',
                    f'    {redispatch}', '}',
                    f'static void {fb}(Cpu *c) {{', f'    switch (c->pc) {{ {cases} default: break; }}',
                    f'    {MUSTTAIL} rt_dispatch(c);']
         else:
             redispatch = f'{MUSTTAIL} rt_dispatch(c);'
-            out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
+            out = [f'void {fname(entry)}(Cpu *c) {{', *enter]
             if fp.used:
                 out.append('    ' + fp.decl())
 
@@ -614,7 +617,8 @@ def _emitter(name):
         mod.read = recorded
         e = _W['emitters'][name] = Emitter(mod, set(_W['starts'][name].tolist()),
                                            _W['patches'].for_module(name, base),
-                                           spins=_W['patches'].spins_for(name, base), **_W['opts'])
+                                           spins=_W['patches'].spins_for(name, base),
+                                           hooks=_W['patches'].hooks_for(name, base), **_W['opts'])
     return e
 
 
@@ -729,14 +733,16 @@ def in_span(addrs, lo, hi):
     return addrs[bisect.bisect_left(addrs, lo):bisect.bisect_left(addrs, hi)]
 
 
-def chunk_key(mod_key, number, fns, patched, site_addrs, spins, spin_addrs):
+def chunk_key(mod_key, number, fns, patched, site_addrs, spins, spin_addrs, hook_addrs):
     """Key of one chunk: its module, number (in its header) and functions, and the patch sites (set index and
-    replacement words, @page resolved, so the patch page is in them) and spin waits inside its address range. Every
-    input of the chunk text that is not in generator_key or module_key must be added here, with a case in
+    replacement words, @page resolved, so the patch page is in them), spin waits and hooked functions inside its
+    address range; hook_addrs None (FN_ENTER in every function) keys apart from an empty list. Every input of the
+    chunk text that is not in generator_key or module_key must be added here, with a case in
     tests/lift_cache_test.py."""
     lo, hi = fns[0][0], fns[-1][1]
     sites = [[a, [[k, words] for k, words in patched[a]]] for a in in_span(site_addrs, lo, hi)]
-    return _key(mod_key, number, fns, sites, [[b, spins[b]] for b in in_span(spin_addrs, lo, hi)])
+    hooks = None if hook_addrs is None else in_span(hook_addrs, lo, hi)
+    return _key(mod_key, number, fns, sites, [[b, spins[b]] for b in in_span(spin_addrs, lo, hi)], hooks)
 
 
 def _entry_check(file, entry):
@@ -855,6 +861,9 @@ def main():
     ap.add_argument('--v-trust', action='store_true',
                     help='with --v-locals: do not reload V8-V15 after a call (AAPCS64: the callee preserves their low '
                          '64 bits)')
+    ap.add_argument('--fn-enter-all', action='store_true',
+                    help='FN_ENTER (runtime/cpu.h) in every function, also with hook lines in the patch table '
+                         '(recomp/patches.py `hook`): a whole-game function-entry profile')
     ap.add_argument('--no-cache', action='store_true',
                     help=f'lift every chunk, also those whose inputs match <mod>/{CACHE_FILE} (it is written anew); '
                          'so does the environment variable TOTK_LIFT_CACHE=0')
@@ -863,7 +872,7 @@ def main():
     no_cache = ('--no-cache' if args.no_cache else
                 'TOTK_LIFT_CACHE=0' if os.environ.get('TOTK_LIFT_CACHE', '').strip() == '0' else None)
     opts = {'reg_locals': args.reg_locals, 'callee_saved': not args.no_callee_saved_trust, 'v_locals': args.v_locals,
-            'v_trust': args.v_trust}
+            'v_trust': args.v_trust, 'fn_enter_all': args.fn_enter_all}
     gen_key = generator_key(opts)
 
     t0 = time.perf_counter()
@@ -895,9 +904,15 @@ def main():
         mkey = module_key(gen_key, name, path, base, abs_starts)
         patched, spins = table.for_module(name, base), table.spins_for(name, base)
         site_addrs, spin_addrs = sorted(patched), sorted(spins)
+        hooks = None if args.fn_enter_all else table.hooks_for(name, base)
+        stray = sorted(set(hooks or ()) - set(abs_starts.tolist()))
+        if stray:
+            raise SystemExit(f'{args.patches}: hook {", ".join(f"{name}+{a - base:#x}" for a in stray)} is no function '
+                             f'start of {name}')
+        hook_addrs = None if hooks is None else sorted(hooks)
         for number, (i0, i1) in enumerate(chunks):
             fns = list(zip(abs_starts[i0:i1].tolist(), ends[i0:i1].tolist()))
-            key = chunk_key(mkey, number, fns, patched, site_addrs, spins, spin_addrs)
+            key = chunk_key(mkey, number, fns, patched, site_addrs, spins, spin_addrs, hook_addrs)
             tasks.append((int(est[i0:i1].sum()), (name, number, str(moddir / f'{name}_{number:04d}.c'), fns, key)))
         paths[name] = (str(path), base)
         starts_abs[name] = abs_starts

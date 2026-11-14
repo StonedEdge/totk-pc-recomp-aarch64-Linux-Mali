@@ -1,5 +1,5 @@
 """recomp/gen.py's lift cache (<mod>/lift_cache.json) on a module it makes itself: a run with unchanged inputs reuses
-every chunk, a changed patch site or spin wait lifts only the chunk that holds it, a chunk file or cache entry changed
+every chunk, a changed patch site, spin wait or function hook lifts only the chunk that holds it, a chunk file or cache entry changed
 behind the cache's back is not taken, a cache that cannot be written only warns, TOTK_LIFT_CACHE=0 and a change to
 the generator's sources or options lift everything, and the output always equals a --no-cache lift's, folded.txt
 included. No game files.
@@ -42,14 +42,16 @@ TEXT = JT_TEXT + struct.pack('<5I', bl(G, H), RET, MOV_W8_100, bl(H + 4, G), RET
 SPIN = 'spin main 48 c'
 
 
-def patch_file(*replacements, first=None, spin=False):
+def patch_file(*replacements, first=None, spin=False, hooks=()):
     """A patch file with set a patching h's mov with each replacement (sets a0, a1, ...); first: a set defined before
-    them, which moves their indices; spin: SPIN too."""
+    them, which moves their indices; spin: SPIN too; hooks: a hook line with these function offsets."""
     lines = [f'set {first} TEST_{first.upper()} 0'] if first else []
     for i, w in enumerate(replacements):
         lines += [f'set a{i} TEST_A{i} 0', f'site a{i} main {H:x} {MOV_W8_100:08x} {w:08x}']
     if spin:
         lines.append(SPIN)
+    if hooks:
+        lines.append('hook main ' + ' '.join(f'{o:x}' for o in hooks))
     return '\n'.join(lines) + '\n'
 
 
@@ -153,6 +155,29 @@ class LiftCache(unittest.TestCase):
         self.assert_like_fresh(patch_file(MOV_W8_200, spin=True))
         self.assertEqual(self.gen(patch_file(MOV_W8_200))['chunks_reused'], 2)
         self.assertNotIn('rt_spin_gate', self.chunk(0).read_text())
+
+    def test_hooks_are_in_the_key(self):
+        """No hook line: FN_ENTER in every function. The first hook line takes it out of every other function, so
+        every chunk is lifted; one more hooked function lifts only its chunk; --fn-enter-all puts it back everywhere;
+        a hook on an address that is no function start stops the lift."""
+        fn_enter = lambda: ['FN_ENTER(' in self.chunk(n).read_text() for n in range(3)]  # noqa: E731
+        self.gen(patch_file(MOV_W8_200))
+        self.assertEqual(fn_enter(), [True, True, True])
+        self.assertEqual(self.gen(patch_file(MOV_W8_200, hooks=[G]))['chunks_reused'], 0)
+        self.assertEqual(fn_enter(), [False, True, False])
+        self.assert_like_fresh(patch_file(MOV_W8_200, hooks=[G]))
+        self.assertEqual(self.gen(patch_file(MOV_W8_200, hooks=[G, H]))['chunks_reused'], 2)
+        self.assertEqual(fn_enter(), [False, True, True])
+        self.assert_like_fresh(patch_file(MOV_W8_200, hooks=[G, H]))
+        self.assertEqual(self.gen(patch_file(MOV_W8_200, hooks=[G]), 'gen', '--fn-enter-all')['chunks_reused'], 0)
+        self.assertEqual(fn_enter(), [True, True, True])
+        p = self.d / 'patches.txt'
+        p.write_text(patch_file(MOV_W8_200, hooks=[G + 4]))
+        r = subprocess.run([sys.executable, str(ROOT / 'recomp' / 'gen.py'), '--exefs', str(self.d / 'exefs'),
+                            '--out', str(self.d / 'gen'), '--modules', 'main', '--jobs', '1', '--patches', str(p)],
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('is no function start', r.stderr)
 
     def test_changed_cache_entry_is_not_taken(self):
         """A changed result in lift_cache.json (a folded range, here) fails the entry's digest: the chunk is lifted
