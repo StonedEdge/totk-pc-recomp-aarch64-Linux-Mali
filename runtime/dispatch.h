@@ -28,6 +28,8 @@ int rt_linked_modules(RtModule *out, int max);
 // Register a host function at a guest address outside every module (HLE entry points). Allowed only before
 // rt_dispatch_init; the registry is fixed afterwards.
 void rt_register_host(uint64_t addr, GuestFn fn);
+// Indirect calls to the lifted function at addr go to fn instead; *orig gets the lifted one (before rt_dispatch_init).
+void rt_dispatch_override(uint64_t addr, GuestFn fn, GuestFn *orig);
 
 // Build the table from the modules (kept by pointer; they must outlive the process). Call it once, before any guest
 // thread starts: thread creation publishes the table to the threads. Fatal on a malformed table:

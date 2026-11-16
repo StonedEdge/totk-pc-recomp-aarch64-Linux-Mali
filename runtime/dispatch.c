@@ -82,6 +82,20 @@ static GuestFn host_lookup(uint64_t addr) {
     return NULL;
 }
 
+// Lifted guest functions that indirect calls reach through host code instead (rt_dispatch_override): their slot is
+// left empty, so rt_dispatch takes dispatch_slow and finds the host function; *orig gets the lifted function for the
+// host code to call. Direct calls in lifted code still go to the lifted function.
+#define OVR_CAP 8
+static struct { uint64_t addr; GuestFn fn, *orig; } g_ovr[OVR_CAP];
+static int g_novr;
+
+void rt_dispatch_override(uint64_t addr, GuestFn fn, GuestFn *orig) {
+    if (g_ready) rt_fatal("rt_dispatch_override(%#llx) after rt_dispatch_init", (unsigned long long)addr);
+    if (g_novr >= OVR_CAP || !addr || (addr & 3) || !fn || !orig) rt_fatal("rt_dispatch_override: bad entry");
+    g_ovr[g_novr].addr = addr, g_ovr[g_novr].fn = fn, g_ovr[g_novr].orig = orig;
+    g_novr++;
+}
+
 void rt_register_host(uint64_t addr, GuestFn fn) {
     if (g_ready) rt_fatal("rt_register_host(%#llx) after rt_dispatch_init", (unsigned long long)addr);
     if (!addr || (addr & 3) || !fn) rt_fatal("rt_register_host: bad entry %#llx", (unsigned long long)addr);
@@ -192,6 +206,21 @@ void rt_dispatch_init(const RtModule *mods, int count) {
         for (uint64_t k = 0; k < m->count; k++)
             slot[(m->addrs[k] - lo) >> 2] = (uint32_t)((uintptr_t)m->fns[k] - anchor);
         g_functions += m->count;
+    }
+    for (int i = 0; i < g_novr; i++) {
+        uint64_t a = g_ovr[i].addr, k = (a - lo) >> 2;
+        if (a < lo || k >= slots || !slot[k]) {
+            rt_log("dispatch: no lifted function at %#llx to override; left alone", (unsigned long long)a);
+            continue;
+        }
+        *g_ovr[i].orig = (GuestFn)(anchor + slot[k]);
+        slot[k] = 0;
+        uint64_t h = host_hash(a);
+        while (g_host[h].addr && g_host[h].addr != a) h = (h + 1) & (HOST_CAP - 1);
+        g_host[h].addr = a;
+        g_host[h].fn = g_ovr[i].fn;
+        g_nhost++;
+        rt_log("dispatch: indirect calls to %#llx go through host code", (unsigned long long)a);
     }
     // a mapping of reserved 2 MiB pages changes protection only in whole pages (EINVAL otherwise)
     table_seal(slot, g_table_huge ? (bytes + (2u << 20) - 1) & ~(uint64_t)((2u << 20) - 1) : bytes);
