@@ -147,6 +147,11 @@ def set_pgo(pgo, out):
         flags = [f'-fprofile-generate={cmd_arg((out / "pgo").resolve().as_posix())}']
         RT_FLAGS.append('-DTOTK_PGO_GEN')
         LINK_FLAGS.append('-fprofile-generate')   # links clang_rt.profile
+        if os.environ.get('TOTK_PGO_NO_VP') == '1':
+            # no value profiling (indirect call targets, memcpy sizes), the fallback if its per-site lists still crash
+            # or freeze the instrumented game (runtime/platform/linux.c, pgo_flush_thread); the edge counts that drive
+            # inlining and layout stay. It changes every compile of the generated code, so the whole game rebuilds.
+            flags += ['-mllvm', '-disable-vp']
     else:
         PGO_INPUT = Path(pgo).resolve()
         if not PGO_INPUT.is_file():

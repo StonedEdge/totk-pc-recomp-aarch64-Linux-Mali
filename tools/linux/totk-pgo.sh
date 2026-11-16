@@ -56,7 +56,7 @@ gen)
     $py tools/build_game.py $(build_args) --out build/pgo-gen --pgo gen
     cp build/pgo-gen/totk "$dest/totk"
     echo "the instrumented build is in $dest (the plain one is totk-plain). Play it, then close it from its menu."
-    echo "Its counts go to $root/build/pgo-gen/pgo every minute."
+    echo "Its counts go to $root/build/pgo-gen/pgo/totk-<pid>.profraw every minute (one file a run)."
     ;;
 merge)
     ls build/pgo-gen/pgo/*.profraw >/dev/null 2>&1 || { echo "no counts in build/pgo-gen/pgo: play the instrumented build first"; exit 1; }

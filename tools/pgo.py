@@ -3,7 +3,8 @@
     python tools/pgo.py merge build/v143-pgogen --version v143 [--out build/pgo/pgo-v143.profdata]
 
 An instrumented build (build_game.py --pgo gen) writes <build>/pgo/default_<id>.profraw while totk.exe runs (every
-minute and at exit); successive runs of the same exe add to that file. llvm-profdata comes from the llvm-mingw toolchain
+minute and at exit); successive runs of the same exe add to that file. On Linux each run writes its own
+totk-<pid>.profraw instead (runtime/platform/linux.c, pgo_flush_thread); merge adds all of them. llvm-profdata comes from the llvm-mingw toolchain
 the instrumented build used: its raw format is tied to the compiler version.
 
 Beside the profile goes <out>.json, the training record: the game version, the git tree of recomp/ at the merge and

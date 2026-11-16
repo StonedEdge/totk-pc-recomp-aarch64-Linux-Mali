@@ -1769,22 +1769,48 @@ int plat_stderr_path(char *out, size_t cap) {
 
 // ---- process
 
+// The game keeps many files open at once (romfs, saves, the pipeline cache, Vulkan's and the profile runtime's), more
+// than a desktop session's soft limit of 1024 on the handheld: past it, opens fail with EMFILE. The hard limit is the
+// process's to take, so the soft one is raised to it before anything opens a file. Nothing here uses select(), whose
+// fd_set stops at 1024.
+__attribute__((constructor)) static void raise_file_limit(void) {
+    struct rlimit r;
+    if (getrlimit(RLIMIT_NOFILE, &r) == 0 && r.rlim_cur < r.rlim_max) {
+        r.rlim_cur = r.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &r);
+    }
+}
+
 #ifdef TOTK_PGO_GEN
 // compiler-rt's profile runtime (an instrumented build, tools/build_game.py --pgo gen). It writes its counters from an
 // atexit handler, which _exit skips; __llvm_profile_dump writes them once and makes later writes no-ops.
 int __llvm_profile_dump(void);
 int __llvm_profile_write_file(void);
-void __llvm_profile_reset_counters(void);
+const char *__llvm_profile_get_filename(void);
+void __llvm_profile_set_filename(const char *name);
 
-// A long played session must not lose its counts to a crash, a kill or a handheld that sleeps and never wakes: every
-// minute the counters are added to the .profraw (the file merges, -fprofile-generate's %m) and zeroed, as win32.c
-// does. Counts taken between the write and the reset are lost.
+// A long played session must not lose its counts to a crash, a kill or a handheld that sleeps and never wakes, so the
+// counters are written every minute. Unlike win32.c, the file is not merged into (-fprofile-generate's %m) and the
+// counters are not zeroed after each write: on the CM5 the reset ran while game threads were adding value-profile
+// nodes, and the next write's walk of those lists crashed (lprofMergeValueProfData) or the game froze. Instead each run
+// has its own file, totk-<pid>.profraw in the -fprofile-generate directory, rewritten whole with the counts so far;
+// tools/pgo.py merge adds the runs' files together. The name is set from this thread a second after start, once the
+// profile runtime's own constructor has set the directory.
 static void *pgo_flush_thread(void *arg) {
     (void)arg;
+    struct timespec ts = {1, 0};
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+    const char *cur = __llvm_profile_get_filename();
+    const char *slash = cur ? strrchr(cur, '/') : NULL;
+    if (slash) {
+        char name[PATH_MAX];
+        snprintf(name, sizeof name, "%.*s/totk-%%p.profraw", (int)(slash - cur), cur);
+        __llvm_profile_set_filename(name);
+    }
     for (;;) {
-        struct timespec ts = {60, 0};
+        ts = (struct timespec){60, 0};
         while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
-        if (__llvm_profile_write_file() == 0) __llvm_profile_reset_counters();
+        __llvm_profile_write_file();
     }
     return NULL;
 }
