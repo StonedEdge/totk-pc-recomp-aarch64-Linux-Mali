@@ -1685,10 +1685,19 @@ void kern_run_on_guest_main(void (*fn)(Cpu *c)) {
 // The OS timer ends a wait late by up to PLAT_WAIT_LATE_NS (Windows' high-resolution waitable timer: 0.3-0.5 ms; the
 // SDK's 20 us polling sleeps, main thread and job workers, about 1.5 per frame each, took 460-515 us). Sleeps up to
 // twice that spin on the clock instead (1 ms on Windows, 120 us on Linux); the virtual core is already given up.
+// TOTK_SLEEP_SPIN_US sets that limit (0: every sleep waits on the OS timer). On the CM5 the spin is the largest use of
+// the clock: 6 % of the job workers' and 5 % of the main thread's CPU at Lookout Landing (sampled 2026-11-17), on the
+// 4 fast cores the workers already wait for ~10 % of the time.
 #define SLEEP_SPIN_NS (2 * PLAT_WAIT_LATE_NS)
 static void sleep_ns(RtThread *t, int64_t ns) {
     (void)t;
-    if (ns <= SLEEP_SPIN_NS) {
+    static int64_t spin = -1;
+    if (spin < 0) {
+        const char *e = cfg_get("TOTK_SLEEP_SPIN_US");
+        spin = e && *e ? atoll(e) * 1000 : (int64_t)SLEEP_SPIN_NS;
+        if (e && *e) rt_log("kernel: SleepThread spins up to %lld us (TOTK_SLEEP_SPIN_US)", (long long)(spin / 1000));
+    }
+    if (ns <= spin) {
         uint64_t end = kern_now_ns() + (uint64_t)ns;
         while (kern_now_ns() < end) plat_pause();
         return;
@@ -2094,7 +2103,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
             x[0] = R_BAD_STATE;
             return 1;
         }
-        uint64_t start = kern_now_ns();
+        uint64_t start = 0;   // read when the wait first blocks with a timeout: most calls find a signalled object or poll
         uint32_t r;
         int idx = -1;
         lock();
@@ -2132,7 +2141,9 @@ int kern_svc(Cpu *c, uint32_t imm) {
             }
             int64_t left = ns;
             if (ns > 0) {
-                uint64_t spent = kern_now_ns() - start;
+                uint64_t now = kern_now_ns();
+                if (!start) start = now;
+                uint64_t spent = now - start;
                 if (spent >= (uint64_t)ns) {
                     r = R_TIMEOUT;
                     break;
