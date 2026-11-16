@@ -162,6 +162,13 @@ def set_pgo(pgo, out):
                  '-Wno-profile-instr-out-of-date', '-Wno-backend-plugin']
     GEN_FLAGS.extend(flags + PGO_NAMES)
     RT_FLAGS.extend(flags + PGO_NAMES)
+    if pgo == 'gen' and not WIN:
+        # The runtime's signal handlers (the write-watch SIGSEGV handler, the interrupt signal; runtime/platform/linux.c)
+        # run runtime code, and value profiling allocates with calloc the first time a site sees a new target. A
+        # signal that lands while its thread holds malloc's lock then deadlocks it (the instrumented game froze on the
+        # CM5 with every thread asleep) or corrupts the heap. The runtime keeps its edge counts, plain adds that are
+        # safe in a handler, and only the runtime recompiles. The generated code never runs in a handler.
+        RT_FLAGS.extend(['-mllvm', '-disable-vp'])
 if WIN:
     # _WIN32_WINNT: Windows 10, the port's minimum. MSYS2's headers default to it, llvm-mingw's (the release toolchain)
     # to Windows 7, which hides the per-monitor DPI functions gfx_window_win.c and dpi_probe_win.c call.
