@@ -47,39 +47,6 @@ static void wait_until(uint64_t at) {
     while (kern_now_ns() < at) plat_yield();
 }
 
-// One present: the blit (with the acquire), the timeline value after it, the wait for the pacing target, the flip.
-static void present_run(const PresentJob *jp, uint64_t *last, uint64_t *last_queued) {
-    PresentJob j = *jp;
-    if (flight_on) vk_thumbs_frame(j.frame);
-    vk_reflex_present_frame(j.pid);   // the present of this blit, and the submission after it, are the frame's
-    vk_reflex_submit_frame(j.pid);
-    vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
-    uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
-    if (j.value && f != j.value)
-        rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
-                 (unsigned long long)f, (unsigned long long)j.value);
-    if (present_thread) {
-        plat_mutex_lock(&pl);
-        busy = 0;
-        plat_cond_broadcast(&pcv);
-        plat_mutex_unlock(&pl);
-    }
-    uint64_t t0 = kern_now_ns();
-    wait_until(j.at);
-    uint64_t t1 = kern_now_ns();
-    vk_present_flip();
-    // TOTK_TRACE=present: one line per present: the host present's interval, the interval of the game's present
-    // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
-    if (rt_trace & RT_TRACE_PRESENT)
-        rt_log("present: frame %llu interval %.3f ms, game %.3f ms, waited %.3f ms, %.3f ms past target",
-               (unsigned long long)j.frame, *last ? (t1 - *last) / 1e6 : 0.0,
-               *last_queued ? (j.queued - *last_queued) / 1e6 : 0.0, (t1 - t0) / 1e6,
-               j.at && t1 > j.at ? (t1 - j.at) / 1e6 : 0.0);
-    *last = t1;
-    *last_queued = j.queued;
-    vk_pipeline_autosave();   // starts the autosave thread once
-}
-
 static void present_main(void *arg) {
     (void)arg;
     perf_core_thread(PCORE_PRESENT);
@@ -92,7 +59,32 @@ static void present_main(void *arg) {
         busy = 1;
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
-        present_run(&j, &last, &last_queued);
+        if (flight_on) vk_thumbs_frame(j.frame);
+        vk_reflex_present_frame(j.pid);   // the present of this blit, and the submission after it, are the frame's
+        vk_reflex_submit_frame(j.pid);
+        vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
+        uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
+        if (j.value && f != j.value)
+            rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
+                     (unsigned long long)f, (unsigned long long)j.value);
+        plat_mutex_lock(&pl);
+        busy = 0;
+        plat_cond_broadcast(&pcv);
+        plat_mutex_unlock(&pl);
+        uint64_t t0 = kern_now_ns();
+        wait_until(j.at);
+        uint64_t t1 = kern_now_ns();
+        vk_present_flip();
+        // TOTK_TRACE=present: one line per present: the host present's interval, the interval of the game's present
+        // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
+        if (rt_trace & RT_TRACE_PRESENT)
+            rt_log("present: frame %llu interval %.3f ms, game %.3f ms, waited %.3f ms, %.3f ms past target",
+                   (unsigned long long)j.frame, last ? (t1 - last) / 1e6 : 0.0,
+                   last_queued ? (j.queued - last_queued) / 1e6 : 0.0, (t1 - t0) / 1e6,
+                   j.at && t1 > j.at ? (t1 - j.at) / 1e6 : 0.0);
+        last = t1;
+        last_queued = j.queued;
+        vk_pipeline_autosave();   // starts the autosave thread once
         plat_mutex_lock(&pl);
     }
     return;
@@ -137,20 +129,6 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
         for (int i = 0; i < 4; i++) j.crop[i] = crop[i];
     }
     vk_upload_flush(0);   // an upload vk_texture_get just recorded goes before the blit
-    // TOTK_PRESENT_THREAD=0: the blit and the flip on the thread that replays the frame, no present thread. A test
-    // for the Mali driver's queue stopping on a GPU-side wait (vk_rec.c rec_submit), which other emulators on the same
-    // driver see with presentation on its own thread. The pacing wait then holds the replay too.
-    static int pthr = -1;
-    if (pthr < 0) {
-        pthr = rt_knob("PRESENT_THREAD", "1");
-        if (!pthr) rt_log("vk: presents on the replaying thread (TOTK_PRESENT_THREAD=0)");
-    }
-    if (!pthr) {
-        static uint64_t last, last_queued;
-        present_run(&j, &last, &last_queued);
-        if (rdoc_active()) rdoc_after_present(frame);
-        return;
-    }
     plat_mutex_lock(&pl);
     if (!present_thread) {
         if (!plat_thread_spawn(present_main, NULL, "vk present", 0)) rt_fatal("vk: cannot start the present thread");
