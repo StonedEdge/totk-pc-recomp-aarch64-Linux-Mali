@@ -98,3 +98,15 @@ writes its counts every minute and when it is closed from its menu. Every settin
 - Subtitles can lose letters (the R8 font atlas).
 - Some texture aliasing fails (4 KB alignment).
 - Only Great Sky Island and the woods around it have been played much; towns and the surface are less tested.
+
+## Thread priority
+
+`TOTK_CRIT_PRIO` (on by default on the RK3588) raises the threads the frame waits on above the game's job workers, but
+Linux only lets a user raise a thread's priority as far as the `nice` limit allows. Once, then log out and in again:
+
+```
+echo "$USER - nice -10" | sudo tee /etc/security/limits.d/totk.conf
+```
+
+The log then says "runs at a higher priority than the job workers" for the main, render, replay and recorder threads.
+

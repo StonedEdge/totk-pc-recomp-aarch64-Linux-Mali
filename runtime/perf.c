@@ -71,9 +71,30 @@ void perf_read(uint64_t ns) {
 }
 
 uint64_t perf_frame_no(void) { return __atomic_load_n(&g_frame_no, __ATOMIC_RELAXED); }
+// TOTK_CRIT_PRIO (on by default on AArch64 CPUs with cores of two speeds): the game's main and render threads, the
+// replay and the recorder run at a higher priority (nice -5) than the job workers. On the CM5 the 4 fast cores are
+// full while moving: with the recorder waiting ~170 ms/s for a core and the replay waiting for the recorder after
+// each part, every core the workers win delays the frame (fulldiag, Lookout Landing, 2026-11-17). Linux lets a user
+// lower nice values only up to RLIMIT_NICE: without it (a "nice" line in /etc/security/limits.conf) this logs that
+// the priority stayed.
+static void crit_priority(int role, const char *name) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_CRIT_PRIO");
+        on = e && *e ? strcmp(e, "0") != 0 : perf_slow_bg_default();
+    }
+    if (!on || role == PCORE_PRESENT) return;
+    plat_thread_priority(PLAT_PRIO_HIGHEST);
+    int got = plat_thread_priority_get();
+    rt_log("cpu: the %s thread %s", name,
+           got >= PLAT_PRIO_HIGHEST ? "runs at a higher priority than the job workers (TOTK_CRIT_PRIO)"
+                                     : "kept its priority: the user may not raise it (RLIMIT_NICE, TOTK_CRIT_PRIO)");
+}
+
 void perf_core_thread(int role) {
     static const char *const names[] = {"game main", "game render", "vk replay", "vk recorder", "vk present"};
     static int32_t said;
+    if (role >= 0 && role < PCORE_N) crit_priority(role, names[role]);
     int r = plat_thread_perf_core();
     if (r < 0 || role < 0 || role >= PCORE_N) return;
     if (__atomic_fetch_or(&said, 1 << role, __ATOMIC_RELAXED) & (1 << role)) return;
