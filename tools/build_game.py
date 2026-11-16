@@ -160,6 +160,12 @@ def set_pgo(pgo, out):
         # since the training, which then compile without a profile
         flags = [f'-fprofile-use={cmd_path(PGO_INPUT)}', '-Wno-profile-instr-unprofiled',
                  '-Wno-profile-instr-out-of-date', '-Wno-backend-plugin']
+        if not WIN:
+            # On the CM5 the instrumented game freezes every few minutes (a GPU wait the slower CPU side loses a race
+            # to), so its training is short and misses whole parts of the game. Code it never ran would otherwise be
+            # compiled for size (profile-guided size optimisation) and run slower when the player gets there; it keeps
+            # full optimisation and is only placed away from the hot code.
+            flags += ['-mllvm', '-pgso=false']
     GEN_FLAGS.extend(flags + PGO_NAMES)
     RT_FLAGS.extend(flags + PGO_NAMES)
     if pgo == 'gen' and not WIN:
