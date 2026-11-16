@@ -101,7 +101,7 @@ writes its counts every minute and when it is closed from its menu. Every settin
 
 ## Thread priority
 
-`TOTK_CRIT_PRIO` (on by default on the RK3588) raises the threads the frame waits on above the game's job workers, but
+`TOTK_CRIT_PRIO=1` (off by default: no gain measured on the RK3588, 26.6 against 26.8 fps) raises the threads the frame waits on above the game's job workers, but
 Linux only lets a user raise a thread's priority as far as the `nice` limit allows. Once, then log out and in again:
 
 ```

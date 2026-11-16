@@ -71,17 +71,19 @@ void perf_read(uint64_t ns) {
 }
 
 uint64_t perf_frame_no(void) { return __atomic_load_n(&g_frame_no, __ATOMIC_RELAXED); }
-// TOTK_CRIT_PRIO (on by default on AArch64 CPUs with cores of two speeds): the game's main and render threads, the
+// TOTK_CRIT_PRIO=1 (off by default): the game's main and render threads, the
 // replay and the recorder run at a higher priority (nice -5) than the job workers. On the CM5 the 4 fast cores are
 // full while moving: with the recorder waiting ~170 ms/s for a core and the replay waiting for the recorder after
 // each part, every core the workers win delays the frame (fulldiag, Lookout Landing, 2026-11-17). Linux lets a user
 // lower nice values only up to RLIMIT_NICE: without it (a "nice" line in /etc/security/limits.conf) this logs that
-// the priority stayed.
+// the priority stayed. Measured there with the priority applied: 26.6 fps against 26.8 without, the recorder still
+// waiting 168 ms/s for a core (a wait per slice of ~75 us, the scheduler's wakeup latency, which nice does not
+// shorten), so it stays off.
 static void crit_priority(int role, const char *name) {
     static int on = -1;
     if (on < 0) {
         const char *e = cfg_get("TOTK_CRIT_PRIO");
-        on = e && *e ? strcmp(e, "0") != 0 : perf_slow_bg_default();
+        on = e && *e && strcmp(e, "0") != 0;
     }
     if (!on || role == PCORE_PRESENT) return;
     plat_thread_priority(PLAT_PRIO_HIGHEST);
