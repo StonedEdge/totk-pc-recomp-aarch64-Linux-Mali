@@ -364,7 +364,11 @@ VkResult rec_submit(const VkSubmitInfo2 *si) {
     // the present, uploads, readbacks and device waits rely on holds through vk_queue_lock (rec_queue_wait). The values
     // the part signals are counted as issued at once (vk_sync.c): waiting for one on the host before its submission is
     // legal for a timeline semaphore. =0: waits here for the submission, as before; =ab with the A/B blocks.
-    if (rec_async < 0) rec_async = rt_knob("REC_ASYNC", "1");
+    // On the two-speed AArch64 CPU (perf_slow_bg_default: the RK3588 with its Mali G610) the default is 0: with the
+    // part submitted later from the recorder, the Mali driver's queue stopped for good on a GPU-side wait (the kernel's
+    // queue dump: BLOCKED_REASON SYNC_WAIT), and every game thread waited on the GPU, within minutes in a slow
+    // instrumented build and in the diagnostic runs of the normal one. With 0 neither froze.
+    if (rec_async < 0) rec_async = rt_knob("REC_ASYNC", perf_slow_bg_default() ? "0" : "1");
     if (RT_KNOB_ON(rec_async)) {
         pub_now();
         return __atomic_load_n(&r_sub_err, __ATOMIC_ACQUIRE);

@@ -57,7 +57,7 @@ compare:
 | two-speed CPUs (aarch64) | `TOTK_SLOW_BG=0` | Background threads moved to the slow cores |
 | two-speed CPUs (aarch64) | `TOTK_REC_SPIN_US` (20) | How long the command recorder spins before it sleeps (200 elsewhere) |
 | all | `TOTK_PACE_SPIN_US=0` | Frame pacing sleeps on the timer instead of yielding while it waits |
-| all | `TOTK_REC_ASYNC=0` | Upstream's: submissions are handed to the recorder without waiting for it |
+| two-speed CPUs (aarch64) | `TOTK_REC_ASYNC=1` | Upstream's: submissions are handed to the recorder without waiting for it; froze the GPU queue on the CM5 within minutes |
 
 Vertex shaders that write storage buffers run as compute shaders where the driver lacks
 `vertexPipelineStoresAndAtomics` (the Mali blob): without it Ultra Hand cannot grab anything.
