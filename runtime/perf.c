@@ -344,6 +344,26 @@ static int bg_pick(uint32_t tid, const char *name) {
                                         "wl_cursor"};
     for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
         if (!strncmp(name, names[i], strlen(names[i]))) return 1;
+    // TOTK_SLOW_EXTRA: more thread names (the start of each, comma-separated) for the slower cores, to try one at a
+    // time against the 4 full fast cores: e.g. "vk recorder" (most of its time is in the Mali driver), "vk
+    // completion,window,mali-event".
+    static char extra[256];
+    static const char *ex[8];
+    static int nex = -1;
+    if (nex < 0) {
+        nex = 0;
+        const char *e = cfg_get("TOTK_SLOW_EXTRA");
+        if (e && *e) {
+            snprintf(extra, sizeof extra, "%s", e);
+            for (char *t = strtok(extra, ","); t && nex < 8; t = strtok(NULL, ",")) {
+                while (*t == ' ') t++;
+                if (*t) ex[nex++] = t;
+            }
+            rt_log("cpu: also to the slower cores: %s (TOTK_SLOW_EXTRA)", e);
+        }
+    }
+    for (int i = 0; i < nex; i++)
+        if (!strncmp(name, ex[i], strlen(ex[i]))) return 1;
     return kern_prio_of_tid(tid) >= 50;
 }
 
