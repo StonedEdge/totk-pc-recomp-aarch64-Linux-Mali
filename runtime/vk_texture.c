@@ -821,9 +821,15 @@ static uint64_t drop_clean(uint64_t need, uint64_t freed, int *dropped, int step
 
 static void sweep_pressure(void) {   // tex_lock held
     if (vram_pressure < 0) {
+        // On Arm's Mali the device-local heap is system memory and the driver's budget is nearly all of it (6.3 GB of
+        // the CM5's 7.8 GB), so 90 % never comes: after a death or a save load at Serene Stable the runtime kept the
+        // old area's released textures (VMA 483 -> 913 MiB in 368 -> 2615 allocations), the system went to swap, and
+        // the Mali driver's recording slowed (recorder 360 -> 616 ms/s, most of it new pages from the kernel): about
+        // 26 fps where a fresh start held 30. 15 % (~0.94 GB there) held 30 after the reload.
+        int def = vk_caps.mali ? 15 : 90;
         const char *s = cfg_get("TOTK_TEX_VRAM_PRESSURE");
-        vram_pressure = s && *s ? atoi(s) : 90;
-        if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = 90;
+        vram_pressure = s && *s ? atoi(s) : def;
+        if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = def;
         const char *m = cfg_get("TOTK_TEX_RELEASED_MIB");
         released_cap = (m && *m ? strtoull(m, NULL, 10) : 256) << 20;
         rt_log("vk: released textures under VRAM pressure: %s%d%%; above %llu MiB of them: %s (TOTK_TEX_RELEASED_MIB)",

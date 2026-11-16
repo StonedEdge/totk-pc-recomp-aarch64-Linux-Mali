@@ -110,3 +110,10 @@ echo "$USER - nice -10" | sudo tee /etc/security/limits.d/totk.conf
 
 The log then says "runs at a higher priority than the job workers" for the main, render, replay and recorder threads.
 
+## Texture memory limit
+
+The Mali driver reports nearly all of system memory as its device-local budget (6.3 GB of the CM5's 7.8 GB), so
+`TOTK_TEX_VRAM_PRESSURE` defaults to 15 % there instead of 90 %. With 90 %, released textures piled up after a death or
+a save load (VMA 483 -> 913 MiB), the system went to swap and the driver's recording slowed: ~26 fps where a fresh
+start held 30. The "Texture memory limit" slider overrides it.
+
