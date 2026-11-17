@@ -128,7 +128,8 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
 // Mali G610 blob the recorder's time in one driver routine grew 97 -> 251 ms/s over such a session while everything
 // else stayed flat: a cost that grows with the objects the driver tracks. So pools are bound into shared imports of
 // aligned windows of guest memory instead (chunk_get), a few dozen to a few hundred for the whole game, and a pool
-// gets one alone only when its window cannot be imported (holes, other protections) or it is larger than a window.
+// gets one alone only when it is larger than a window or its window cannot be imported; a window with holes or other
+// protections shrinks to the read-write run around the pool.
 //
 // A chunk keeps every page of its window pinned for as long as any of its pools lives. A decommit (MADV_DONTNEED)
 // gives the guest new pages there later while the chunk still holds the old ones, so a chunk takes no new pool once a
@@ -181,18 +182,31 @@ static int chunk_get(VkCtx *c, VkBuffer buf, const VkMemoryRequirements *req, ui
         k = x;
     }
     for (int i = 0; i < CHUNK_REFUSED && !k; i++)
-        if (chunk_refused[i].lo == wlo && chunk_refused[i].hi == whi &&
-            chunk_refused[i].gen == mem_map_gen(wlo, whi - wlo)) {
+        if (chunk_refused[i].hi && chunk_refused[i].lo <= lo && hi <= chunk_refused[i].hi &&
+            chunk_refused[i].gen == mem_map_gen(chunk_refused[i].lo, chunk_refused[i].hi - chunk_refused[i].lo)) {
             plat_mutex_unlock(&chunk_lock);
             return 0;
         }
     if (!k) {
-        // A new window: every page committed read-write (a hole or a read-only page would fail the import), then
-        // imported whole. The generation is read first, so a change during the import marks the chunk stale.
+        // A new window: its pages must all be committed read-write (a hole or a read-only page fails the import), so
+        // where some are not, the window shrinks to the read-write run around the pool (about half of TotK's windows
+        // have a hole or a guard page). The generation is read before the import, so a change during it marks the chunk
+        // stale.
         mem_thaw(wlo, whi - wlo);
-        uint64_t gen = mem_map_gen(wlo, whi - wlo), e;
+        uint64_t e;
         int ok = 1;
-        for (uint64_t a = wlo; ok && a < whi; a = e) ok = plat_mem_state(a, whi, &e) == PLAT_PROT_RW && e > a;
+        for (uint64_t a = wlo; ok && a < whi; a = e) {
+            int st = plat_mem_state(a, whi, &e);
+            if (e <= a) ok = 0;
+            else if (st == PLAT_PROT_RW) continue;
+            else if (e <= lo) wlo = e;             // a hole or other protection before the pool
+            else if (a >= hi) whi = a, e = whi;    // after it: the run ends here
+            else ok = 0;                           // inside the pool itself
+        }
+        uint64_t al = c->min_imported_host_alignment ? c->min_imported_host_alignment : 0x1000;
+        wlo = (wlo + al - 1) & ~(al - 1), whi &= ~(al - 1);
+        if (wlo > lo || whi < hi) ok = 0, wlo = lo, whi = hi;
+        uint64_t gen = mem_map_gen(wlo, whi - wlo);
         VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         int type = -1;
         if (ok && p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
