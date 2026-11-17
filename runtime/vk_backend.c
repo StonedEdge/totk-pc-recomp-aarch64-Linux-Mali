@@ -253,8 +253,7 @@ static void replay_main(void *arg) {
         }
         plat_mutex_lock(&rl);
         // Only submissions and presents carry a timeline value, and only presents count for the frame bound
-        // (vk_be_present): counting the queued releases and writes as presents let the replay fall many frames behind
-        // the game, so every drain waited for all of them (on the RK3588 a WriteTexels drain took 12 ms on average).
+        // (vk_be_present, TOTK_REPLAY_FRAMES).
         if (it.kind == RI_SUBMIT || it.kind == RI_PRESENT) r_value_done = it.value;
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
         else if (it.kind == RI_PRESENT) r_presents_done++;
@@ -366,12 +365,21 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
         present_image(t, crop, at_ns, kern_now_ns(), frame, 0, vk_reflex_frame());
         return;
     }
-    // Frame bound: the replay thread handled the previous present before this one is queued.
+    // Frame bound (TOTK_REPLAY_FRAMES): at most that many presents queued and not replayed before this one is queued;
+    // 0 (the default) bounds the replay by the queue's size only. Releases were once counted as presents, so the bound
+    // of 1 this had never held; holding it on the RK3588 cost frame rate (the game waited for the replay every frame).
+    static int bound = -1;
+    if (bound < 0) {
+        const char *e = cfg_get("TOTK_REPLAY_FRAMES");
+        bound = e && *e ? atoi(e) : 0;
+        if (bound < 0) bound = 0;
+        rt_log("vk: replay frame bound: %d%s (TOTK_REPLAY_FRAMES)", bound, bound ? " presents" : ", the queue's size only");
+    }
     plat_mutex_lock(&rl);
     dr_calls[DR_FRAME]++, dr_tcalls[DR_FRAME]++;
-    if (r_presents_done < r_presents_queued) {
+    if (bound && r_presents_queued - r_presents_done >= (uint64_t)bound) {
         uint64_t p0 = perf_begin();
-        while (r_presents_done < r_presents_queued) plat_cond_wait(&rcv, &rl);
+        while (r_presents_queued - r_presents_done >= (uint64_t)bound) plat_cond_wait(&rcv, &rl);
         wait_counted(DR_FRAME, p0);
     }
     r_presents_queued++;
