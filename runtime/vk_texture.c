@@ -2101,6 +2101,44 @@ void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, co
     unlock();
 }
 
+// WriteTexels with the replay queued (vk_backend.c vk_be_write_texels), in two halves instead of a drain: the CPU half
+// on the game's thread at the call writes a mirrored texture's pool bytes, which the game may read or overwrite with
+// the CPU next, as on hardware; the image half (vk_write_texels_image) runs on the replay thread in queue order, after
+// the submissions queued before the call and before those after it, as the synchronous replay ordered them. 1: the
+// region is valid and the image half is to be queued.
+int vk_write_texels_cpu(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row,
+                        uint64_t img) {
+    static volatile int32_t n_bad;
+    Region g;
+    if (!region_of(t, v, r, row, img, &g) || (v && v->set_format && v->format != t->d.format)) {
+        log_limited(&n_bad, "WriteTexels: invalid region %d,%d,%d %dx%dx%d or view format (format %#x)", r->xoffset,
+                    r->yoffset, r->zoffset, r->width, r->height, r->depth, t->d.format);
+        return 0;
+    }
+    lock();
+    Tex *e = entry_of(t);
+    if (e && e->pub.mirrored) {
+        if (!storage_texels(t, &g, r, (uint8_t *)src, 1))
+            log_limited(&n_bad, "WriteTexels: region outside level %u of texture %#llx", g.level, (unsigned long long)e->pub.addr);
+        vk_guest_written((uintptr_t)t->mem, t->L.size);
+    }
+    unlock();
+    return e != NULL;
+}
+
+// The image half: a mirrored texture the GPU owns and every other texture get the texels in their image; a mirrored
+// one the GPU does not own is uploaded again from its storage, which the CPU half already wrote.
+void vk_write_texels_image(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row,
+                           uint64_t img) {
+    Region g;
+    if (!region_of(t, v, r, row, img, &g)) return;
+    lock();
+    Tex *e = entry_of(t);
+    if (e && (!e->pub.mirrored || e->pub.gpu_owned)) image_texels(e, &g, r, (uint8_t *)src, 1);
+    else if (e && e->uploaded) e->wt_n++;
+    unlock();
+}
+
 // ---------------------------------------------------------------- CPU reads of GPU-written storage
 // A mirrored texture the GPU rendered into holds its texels in its image only; its storage keeps what the CPU last put
 // there. The game may still read that storage with the CPU: TotK moves its generated grass maps between pools with

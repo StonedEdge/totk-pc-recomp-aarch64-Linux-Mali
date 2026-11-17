@@ -143,12 +143,18 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
 }
 
 // ---- Asynchronous replay
-enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE };
+enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE, RI_WRITE };
 typedef struct {
     int kind, n, has_crop, crop[4];
     uint64_t value, submit_no, at, queued, pid;   // pid: the game's frame when it queued the item (present ID)
     uint64_t *h;
-    const tex_t *tex;   // RI_RELEASE: a copy the item owns (the game may reuse the object's memory)
+    const tex_t *tex;   // RI_RELEASE, RI_WRITE: a copy the item owns (the game may reuse the object's memory)
+    // RI_WRITE: WriteTexels' image half (vk_be_write_texels): the view (a copy, NULL for none), region, pitches and a
+    // copy of the source texels, all owned by the item.
+    const view_t *view;
+    NVNcopyRegion reg;
+    uint64_t row, img;
+    uint8_t *src;
 } ReplayItem;
 #define RQ_CAP 1024   // a frame queues 1 submit and 1 present, and up to a few hundred releases
 enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS, DR_WRITE_TEXELS,
@@ -235,14 +241,23 @@ static void replay_main(void *arg) {
             vk_present_drain();
             vk_texture_release(it.tex);
             free((void *)it.tex);
+        } else if (it.kind == RI_WRITE) {
+            vk_present_drain();
+            vk_write_texels_image(it.tex, it.view, &it.reg, it.src, it.row, it.img);
+            free((void *)it.tex);
+            free((void *)it.view);
+            free(it.src);
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value, it.pid);
         }
         plat_mutex_lock(&rl);
-        if (it.kind != RI_RELEASE) r_value_done = it.value;
+        // Only submissions and presents carry a timeline value, and only presents count for the frame bound
+        // (vk_be_present): counting the queued releases and writes as presents let the replay fall many frames behind
+        // the game, so every drain waited for all of them (on the RK3588 a WriteTexels drain took 12 ms on average).
+        if (it.kind == RI_SUBMIT || it.kind == RI_PRESENT) r_value_done = it.value;
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
-        else r_presents_done++;
+        else if (it.kind == RI_PRESENT) r_presents_done++;
         r_busy = 0;
         plat_cond_broadcast(&rcv);
     }
@@ -288,7 +303,7 @@ static uint64_t replay_enqueue(ReplayItem *it) {
         wait_counted(DR_FULL, p0);
         core_back_unlocked(&away);
     }
-    it->value = it->kind == RI_RELEASE ? 0 : vk_sync_reserve();   // a release signals nothing
+    it->value = it->kind == RI_SUBMIT || it->kind == RI_PRESENT ? vk_sync_reserve() : 0;   // a release or write signals nothing
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
     rq_n++;
     plat_cond_broadcast(&rcv);
@@ -486,9 +501,40 @@ static void vk_be_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegi
     plat_mutex_unlock(&rl);
     free(again);
 }
+// Asynchronous (TOTK_WT_QUEUE, on by default): the pool bytes of a mirrored texture are written now (vk_write_texels_cpu)
+// and the image write is queued with a copy of the texels, in order behind the submissions queued before it, instead
+// of draining the queue: with the replay a frame behind each drain cost the game's thread up to a frame (on the RK3588
+// 479 drains in 2.5 minutes, 5.5 s in all, each a visible stutter). TOTK_WT_QUEUE=0 drains as before.
+static int wt_queue(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = rt_knob("WT_QUEUE", "1");
+        rt_log("vk: WriteTexels %s (TOTK_WT_QUEUE=%d)", on ? "queues the image write behind the replay" : "drains the replay",
+               on);
+    }
+    return on;
+}
+
 static void vk_be_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row,
                                uint64_t img) {
     vk_sync_start();
+    if (gfx_replay_async() && wt_queue() && t && t->mem) {
+        size_t n = vk_texture_texel_span(t, v, r, row, img);
+        if (!n || !vk_write_texels_cpu(t, v, r, src, row, img)) return;   // a bad region (logged) or no texture
+        tex_t *tc = malloc(sizeof *tc);
+        view_t *vc = v ? malloc(sizeof *vc) : NULL;
+        uint8_t *sc = malloc(n);
+        if (!tc || (v && !vc) || !sc) rt_fatal("vk: out of memory (replay queue)");
+        *tc = *t;
+        if (v) *vc = *v;
+        memcpy(sc, src, n);
+        ReplayItem it = {.kind = RI_WRITE, .tex = tc, .view = vc, .reg = *r, .row = row, .img = img, .src = sc};
+        plat_mutex_lock(&rl);
+        dr_calls[DR_WRITE_TEXELS]++, dr_tcalls[DR_WRITE_TEXELS]++;
+        plat_mutex_unlock(&rl);
+        replay_enqueue(&it);
+        return;
+    }
     replay_drain(DR_WRITE_TEXELS);
     vk_present_drain();
     vk_write_texels(t, v, r, src, row, img);

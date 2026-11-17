@@ -126,3 +126,12 @@ slowed the longer one played. `TOTK_IMPORT_CHUNK_MIB` (2 by default on Mali) mak
 windows of guest memory instead (vk_memory.c, chunk_get); the log line "pools imported into chunks" counts them, and
 "import window ... refused" names windows that fell back to one import per pool. `0` restores the old behaviour.
 
+## Stutter from replay drains
+
+With `TOTK_REPLAY_ASYNC=1` some calls wait until the replay thread has caught up with everything queued. Texture
+releases queued behind the replay were counted as presents, so the one-frame bound never held and the replay fell
+several frames behind; over 2.5 minutes on the CM5 the game's threads then waited 5.5 s in 479 WriteTexels drains and
+3.1 s in 109 pool finalizes, 12-28 ms each: frames of 50-70 ms several times a second. Only presents count now, and
+WriteTexels queues its image write instead of draining (`TOTK_WT_QUEUE`, on by default). The log's "replay queue"
+lines count the remaining waits by cause.
+

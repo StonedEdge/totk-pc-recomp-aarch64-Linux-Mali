@@ -224,6 +224,10 @@ void vk_sampler_register(int id, const samp_par *s);                // sampler d
 void vk_texture_release(const tex_t *t);   // TextureFinalize: the image stays for slots that still name its storage
 void vk_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
 void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row, uint64_t img);
+int vk_write_texels_cpu(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row,
+                        uint64_t img);   // WriteTexels with the replay queued: the storage half now, 1: queue the image half
+void vk_write_texels_image(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row,
+                           uint64_t img);   // the image half, on the replay thread in queue order
 void vk_guest_written(uint64_t addr, uint64_t size);   // a host write write-watch may miss: textures there re-upload
 
 // GPU address -> backing (section 3.1). avail: bytes from offset that stay contiguous in buffer. alloc/alloc_offset:
