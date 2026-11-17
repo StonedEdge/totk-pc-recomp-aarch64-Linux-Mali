@@ -117,3 +117,12 @@ The Mali driver reports nearly all of system memory as its device-local budget (
 a save load (VMA 483 -> 913 MiB), the system went to swap and the driver's recording slowed: ~26 fps where a fresh
 start held 30. The "Texture memory limit" slider overrides it.
 
+## Pool imports
+
+The game keeps creating small CPU-visible memory pools as it streams the world (about 1,300 after loading, 2,800 after
+20 minutes). Imported one by one, each was a memory object of its own in the driver, and the recorder's time in one
+driver routine grew from 97 to 251 ms/s over such a session while the rest of its work stayed flat: frame preparation
+slowed the longer one played. `TOTK_IMPORT_CHUNK_MIB` (2 by default on Mali) makes the pools share imports of 2 MiB
+windows of guest memory instead (vk_memory.c, chunk_get); the log line "pools imported into chunks" counts them, and
+"import window ... refused" names windows that fell back to one import per pool. `0` restores the old behaviour.
+

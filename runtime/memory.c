@@ -78,6 +78,9 @@ static uint32_t thaw_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: GetTickCo
 static volatile int32_t nfrz;
 static PlatMutex frz_lock = PLAT_MUTEX_INIT;
 static volatile int64_t frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
+// Per 2 MiB region: bumped by every commit, decommit and protection change over it (thaw_range_locked, why 3), so a
+// holder of host-memory imports (vk_memory.c import chunks) can tell the pages under an import may have been replaced.
+static volatile uint32_t map_gen[RT_ADDRESS_LIMIT >> FRZ_SHIFT];
 
 static int watched(uint64_t addr, uint64_t size) {
     const RtGuestLayout *g = &L;
@@ -105,7 +108,18 @@ static void thaw_locked(uint64_t r, int why) {
 static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
     if (!n || a >= RT_ADDRESS_LIMIT) return;
     uint64_t r0 = a >> FRZ_SHIFT, r1 = (a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1) >> FRZ_SHIFT;
-    for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why);
+    for (uint64_t r = r0; r <= r1; r++) {
+        if (why == 3) __atomic_add_fetch(&map_gen[r], 1, __ATOMIC_RELEASE);
+        thaw_locked(r, why);
+    }
+}
+
+uint64_t mem_map_gen(uint64_t a, uint64_t n) {
+    if (!n || a >= RT_ADDRESS_LIMIT || n > RT_ADDRESS_LIMIT - a) return 0;
+    uint64_t sum = 0;
+    for (uint64_t r = a >> FRZ_SHIFT; r <= (a + n - 1) >> FRZ_SHIFT; r++)
+        sum += __atomic_load_n(&map_gen[r], __ATOMIC_ACQUIRE);
+    return sum;
 }
 
 void mem_thaw(uint64_t a, uint64_t n) {

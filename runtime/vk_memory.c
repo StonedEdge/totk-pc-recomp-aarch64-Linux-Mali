@@ -45,7 +45,8 @@ typedef struct PoolRec {
     uint64_t lo, size;                 // GPU address range of the pool
     uint64_t import_lo, import_hi;     // POOL_IMPORT: the imported host range (aligned outwards)
     VkBuffer buf;
-    VkDeviceMemory mem;                // POOL_IMPORT
+    VkDeviceMemory mem;                // POOL_IMPORT, imported alone (NULL when buf lies in an import chunk)
+    struct ImpChunk *chunk;            // POOL_IMPORT: the import chunk buf is bound into, NULL when imported alone
     VmaAllocation alloc;               // POOL_PHYS
     VPage *pt;                         // POOL_VIRT: size / 64 KiB entries
     uint64_t npages;
@@ -121,7 +122,133 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
     return -1;
 }
 
-// CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host).
+// ---- import chunks
+// The game makes thousands of small CPU-visible pools while it streams the world (about 1,300 after loading, 2,800
+// after 20 minutes on the Retro Lite CM5), and an import per pool gives the driver one memory object each. On the
+// Mali G610 blob the recorder's time in one driver routine grew 97 -> 251 ms/s over such a session while everything
+// else stayed flat: a cost that grows with the objects the driver tracks. So pools are bound into shared imports of
+// aligned windows of guest memory instead (chunk_get), a few dozen to a few hundred for the whole game, and a pool
+// gets one alone only when its window cannot be imported (holes, other protections) or it is larger than a window.
+//
+// A chunk keeps every page of its window pinned for as long as any of its pools lives. A decommit (MADV_DONTNEED)
+// gives the guest new pages there later while the chunk still holds the old ones, so a chunk takes no new pool once a
+// mapping change touched its window (mem_map_gen); its live pools are unaffected, as the guest changes no mapping
+// under a live pool. TOTK_IMPORT_CHUNK_MIB: the window size (a power of two, at least 2 MiB, the freeze region);
+// 0 imports every pool alone. Default 2 on Arm Mali, 0 elsewhere.
+typedef struct ImpChunk {
+    uint64_t lo, hi;                   // the imported host range
+    uint64_t gen;                      // mem_map_gen of the window when imported
+    VkDeviceMemory mem;
+    uint32_t type;                     // memory type index
+    int32_t refs;                      // chunk_lock: pools bound into it
+    int8_t stale;                      // chunk_lock: a mapping change touched the window; takes no new pools
+} ImpChunk;
+static PlatMutex chunk_lock = PLAT_MUTEX_INIT;
+static ImpChunk **ichunks;
+static int nichunks, cap_ichunks;
+static uint64_t chunk_bytes;           // 0: every pool imported alone
+static int32_t n_chunked, n_chunk_refused;
+// chunk_lock: the latest windows the driver or the checks refused, with their mem_map_gen, so the next pools there go
+// straight to an import of their own; a mapping change there allows another try.
+#define CHUNK_REFUSED 64
+static struct { uint64_t lo, hi, gen; } chunk_refused[CHUNK_REFUSED];
+static unsigned chunk_refused_at;
+
+static void chunk_put(VkCtx *c, ImpChunk *k) {
+    plat_mutex_lock(&chunk_lock);
+    if (--k->refs == 0) {
+        for (int i = 0; i < nichunks; i++)
+            if (ichunks[i] == k) { ichunks[i] = ichunks[--nichunks]; break; }
+        vkFreeMemory(c->device, k->mem, NULL);
+        free(k);
+    }
+    plat_mutex_unlock(&chunk_lock);
+}
+
+// Binds buf (the pool's buffer over [lo, hi), requirements req) into an import chunk: 1 bound, *out the chunk with a
+// reference taken; 0 the caller imports the pool alone.
+static int chunk_get(VkCtx *c, VkBuffer buf, const VkMemoryRequirements *req, uint64_t lo, uint64_t hi,
+                     ImpChunk **out) {
+    uint64_t C = chunk_bytes;
+    if (!C || hi - lo > C) return 0;
+    uint64_t wlo = lo & ~(C - 1), whi = (hi + C - 1) & ~(C - 1);
+    plat_mutex_lock(&chunk_lock);
+    ImpChunk *k = NULL;
+    for (int i = 0; i < nichunks && !k; i++) {
+        ImpChunk *x = ichunks[i];
+        if (x->stale || lo < x->lo || hi > x->hi || !(req->memoryTypeBits >> x->type & 1)) continue;
+        if (mem_map_gen(x->lo, x->hi - x->lo) != x->gen) { x->stale = 1; continue; }
+        k = x;
+    }
+    for (int i = 0; i < CHUNK_REFUSED && !k; i++)
+        if (chunk_refused[i].lo == wlo && chunk_refused[i].hi == whi &&
+            chunk_refused[i].gen == mem_map_gen(wlo, whi - wlo)) {
+            plat_mutex_unlock(&chunk_lock);
+            return 0;
+        }
+    if (!k) {
+        // A new window: every page committed read-write (a hole or a read-only page would fail the import), then
+        // imported whole. The generation is read first, so a change during the import marks the chunk stale.
+        mem_thaw(wlo, whi - wlo);
+        uint64_t gen = mem_map_gen(wlo, whi - wlo), e;
+        int ok = 1;
+        for (uint64_t a = wlo; ok && a < whi; a = e) ok = plat_mem_state(a, whi, &e) == PLAT_PROT_RW && e > a;
+        VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        int type = -1;
+        if (ok && p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                               (void *)(uintptr_t)wlo, &hp) == VK_SUCCESS)
+            type = memory_type(c, req->memoryTypeBits & hp.memoryTypeBits,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkDeviceMemory m = VK_NULL_HANDLE;
+        if (type >= 0) {
+            VkImportMemoryHostPointerInfoEXT im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+                                                   .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                                   .pHostPointer = (void *)(uintptr_t)wlo};
+            VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im,
+                                       .allocationSize = whi - wlo, .memoryTypeIndex = (uint32_t)type};
+            if (vkAllocateMemory(c->device, &ai, NULL, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
+        }
+        if (!m || !(k = calloc(1, sizeof *k))) {
+            if (m) vkFreeMemory(c->device, m, NULL);
+            unsigned at = chunk_refused_at++ % CHUNK_REFUSED;
+            chunk_refused[at].lo = wlo, chunk_refused[at].hi = whi, chunk_refused[at].gen = gen;
+            plat_mutex_unlock(&chunk_lock);
+            long n = plat_inc32(&n_chunk_refused);
+            if (n <= 4 || !(n & (n - 1)))
+                rt_log("vk: import window %#llx+%#llx refused (%s): pools there are imported alone (%ld so far)",
+                       (unsigned long long)wlo, (unsigned long long)(whi - wlo),
+                       !ok ? "not all committed read-write" : type < 0 ? "no memory type" : "driver", n);
+            return 0;
+        }
+        *k = (ImpChunk){.lo = wlo, .hi = whi, .gen = gen, .mem = m, .type = (uint32_t)type};
+        if (nichunks == cap_ichunks) grow((void **)&ichunks, &cap_ichunks, sizeof *ichunks);
+        ichunks[nichunks++] = k;
+    }
+    uint64_t off = lo - k->lo;
+    if ((req->alignment && off % req->alignment) || off + req->size > k->hi - k->lo ||
+        vkBindBufferMemory(c->device, buf, k->mem, off) != VK_SUCCESS) {
+        if (!k->refs) {   // just made for this pool
+            for (int i = 0; i < nichunks; i++)
+                if (ichunks[i] == k) { ichunks[i] = ichunks[--nichunks]; break; }
+            vkFreeMemory(c->device, k->mem, NULL);
+            free(k);
+        }
+        plat_mutex_unlock(&chunk_lock);
+        return 0;
+    }
+    k->refs++;
+    int nk = nichunks;
+    plat_mutex_unlock(&chunk_lock);
+    *out = k;
+    long n = plat_inc32(&n_chunked);
+    if (!(n & (n - 1)) && n >= 64)
+        rt_log("vk: %ld pools imported into chunks of %llu MiB; %d chunks live", n,
+               (unsigned long long)(chunk_bytes >> 20), nk);
+    return 1;
+}
+
+// CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host), through
+// an import chunk shared with nearby pools (above) or an import of its own.
 static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     if (shadow_on) return shadow_pool(c, r, addr, size);
     if (!p_host_props)
@@ -157,6 +284,10 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         vkDestroyBuffer(c->device, r->buf, NULL);
         r->buf = VK_NULL_HANDLE;
         return 0;
+    }
+    if (chunk_get(c, r->buf, &req, r->import_lo, r->import_hi, &r->chunk)) {
+        plat_inc32(&n_imports);
+        return 1;
     }
     VkImportMemoryHostPointerInfoEXT im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
                                            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
@@ -246,6 +377,7 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
     if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
+    if (r->chunk) chunk_put(c, r->chunk);
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     free(r->pt);
     free(r);
@@ -1518,6 +1650,14 @@ static void mirror_mode(int discrete) {
     const char *fi = cfg_get("TOTK_FREEZE_IDLE");
     freeze_idle = fi && *fi ? atoi(fi) : 60;
     if (freeze_idle < 0) freeze_idle = 0;
+    const char *ic = cfg_get("TOTK_IMPORT_CHUNK_MIB");
+    int mib = ic && *ic ? atoi(ic) : class_mali ? 2 : 0;
+    if (mib < 0 || (mib & (mib - 1)) || (mib && mib < 2)) {
+        rt_log("mem: TOTK_IMPORT_CHUNK_MIB=%d is not 0 or a power of two from 2: %d", mib, class_mali ? 2 : 0);
+        mib = class_mali ? 2 : 0;
+    }
+    chunk_bytes = (uint64_t)mib << 20;
+    if (mib) rt_log("mem: CPU-visible pools share host-memory imports of %d MiB windows (TOTK_IMPORT_CHUNK_MIB)", mib);
     const char *sh = cfg_get("TOTK_SHADOW");
 #ifdef _WIN32
     shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : plat_is_wine();
