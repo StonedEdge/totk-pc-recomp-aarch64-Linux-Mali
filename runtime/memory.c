@@ -78,9 +78,12 @@ static uint32_t thaw_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: GetTickCo
 static volatile int32_t nfrz;
 static PlatMutex frz_lock = PLAT_MUTEX_INIT;
 static volatile int64_t frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
-// Per 2 MiB region: bumped by every commit, decommit and protection change over it (thaw_range_locked, why 3), so a
-// holder of host-memory imports (vk_memory.c import chunks) can tell the pages under an import may have been replaced.
-static volatile uint32_t map_gen[RT_ADDRESS_LIMIT >> FRZ_SHIFT];
+// Mapping changes for holders of host-memory imports (vk_memory.c import chunks), which must tell whether the pages
+// under an import may have been replaced since: every commit, decommit and protection change (thaw_range_locked, why 3)
+// takes the next number of map_seq and writes it into each 64 KiB granule it covers. 32 MiB of zeroes, touched only
+// where the game changes mappings.
+#define MAP_GRAN_SHIFT 16
+static volatile uint32_t map_seq, map_last[RT_ADDRESS_LIMIT >> MAP_GRAN_SHIFT];
 
 static int watched(uint64_t addr, uint64_t size) {
     const RtGuestLayout *g = &L;
@@ -108,18 +111,25 @@ static void thaw_locked(uint64_t r, int why) {
 static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
     if (!n || a >= RT_ADDRESS_LIMIT) return;
     uint64_t r0 = a >> FRZ_SHIFT, r1 = (a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1) >> FRZ_SHIFT;
-    for (uint64_t r = r0; r <= r1; r++) {
-        if (why == 3) __atomic_add_fetch(&map_gen[r], 1, __ATOMIC_RELEASE);
-        thaw_locked(r, why);
+    if (why == 3 && a < RT_ADDRESS_LIMIT) {
+        uint32_t q = __atomic_add_fetch(&map_seq, 1, __ATOMIC_ACQ_REL);
+        uint64_t e = a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1;
+        for (uint64_t g = a >> MAP_GRAN_SHIFT; g <= e >> MAP_GRAN_SHIFT; g++) __atomic_store_n(&map_last[g], q, __ATOMIC_RELEASE);
     }
+    for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why);
 }
 
-uint64_t mem_map_gen(uint64_t a, uint64_t n) {
-    if (!n || a >= RT_ADDRESS_LIMIT || n > RT_ADDRESS_LIMIT - a) return 0;
-    uint64_t sum = 0;
-    for (uint64_t r = a >> FRZ_SHIFT; r <= (a + n - 1) >> FRZ_SHIFT; r++)
-        sum += __atomic_load_n(&map_gen[r], __ATOMIC_ACQUIRE);
-    return sum;
+uint32_t mem_map_seq(void) { return __atomic_load_n(&map_seq, __ATOMIC_ACQUIRE); }
+
+uint32_t mem_map_last(uint64_t a, uint64_t n) {
+    if (!n || a >= RT_ADDRESS_LIMIT) return UINT32_MAX;
+    if (n > RT_ADDRESS_LIMIT - a) n = RT_ADDRESS_LIMIT - a;
+    uint32_t m = 0;
+    for (uint64_t g = a >> MAP_GRAN_SHIFT; g <= (a + n - 1) >> MAP_GRAN_SHIFT; g++) {
+        uint32_t v = __atomic_load_n(&map_last[g], __ATOMIC_ACQUIRE);
+        if (v > m) m = v;
+    }
+    return m;
 }
 
 void mem_thaw(uint64_t a, uint64_t n) {

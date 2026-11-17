@@ -132,27 +132,28 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
 // protections shrinks to the read-write run around the pool.
 //
 // A chunk keeps every page of its window pinned for as long as any of its pools lives. A decommit (MADV_DONTNEED)
-// gives the guest new pages there later while the chunk still holds the old ones, so a chunk takes no new pool once a
-// mapping change touched its window (mem_map_gen); its live pools are unaffected, as the guest changes no mapping
-// under a live pool. TOTK_IMPORT_CHUNK_MIB: the window size (a power of two, at least 2 MiB, the freeze region);
+// gives the guest new pages there later while the chunk still holds the old ones, so a chunk takes a new pool only
+// where no mapping change touched the pool's 64 KiB granules since the import (mem_map_last); its live pools are
+// unaffected, as the guest changes no mapping under a live pool. Retiring a whole window at any change in it instead
+// let a trip across the map double the chunks (870 -> 1,575: each new pool started one while a leftover pool kept the
+// old one alive) and the driver routine above went from 34 to 130 ms/s. TOTK_IMPORT_CHUNK_MIB: the window size (a power of two, at least 2 MiB, the freeze region);
 // 0 imports every pool alone. Default 2 on Arm Mali, 0 elsewhere.
 typedef struct ImpChunk {
     uint64_t lo, hi;                   // the imported host range
-    uint64_t gen;                      // mem_map_gen of the window when imported
+    uint32_t seq;                      // mem_map_seq before the import: a change numbered above it may have replaced pages
     VkDeviceMemory mem;
     uint32_t type;                     // memory type index
     int32_t refs;                      // chunk_lock: pools bound into it
-    int8_t stale;                      // chunk_lock: a mapping change touched the window; takes no new pools
 } ImpChunk;
 static PlatMutex chunk_lock = PLAT_MUTEX_INIT;
 static ImpChunk **ichunks;
 static int nichunks, cap_ichunks;
 static uint64_t chunk_bytes;           // 0: every pool imported alone
 static int32_t n_chunked, n_chunk_refused;
-// chunk_lock: the latest windows the driver or the checks refused, with their mem_map_gen, so the next pools there go
-// straight to an import of their own; a mapping change there allows another try.
+// chunk_lock: the latest windows the driver or the checks refused, with mem_map_seq at the time, so the next pools
+// there go straight to an import of their own; a mapping change there allows another try.
 #define CHUNK_REFUSED 64
-static struct { uint64_t lo, hi, gen; } chunk_refused[CHUNK_REFUSED];
+static struct { uint64_t lo, hi; uint32_t seq; } chunk_refused[CHUNK_REFUSED];
 static unsigned chunk_refused_at;
 
 static void chunk_put(VkCtx *c, ImpChunk *k) {
@@ -175,23 +176,24 @@ static int chunk_get(VkCtx *c, VkBuffer buf, const VkMemoryRequirements *req, ui
     uint64_t wlo = lo & ~(C - 1), whi = (hi + C - 1) & ~(C - 1);
     plat_mutex_lock(&chunk_lock);
     ImpChunk *k = NULL;
+    uint32_t last = mem_map_last(lo, hi - lo);   // the pool's own pages: unchanged since a chunk's import, they are its
     for (int i = 0; i < nichunks && !k; i++) {
         ImpChunk *x = ichunks[i];
-        if (x->stale || lo < x->lo || hi > x->hi || !(req->memoryTypeBits >> x->type & 1)) continue;
-        if (mem_map_gen(x->lo, x->hi - x->lo) != x->gen) { x->stale = 1; continue; }
+        if (lo < x->lo || hi > x->hi || last > x->seq || !(req->memoryTypeBits >> x->type & 1)) continue;
         k = x;
     }
     for (int i = 0; i < CHUNK_REFUSED && !k; i++)
         if (chunk_refused[i].hi && chunk_refused[i].lo <= lo && hi <= chunk_refused[i].hi &&
-            chunk_refused[i].gen == mem_map_gen(chunk_refused[i].lo, chunk_refused[i].hi - chunk_refused[i].lo)) {
+            mem_map_last(chunk_refused[i].lo, chunk_refused[i].hi - chunk_refused[i].lo) <= chunk_refused[i].seq) {
             plat_mutex_unlock(&chunk_lock);
             return 0;
         }
     if (!k) {
         // A new window: its pages must all be committed read-write (a hole or a read-only page fails the import), so
         // where some are not, the window shrinks to the read-write run around the pool (about half of TotK's windows
-        // have a hole or a guard page). The generation is read before the import, so a change during it marks the chunk
-        // stale.
+        // have a hole or a guard page). The change number is read before the scan and the import, so a change during
+        // them counts as after the import.
+        uint32_t seq = mem_map_seq();
         mem_thaw(wlo, whi - wlo);
         uint64_t e;
         int ok = 1;
@@ -206,7 +208,6 @@ static int chunk_get(VkCtx *c, VkBuffer buf, const VkMemoryRequirements *req, ui
         uint64_t al = c->min_imported_host_alignment ? c->min_imported_host_alignment : 0x1000;
         wlo = (wlo + al - 1) & ~(al - 1), whi &= ~(al - 1);
         if (wlo > lo || whi < hi) ok = 0, wlo = lo, whi = hi;
-        uint64_t gen = mem_map_gen(wlo, whi - wlo);
         VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         int type = -1;
         if (ok && p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
@@ -225,7 +226,7 @@ static int chunk_get(VkCtx *c, VkBuffer buf, const VkMemoryRequirements *req, ui
         if (!m || !(k = calloc(1, sizeof *k))) {
             if (m) vkFreeMemory(c->device, m, NULL);
             unsigned at = chunk_refused_at++ % CHUNK_REFUSED;
-            chunk_refused[at].lo = wlo, chunk_refused[at].hi = whi, chunk_refused[at].gen = gen;
+            chunk_refused[at].lo = wlo, chunk_refused[at].hi = whi, chunk_refused[at].seq = seq;
             plat_mutex_unlock(&chunk_lock);
             long n = plat_inc32(&n_chunk_refused);
             if (n <= 4 || !(n & (n - 1)))
@@ -234,7 +235,7 @@ static int chunk_get(VkCtx *c, VkBuffer buf, const VkMemoryRequirements *req, ui
                        !ok ? "not all committed read-write" : type < 0 ? "no memory type" : "driver", n);
             return 0;
         }
-        *k = (ImpChunk){.lo = wlo, .hi = whi, .gen = gen, .mem = m, .type = (uint32_t)type};
+        *k = (ImpChunk){.lo = wlo, .hi = whi, .seq = seq, .mem = m, .type = (uint32_t)type};
         if (nichunks == cap_ichunks) grow((void **)&ichunks, &cap_ichunks, sizeof *ichunks);
         ichunks[nichunks++] = k;
     }

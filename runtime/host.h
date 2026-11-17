@@ -177,9 +177,11 @@ void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen r
                                                            // before a kernel write (file read) into guest memory
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);
                                                            // regions frozen now; freezes and thaws since the last call
-uint64_t mem_map_gen(uint64_t a, uint64_t n);              // changes only when a commit, decommit or protection
-                                                           // change touched the 2 MiB regions over [a, a+n): the
-                                                           // pages there may be new ones (0 outside the address limit)
+uint32_t mem_map_seq(void);                                 // the number of the latest commit, decommit or protection
+                                                           // change (they count up from 1)
+uint32_t mem_map_last(uint64_t a, uint64_t n);             // the latest such change over the 64 KiB granules of
+                                                           // [a, a+n), 0 for none: the pages there may be new ones
+                                                           // since (UINT32_MAX outside the address limit)
 void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse after thread exit
 int mem_guest_readable(uint64_t a, uint64_t n);            // [a, a+n) can be read without a fault: inside a loaded
                                                            // module or the committed heap answered from the layout,
