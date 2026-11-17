@@ -135,6 +135,14 @@ static VkCommandPool g_pool;
 static VkCommandBuffer g_cb[FRAMES];
 static VkFence g_fence[FRAMES];
 static VkSemaphore g_acquire[FRAMES];
+// TOTK_ACQUIRE_CPU (default 1 on two-speed AArch64, the RK3588 with its Mali G610; 0 elsewhere): the present thread
+// waits on the CPU for the swapchain image (an acquire fence, g_acq_fence) and the blit's submission waits on nothing,
+// instead of a GPU-side wait on the acquire semaphore. With the recorder submitting parts later (TOTK_REC_ASYNC=1) the
+// Mali driver's only queue stopped for good on a GPU-side wait (BLOCKED_REASON SYNC_WAIT) until the kernel's timeout
+// force-signalled the display's fence: work queued behind a wait on the display holds up what the display waits for.
+// An acquire whose fence does not signal within a second falls back to the semaphore for the rest of the run.
+static VkFence g_acq_fence[FRAMES];
+static int g_acq_cpu = -1;
 static unsigned g_frame;
 static int g_capture;
 static VkBuffer g_cap_buf;
@@ -805,14 +813,34 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         goto out;
     }
     uint32_t idx = 0;
-    VkResult r = vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
+    if (g_acq_cpu < 0) {
+        g_acq_cpu = rt_knob("ACQUIRE_CPU", perf_slow_bg_default() ? "1" : "0");
+        rt_log("gfx: swapchain images are waited for %s (TOTK_ACQUIRE_CPU=%d)",
+               g_acq_cpu ? "on the CPU before the blit is submitted" : "by the blit's submission on the GPU", g_acq_cpu);
+    }
+    int acq_cpu = g_acq_cpu && g_acq_fence[slot];
+    VkSemaphore acq_sem = acq_cpu ? VK_NULL_HANDLE : g_acquire[slot];
+    VkFence acq_fence = acq_cpu ? g_acq_fence[slot] : VK_NULL_HANDLE;
+    VkResult r = vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, acq_sem, acq_fence, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         plat_xchg32(&g_dirty, 1);
         if (!create_swapchain()) goto out;
-        r = vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
+        r = vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, acq_sem, acq_fence, &idx);
     }
     vk_device_fault_report(r);
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) goto out;     // lost, not ready: skip the frame
+    if (acq_cpu) {
+        VkResult w = vkWaitForFences(c->device, 1, &acq_fence, VK_TRUE, 1000000000ull);
+        if (w != VK_SUCCESS) {   // the driver's WSI never signals it: the image is presented without waiting
+            rt_log("gfx: the acquire fence did not signal (%d): swapchain images are waited for on the GPU from now on",
+                   (int)w);
+            g_acq_cpu = 0;
+            vkDestroyFence(c->device, acq_fence, NULL);   // it may still be pending: never reused
+            g_acq_fence[slot] = VK_NULL_HANDLE;
+        } else {
+            vkResetFences(c->device, 1, &acq_fence);
+        }
+    }
     if (r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
     vkResetFences(c->device, 1, &g_fence[slot]);
     if (g_sc_hdr) vk_hdr_metadata(g_sc, 0);   // a changed peak or white goes to the display
@@ -942,9 +970,9 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_render_done[idx],
                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1, .pWaitSemaphoreInfos = &wait,
-                        .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1,
-                        .pSignalSemaphoreInfos = &sig};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = acq_cpu ? 0 : 1,
+                        .pWaitSemaphoreInfos = acq_cpu ? NULL : &wait, .commandBufferInfoCount = 1,
+                        .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
     vk_queue_lock();
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_fence[slot]);
     vk_queue_unlock();
@@ -1016,6 +1044,8 @@ void gfx_window_release_vk(void) {
         for (int i = 0; i < FRAMES; i++) {
             vkDestroySemaphore(c->device, g_acquire[i], NULL);
             vkDestroyFence(c->device, g_fence[i], NULL);
+            if (g_acq_fence[i]) vkDestroyFence(c->device, g_acq_fence[i], NULL);
+            g_acq_fence[i] = VK_NULL_HANDLE;
         }
         for (uint32_t i = 0; i < g_sc_n; i++) {
             vkDestroySemaphore(c->device, g_render_done[i], NULL);
@@ -1049,9 +1079,11 @@ void gfx_window_start(void) {
         vkAllocateCommandBuffers(c->device, &ai, g_cb);
         VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT};
         VkSemaphoreCreateInfo semi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VkFenceCreateInfo afi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};   // unsignalled: acquire fences
         for (int i = 0; i < FRAMES; i++) {
             vkCreateFence(c->device, &fi, NULL, &g_fence[i]);
             vkCreateSemaphore(c->device, &semi, NULL, &g_acquire[i]);
+            vkCreateFence(c->device, &afi, NULL, &g_acq_fence[i]);
         }
         g_frame = 0;
         g_started = 1;
