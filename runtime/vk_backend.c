@@ -143,7 +143,8 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
 }
 
 // ---- Asynchronous replay
-enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE, RI_WRITE };
+enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE, RI_WRITE, RI_PROG };
+static void prog_gone(const prog_t *p, void *snap);
 typedef struct {
     int kind, n, has_crop, crop[4];
     uint64_t value, submit_no, at, queued, pid;   // pid: the game's frame when it queued the item (present ID)
@@ -155,6 +156,8 @@ typedef struct {
     NVNcopyRegion reg;
     uint64_t row, img;
     uint8_t *src;
+    const prog_t *prog;   // RI_PROG: the released program (the game's object) and its snapshot (ProgSnap)
+    void *snap;
 } ReplayItem;
 #define RQ_CAP 1024   // a frame queues 1 submit and 1 present, and up to a few hundred releases
 enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS, DR_WRITE_TEXELS,
@@ -241,6 +244,9 @@ static void replay_main(void *arg) {
             vk_present_drain();
             vk_texture_release(it.tex);
             free((void *)it.tex);
+        } else if (it.kind == RI_PROG) {
+            prog_gone(it.prog, it.snap);
+            vk_program_release(it.prog);
         } else if (it.kind == RI_WRITE) {
             vk_present_drain();
             vk_write_texels_image(it.tex, it.view, &it.reg, it.src, it.row, it.img);
@@ -428,7 +434,93 @@ static void vk_be_texture_release(const tex_t *t) {
     plat_mutex_unlock(&rl);
     replay_enqueue(&it);
 }
-static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEASE); vk_program_release(p); }
+// ---- program releases with the replay queued (TOTK_PROG_QUEUE, on by default)
+// The replay reads a bound program's object and its stages' control sections from the game's memory when it records a
+// draw (vk_exec_draw.c find_stage, answers_for), so a release drained the queue first: on the RK3588 20-35 times a
+// minute in Hateno, about 14 ms each, a frame of 50 ms each time. Instead the release snapshots the object with copies
+// of its control sections and queues an RI_PROG item behind the submissions made before it; until the replay reaches
+// the item, a bind of that object resolves to the oldest pending snapshot (vk_prog_live), which is what those earlier
+// submissions bound. The code stays at the game's address: it is bound by address (the c1 constants) and read only
+// to translate a variant not seen before. A snapshot is freed 4 presents after its item, past any recorder still
+// holding it. TOTK_PROG_QUEUE=0 drains as before.
+#define PROG_CONTROL_SIZE 0x880   // gfx_shader.c CONTROL_SIZE: the bytes of a control section the translator reads
+typedef struct ProgSnap {
+    prog_t p;
+    const prog_t *key;
+    uint64_t freed_at;            // r_presents_done when its item was replayed
+    struct ProgSnap *next;
+    uint8_t ctl[6][PROG_CONTROL_SIZE];
+} ProgSnap;
+static PlatMutex ps_lock = PLAT_MUTEX_INIT;
+static ProgSnap *ps_pending, *ps_dead;   // pending: oldest first; dead: replayed, waiting to be freed
+static volatile int32_t ps_n;            // pending snapshots: 0 keeps vk_prog_live to one load
+
+const prog_t *vk_prog_live(const prog_t *p) {
+    if (!p || !__atomic_load_n(&ps_n, __ATOMIC_ACQUIRE)) return p;
+    const prog_t *r = p;
+    plat_mutex_lock(&ps_lock);
+    for (ProgSnap *s = ps_pending; s; s = s->next)
+        if (s->key == p) { r = &s->p; break; }
+    plat_mutex_unlock(&ps_lock);
+    return r;
+}
+
+static void prog_gone(const prog_t *p, void *snap) {
+    (void)p;
+    plat_mutex_lock(&ps_lock);
+    for (ProgSnap **q = &ps_pending; *q; q = &(*q)->next)
+        if (*q == snap) {
+            ProgSnap *s = *q;
+            *q = s->next;
+            __atomic_sub_fetch(&ps_n, 1, __ATOMIC_RELEASE);
+            s->freed_at = r_presents_done;
+            s->next = ps_dead, ps_dead = s;
+            break;
+        }
+    for (ProgSnap **q = &ps_dead; *q;) {
+        ProgSnap *s = *q;
+        if (r_presents_done >= s->freed_at + 4) *q = s->next, free(s);
+        else q = &s->next;
+    }
+    plat_mutex_unlock(&ps_lock);
+}
+
+static int prog_queue(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = rt_knob("PROG_QUEUE", "1");
+        rt_log("vk: program releases %s (TOTK_PROG_QUEUE=%d)", on ? "queue a snapshot behind the replay" : "drain the replay", on);
+    }
+    return on;
+}
+
+static void vk_be_program_release(const prog_t *p) {
+    if (!gfx_replay_async() || !prog_queue() || !p) {
+        replay_drain(DR_PROG_RELEASE);
+        vk_program_release(p);
+        return;
+    }
+    vk_sync_start();
+    ProgSnap *s = calloc(1, sizeof *s);
+    if (!s) rt_fatal("vk: out of memory (replay queue)");
+    s->p = *p, s->key = p;
+    for (uint32_t i = 0; i < p->nstage && i < 6; i++)
+        if (p->sd[i].control) {
+            memcpy(s->ctl[i], p->sd[i].control, PROG_CONTROL_SIZE);
+            s->p.sd[i].control = s->ctl[i];
+        }
+    plat_mutex_lock(&ps_lock);
+    ProgSnap **q = &ps_pending;
+    while (*q) q = &(*q)->next;
+    *q = s;
+    __atomic_add_fetch(&ps_n, 1, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&ps_lock);
+    ReplayItem it = {.kind = RI_PROG, .prog = p, .snap = s};
+    plat_mutex_lock(&rl);
+    dr_calls[DR_PROG_RELEASE]++, dr_tcalls[DR_PROG_RELEASE]++;
+    plat_mutex_unlock(&rl);
+    replay_enqueue(&it);
+}
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {

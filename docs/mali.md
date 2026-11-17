@@ -133,6 +133,7 @@ releases queued behind the replay were counted as presents, so the one-frame bou
 several frames behind; over 2.5 minutes on the CM5 the game's threads then waited 5.5 s in 479 WriteTexels drains and
 3.1 s in 109 pool finalizes, 12-28 ms each: frames of 50-70 ms several times a second. Holding the bound of one frame
 lowered the frame rate (the game waited for the replay every frame), so the bound is now `TOTK_REPLAY_FRAMES` and off
-by default, and WriteTexels queues its image write instead of draining (`TOTK_WT_QUEUE`, on by default). The log's
-"replay queue" lines count the remaining waits by cause.
+by default, and WriteTexels queues its image write instead of draining (`TOTK_WT_QUEUE`, on by default). Program
+releases (20-35 a minute in Hateno, about 14 ms each) queue a snapshot of the program the same way
+(`TOTK_PROG_QUEUE`). The log's "replay queue" lines count the remaining waits by cause; pool finalizes still drain.
 

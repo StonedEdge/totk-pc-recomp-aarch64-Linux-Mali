@@ -5007,8 +5007,9 @@ int vk_exec_bind(VkExec *ex, uint32_t op, const void *payload) {
     switch (op) {
     case OP_BIND_PROGRAM: {
         const p_bind_program *b = payload;
-        if (ex->prog != b->prog || ex->prog_stages != b->stages) ex->dirt.prog = 1;
-        ex->prog = b->prog, ex->prog_stages = b->stages;
+        const prog_t *pr = vk_prog_live(b->prog);   // a released program's snapshot (TOTK_PROG_QUEUE)
+        if (ex->prog != pr || ex->prog_stages != b->stages) ex->dirt.prog = 1;
+        ex->prog = pr, ex->prog_stages = b->stages;
         gen = 1;
         break;
     }
